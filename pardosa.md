@@ -1,6 +1,6 @@
 # Pardosa — Research & Design Notes
 
-Pardosa is an in-memory EDA storage layer implementing **fiber semantics** in Rust. It provides Event Carried State Transfer (ECST) with correctness, auditability, and deletion policy as first-class concerns.
+Pardosa is an EDA storage layer implementing **fiber semantics** in Rust. It provides Event Carried State Transfer (ECST) with correctness, auditability, and deletion policy as first-class concerns.
 
 ## Origin
 
@@ -112,6 +112,7 @@ type Fiber struct {
 ```
 
 ### Known issues in Go prototype
+
 - `List`/`ListWithDeleted` assume monotonically increasing DomainId — broken by design
 - No concurrency (TODO: RWMutex)
 - No stream persistence (TODO: NATS/JetStream write)
@@ -171,16 +172,19 @@ pardosa/
 ### Relevant Rust Ecosystem
 
 **Event sourcing crates** (for reference, not direct use):
+
 - `cqrs-es` — lightweight CQRS+ES framework, serverless-oriented
 - `esrs` — Postgres-backed ES by Prima.it
 - `thalo` — ES with Postgres+Kafka, includes schema DSL
 
 **Append-only log patterns**:
+
 - Bitcask pattern: append-only write log + in-memory HashMap index — closest match to Pardosa's `Line` + `LookupFiber` design
 - `nebari` — transactional append-only KV in pure Rust
-- Segmented log pattern: https://arindas.github.io/blog/segmented-log-rust/ — shares the append-only invariant but Pardosa does not segment: single flat array, no rotation/compaction, policy-driven migrations instead
+- Segmented log pattern: <https://arindas.github.io/blog/segmented-log-rust/> — shares the append-only invariant but Pardosa does not segment: single flat array, no rotation/compaction, policy-driven migrations instead
 
 **State machines** (reference, not used — hand-rolled approach chosen for inspectability and DOT visualization):
+
 - `statig` — hierarchical, generic, async, `no_std`
 - `rust-fsm` — simpler DSL macro approach
 - `sm` — compile-time validated, less maintained
