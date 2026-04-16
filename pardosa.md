@@ -176,9 +176,9 @@ pardosa/
 - `thalo` — ES with Postgres+Kafka, includes schema DSL
 
 **Append-only log patterns**:
-- Bitcask pattern: append-only write log + in-memory HashMap index
+- Bitcask pattern: append-only write log + in-memory HashMap index — closest match to Pardosa's `Line` + `LookupFiber` design
 - `nebari` — transactional append-only KV in pure Rust
-- Segmented log pattern: https://arindas.github.io/blog/segmented-log-rust/
+- Segmented log pattern: https://arindas.github.io/blog/segmented-log-rust/ — shares the append-only invariant but Pardosa does not segment: single flat array, no rotation/compaction, policy-driven migrations instead
 
 **State machines** (reference, not used — hand-rolled approach chosen for inspectability and DOT visualization):
 - `statig` — hierarchical, generic, async, `no_std`
