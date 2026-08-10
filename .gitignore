@@ -1,6 +1,16 @@
-
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Rust
+/target
+Cargo.lock
+origin-prototype/target
+
+# OODA scratch and traces
+.ooda/
+
+# macOS
+.DS_Store
