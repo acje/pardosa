@@ -1,5 +1,23 @@
 # Pardosa — Research & Design Notes
 
+> **HISTORICAL — April 2026. Not a current specification.**
+>
+> These are the design notes from the original Rust prototype, retained as
+> input to the 1.0 spec. They describe the state of thinking in April 2026 and
+> analyse a Go prototype that is no longer the reference implementation.
+>
+> **Still accurate and load-bearing:** the fiber/line/dragline model and the
+> 5-state, 10-transition fiber state machine. Verified 2026-08-11 —
+> `FiberState` and `FiberMigrationPolicy` ship unchanged in the current
+> implementation.
+>
+> **Out of date:** the "Go Prototype Analysis" and "Known issues" sections
+> describe `acje/web-service-gin`, superseded by the Rust implementation in
+> gh-report `crates/pardosa*`. Nothing here reflects the 1.0 structural
+> redesign or the new format.
+>
+> For current state read `bd show pardosa-jn1` (the map) and the README.
+
 Pardosa is an EDA storage layer implementing **fiber semantics** in Rust. It provides Event Carried State Transfer (ECST) with correctness, auditability, and deletion policy as first-class concerns.
 
 ## Origin

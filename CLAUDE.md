@@ -1,5 +1,11 @@
 # Project Instructions for AI Agents
 
+> **Read `AGENTS.md` first.** It carries the "Resuming the pardosa 1.0 spec
+> work" section — how to load the wayfinder map (`bd show pardosa-jn1`), which
+> directory to run `bd` from, and the difference between AFK research tickets
+> and HITL grilling tickets. This file is bd's generic tooling boilerplate and
+> does not describe the active work.
+
 This file provides instructions and context for AI coding agents working on this project.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:6cd5cc61 -->
