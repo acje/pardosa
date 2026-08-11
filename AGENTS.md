@@ -1,5 +1,42 @@
 # Agent Instructions
 
+## Resuming the pardosa 1.0 spec work
+
+This repo's active work is a **wayfinder map** — a bd epic whose child tickets
+are the open decisions between here and a defined end state for the pardosa
+library. To pick it up:
+
+1. Load the skill: `skill({ name: "wayfinder" })`, and use its
+   **"Work through the map"** mode.
+2. Read the map: `bd show pardosa-jn1`. This is the low-resolution view —
+   destination, standing constraints, decisions already made, fog, and what is
+   out of scope. Read it before choosing anything.
+3. Take the next frontier ticket: `bd ready --parent pardosa-jn1 -u`, then
+   claim it with `bd assign <id> <you>` **before** doing any work.
+4. Resolve one ticket per session (research tickets are the exception — those
+   may be batched). Record the answer with `bd comment <id>`, close with
+   `bd close <id> --reason "<gist>"`, and add a one-line entry to the map's
+   Decisions-so-far via `bd update pardosa-jn1 --stdin`.
+
+**Run `bd` from this repo's directory.** bd resolves its workspace from the
+current directory; from the gh-report checkout the same commands resolve a
+different store (prefix `adr-fmt`) and will not find `pardosa-jn1`.
+
+**On a fresh clone**, the beads data comes from the git remote, not the
+worktree: `git clone` then `bd dolt pull`. `.beads/issues.jsonl` is a passive
+export and is not the source of truth.
+
+Ticket types carry a `wayfinder:<type>` label. `research` is AFK — dispatch
+`copernicus` via Task. `grilling` is HITL — it needs the human, and an agent
+answering its own grilling questions has broken the method.
+
+Reference material for the spec lives in `docs/origin/`; the working
+implementation being specified is in the sibling `gh-report` checkout under
+`crates/pardosa*`, and is reference material rather than the thing being
+published.
+
+## Issue tracking
+
 This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
 
 > **Architecture in one line:** Issues live in a local Dolt database
