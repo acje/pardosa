@@ -5,6 +5,9 @@
 .beads/proxieddb/
 .beads.gate.lock
 
+# Bead-db rollback backups (local artefacts; keep out of git)
+.beads.backup-*
+
 # Rust
 /target
 Cargo.lock
