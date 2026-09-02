@@ -10,6 +10,7 @@
 
 # Rust
 /target
+scripts/target/
 Cargo.lock
 
 # OODA scratch and traces
