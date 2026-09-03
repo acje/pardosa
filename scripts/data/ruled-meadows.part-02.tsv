@@ -1,0 +1,41 @@
+64	5	B	pardosa-jn1.36	Standing rule fixing what conformance may assert -- the promise, never the mechanism -- binding every future obligation
+65	5	B	pardosa-jn1.36	Makes passing the suite the binding condition on the claim "supports backend X"; spans rule and gate, higher taken
+66	5	B	pardosa-jn1.36	Draws the refusal rule by what is promised: a configuration breaking a promised invariant is refused at open
+67	5	B	pardosa-jn1.36	Removes the configuration escape from a corruption guard, making it a constraint no build can switch off
+68	4	A	pardosa-jn1.36	Fixes who may extend the system: the trait stays sealed, so an outsider verifies but cannot ship an adapter
+69	5	B	pardosa-jn1.40	Lays down the criterion that separates API from data -- type names and paths in, string contents out
+70	4	A	pardosa-jn1.40	Governs the non_exhaustive lever itself: exemption is derived from the spec's closed-by-construction designation
+71	10	D	pardosa-jn1.31	Fixes what physically travels in each published tarball rather than what the manifest claims
+72	9	D	pardosa-jn1.34	Sets the delay between decision and name acquisition, carrying the squatting risk to publish
+73	10	D	pardosa-jn1.33	Fixes the artefact topology of the repo: one workspace, crates under crates/, spec and ADR tree beside them
+74	5	B	pardosa-jn1.9	Standing dependency rule: caret plus lockstep, exact pins forbidden at publish so version unification holds
+75	5	B	pardosa-jn1.9	States the floor as a rule -- oldest stable compiling the frozen surface -- not as a number that would drift
+76	4	A	pardosa-jn1.9	Splits what binds from what freezes, and when: the single statement governing every later regime assignment
+77	6	B	pardosa-jn1.32	Decides what the spec discloses about platforms: a positive list, no exclusion list, unverified recorded as unverified
+78	4	A	pardosa-abi	Buys the irreversible half now and omits the reversible half, fixing what may still be added at a minor
+79	3	S	pardosa-abi	Scope boundary: correlation is deferred to an external standard and pardosa carries nothing natively
+80	5	B	pardosa-jn1.35	Constrains when a yank is permitted -- correctness or safety only -- and obliges a published policy without an SLA
+81	6	B	pardosa-jn1.35	Discloses the maintainer relationship a stranger cannot otherwise see, and withholds any response-time promise
+82	5	B	pardosa-jn1.47	Standing prohibition on contrastive definition: positive definition only, for any X, binding all future text
+83	5	B	pardosa-jn1.47	Fixes where normative force lives: the page orients and never adds, so one artefact binds rather than two
+84	4	A	pardosa-jn1.47	Keeps the enumeration open, so obligations may be added in any release without a compatibility cost
+85	4	A	pardosa-jn1.47	Assigns the bar to the invariant regime, deciding when it binds rather than what it says
+86	8	C	pardosa-jn1.47	Sets enforcement strength: presence gated, quality damped by a record rather than a gate or checklist
+87	10	D	pardosa-jn1.48	Fixes which artefact exists at 0.5.1 to hold the binding prose, rather than deferring it to a later consolidation
+88	12	D	pardosa-jn1.48	Fixes one concrete path value, named for the line it specifies, so citations stay stable across majors
+89	4	A	pardosa-jn1.48	Puts a regime marker on every clause, making stability promise a per-clause property distinct from force
+90	4	A	pardosa-jn1.48	Defines what the regime marker answers -- does breaking this break a consumer -- separating force from mutability
+91	6	B	pardosa-jn1.51	Decides how the document explains its own name where it is read, since the non-normative page never reaches that reader
+92	6	B	pardosa-jn1.51	Routes the reader to the clause instead of restating it, keeping the two-regime rule stated exactly once
+93	6	B	pardosa-jn1.52	Decides what the frozen surface exposes: the word is taught vocabulary, never a public type
+94	6	B	pardosa-jn1.52	Fixes how many entities a stranger must learn at this level, making event line an aspect rather than a noun
+95	4	A	pardosa-jn1.52	Splits the layout by axis into what binds from 0.5.1 and what freezes at 1.0
+96	2	S	pardosa-jn1.52	Chooses the frame the concept is understood from -- ordering first, durability and containment as consequences
+97	3	S	pardosa-jn1.53	Permanent scope boundary: partitioning is a topology choice above pardosa, never inside an artefact
+98	4	A	pardosa-jn1.53	Converts an implementation fact into a promise with a regime marker, so a consumer may rely on it
+99	6	B	pardosa-jn1.53	Withholds any identity a stranger could hold; the locator names it extrinsically and the frontier is the comparable value
+100	4	A	pardosa-jn1.53	Refuses a second irreversible envelope slot, leaving the one already bought as the standing escape hatch
+101	5	B	pardosa-jn1.53	Applies the language rule as a refusal: a backend noun is barred from consumer vocabulary by any path
+102	4	A	pardosa-jn1.53	Reserves structure now so the licensed split is reachable later without breaking old readers
+103	5	B	pardosa-jn1.53	States the containment invariant a fiber never violates, which is what keeps linearizability true under partitioning
+104	6	B	pardosa-jn1.53	Splits visibility in two: an operator can name a dragline through the read-only surface, a consumer cannot
