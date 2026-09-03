@@ -1,0 +1,32 @@
+184	5	B	pardosa-jn1.61	Lays down the standing exception to re-minting -- one identity survives a generation boundary, and its non-claim is fixed with it
+185	6	B	pardosa-jn1.61	Fixes what the version field carries, refusing a second rendering of a fact the generation chain already tells
+186	6	B	pardosa-jn1.61	Structures who knows what: each artefact's .meta names only itself, so the roster is derived by the reader rather than replicated
+187	5	B	pardosa-jn1.61	Binds the uncovered-fiber case to a refusal at open, so the containment invariant cannot be broken unobserved
+188	4	A	pardosa-jn1.61	Re-freezes the amended record set at 1.0, fixing what a later version may and may not add
+189	5	B	pardosa-jn1.61	Makes presence unconditional, so no second absence-semantics has to be minted and carried forever
+190	6	B	pardosa-jn1.62	Fixes what each envelope field tells a consumer and in which regime, so a holder can tell which guarantee they have
+191	4	A	pardosa-jn1.62	Freezes the field set at 1.0 while stating the format still permits growth -- governs what a later version may change
+192	6	B	pardosa-jn1.62	Pins the wire meaning of a field the shape hash cannot see, so a transition marker is not read as a state
+193	6	B	pardosa-jn1.62	Draws the visibility line: envelope identifiers are consumer-facing, dragline identity operator-only
+194	5	B	pardosa-jn1.62	Fixes the reach of the envelope-check rule by carving the record-yielding reader out of it explicitly
+195	5	B	pardosa-jn1.64	Binds when purge may act on a tombstoned fiber, placing the rule inside the existing policy rather than minting one
+196	5	B	pardosa-jn1.64	Imposes exactly one standing obligation on every consumer's domain model, conditional on pardosa having a reader for it
+197	5	B	pardosa-jn1.64	Refuses a shape -- a second durable rendering of one fact -- and records the refusal so it is not re-proposed
+198	5	B	pardosa-jn1.64	Refuses three further shapes on named grounds, each recorded rather than left as silent absence
+199	3	S	pardosa-jn1.64	Sets the scope boundary that keeps the no-query-surface non-goal alive: the variant is read at migration only (spans 3/5, higher taken)
+200	6	B	pardosa-jn1.64	States as a non-claim what the standard does not own, so a reader does not infer a reserved value space
+201	6	B	pardosa-jn1.64	Fixes what the declaration must state rather than the words it must use, keeping the surface content-specified
+202	8	C	pardosa-jn1.75	Reports a verification procedure's verdict, with the guard proven to bite before the verdict was accepted
+203	8	C	pardosa-jn1.75	Structures the checking mechanism into gated and judged tiers, fixing where the loop can damp error and where it cannot
+204	8	C	pardosa-jn1.75	Makes the sweep a standing trigger-fired check with a curated input, closing the loop at the move that creates staleness
+205	5	B	pardosa-jn1.75	Refuses forever any description of the mechanism broader than its bite, which is the fails-open shape (spans 5/6, higher taken)
+206	6	B	pardosa-jn1.75	Corrects the record where a wrong id silently misleads, without touching the append-only regime
+207	12	D	pardosa-jn1.63	Fixes the two nouns for an already-ruled concept, adopting the user's own word rather than minting one
+208	12	D	pardosa-jn1.63	Assigns the contested word to one sense and names the yielding sense, settling a collision between two existing usages
+209	12	D	pardosa-jn1.63	Replaces one identifier with a name built from vocabulary the map already owns
+210	12	D	pardosa-jn1.63	Drops a contrastive qualifier from the surviving walk's name; behaviour is unchanged
+211	12	D	pardosa-jn1.63	Collapses three mechanism-named variants into one property-named variant after applying the remedy-difference test
+212	12	D	pardosa-jn1.63	Renames the two identifiers that named pardosa's reaction instead of the value condition; the five codes stand
+213	6	B	pardosa-jn1.63	Puts the schema-moved / standard-moved distinction into the names, so it is visible at the call site and not only in the spec
+214	4	A	pardosa-jn1.63	Preserves the five-module freeze by shedding the material into an existing home rather than growing the module set
+215	6	B	pardosa-jn1.63	Rations spec clauses to the one noun naming an enforced constraint, leaving the rest to rustdoc and clauses that exist
