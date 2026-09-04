@@ -140,6 +140,163 @@ each answers its own question.
 
 What is frozen, what remains free to change, and who may extend the system.
 
+#### C4.1 — INVARIANT
+
+This specification carries two kinds of commitment, and every clause carries
+exactly one of them. A commitment on the invariant axis binds from 0.5.1 and
+pardosa holds it from that release onward. A commitment on the surface axis is
+fixed at 1.0: within the 0.5.x line the shape it describes may change at a minor
+release, and from 1.0 it changes only at a major release. A consumer reads a
+clause's axis and knows which of the two it has been given.
+
+#### C4.2 — INVARIANT
+
+Every clause records its own axis, and the axis is a property of that clause
+rather than of the section holding it. The axis answers one question: does
+breaking this clause break a consumer. It answers nothing about whether the
+clause's text may change. A clause therefore holds a binding commitment while
+its content stays open, and a clause that enumerates may add to its enumeration
+in any release without altering what it promises.
+
+#### C4.3 — INVARIANT
+
+Where a clause refuses — where it states that pardosa does not do a thing, and
+that reliance on its doing so is unfounded — the clause's axis attaches to the
+force of the refusal rather than to its removal. It states from when reliance is
+illegitimate. A later release that offers more than a refusal withheld breaks
+nothing a consumer was entitled to hold.
+
+#### C4.4 — SURFACE
+
+Within a major line, pardosa's public surface grows only by an addition a
+consumer cannot silently mis-handle. Three additions meet that test: a cargo
+feature that adds capability and removes none; a new public item; and the
+opening of the seal on the trait an adapter implements. Nothing else is added
+within a major line. A further variant of a public enumeration and a further
+field of a public struct each fall outside the test.
+
+#### C4.5 — SURFACE
+
+A public enumeration's variant set is complete. A consumer matches every variant
+the enumeration names and meets no further variant within a major line. An
+enumeration admits further variants only where this specification designates it
+an open domain and names the domain that is open. This specification designates
+no enumeration open.
+
+#### C4.6 — SURFACE
+
+The variant set of pardosa's top-level failure enumeration is complete. A
+consumer matches its variants exhaustively and carries no arm for a variant it
+has not been given.
+
+#### C4.7 — SURFACE
+
+Every variant of a pardosa enumeration names one condition. No enumeration
+carries a variant standing for the conditions the others do not name.
+
+#### C4.8 — SURFACE
+
+The migration policy a caller selects when it locks a fiber, and the rescue
+policy governing what a locked fiber's migration preserves, are both part of the
+public surface. Each is a complete variant set, and each variant is a choice the
+caller makes.
+
+#### C4.9 — SURFACE
+
+A public struct's field set does not grow within a major line. A consumer
+constructing a public struct names every field the struct carries.
+
+#### C4.10 — SURFACE
+
+The trait an adapter implements is sealed: pardosa names the implementations
+that exist, and an implementation authored outside pardosa is not admitted. The
+obligations an adapter meets are public, and a third party establishes for
+itself that an adapter meets them. Opening the seal is an addition within a major
+line; closing it again is a major change. The trait marking which backend an
+artefact belongs to carries no method, and the trait governing how bytes reach
+durable storage seals separately from it. The trait carrying the exclusion
+obligations stays internal, and conformance is what holds an adapter to them.
+
+#### C4.11 — SURFACE
+
+The migration manager is a module of the pardosa crate. It is part of the public
+surface fixed at 1.0, and the vocabulary a migration failure surfaces through is
+fixed with it.
+
+#### C4.12 — SURFACE
+
+An artefact's metadata record has its shape fixed at 1.0. The operator interface
+reading that record answers three questions: which owner holds this artefact,
+whether that owner is provably dead, and which migrations ran under which rescue
+policy. The record's event set as an interface, access to its individual fields,
+and the abstraction beneath it stay internal and are not fixed.
+
+#### C4.13 — SURFACE
+
+The metadata record carries nine kinds of record, and that set is fixed at 1.0.
+A record of a kind pardosa does not recognise is rejected.
+
+#### C4.14 — INVARIANT
+
+From 0.5.1 the metadata record carries an identity structure that holds across
+any number of draglines: a logical identity distinct from the artefact's physical
+locator, a version, the identifiers of the draglines that make up that identity,
+and the rule partitioning fibers across them.
+
+#### C4.15 — INVARIANT
+
+The order a dragline establishes over its events, the per-fiber precursor chain,
+and the dense re-chaining across a generation boundary bind from 0.5.1. How those
+events are physically laid down is fixed at 1.0. A clause governing an artefact's
+layout states which of the two halves it governs.
+
+#### C4.16 — INVARIANT
+
+An artefact holds exactly one dragline. A consumer relies on one rolling
+commitment covering the whole of that artefact.
+
+#### C4.17 — INVARIANT
+
+Between migrations, the order a dragline establishes over the events of different
+fibers holds. A migration may remove events, and the order surviving a migration
+is a subsequence of the order preceding it. A migration does not reorder the
+events within a dragline. pardosa documents this order as a dragline's default
+behaviour and offers no contract over it: a consumer may observe it and may not
+hold pardosa to it.
+
+#### C4.18 — INVARIANT
+
+The event envelope reserves one optional slot, which 1.0 leaves unused and
+unexposed. pardosa offers no interface for reading or writing event metadata, and
+an event does not name the dragline it belongs to. A consumer carrying metadata
+of its own carries it within the event type it defines, and that type is the
+extension point pardosa documents.
+
+#### C4.19 — INVARIANT
+
+An envelope whose recorded shape differs from the shape pardosa expects is
+refused, on every path. pardosa does not compute whether one schema is compatible
+with another. A schema change is a migration, and migration is what a consumer
+reaches for in place of computed compatibility. This refusal holds throughout the
+1.0 line.
+
+#### C4.20 — SURFACE
+
+The event envelope carries five fields the standard owns, and that set is fixed
+at 1.0. The format admits a sixth field; the standard refuses to add one.
+
+#### C4.21 — SURFACE
+
+pardosa's public surface is five modules, and that count is fixed at 1.0.
+Material that would otherwise mint a sixth module is placed in the module whose
+concept already holds it.
+
+#### C4.22 — INVARIANT
+
+An artefact is read by the major line that wrote it. Across a major boundary the
+operator links both major lines and copies the events through. pardosa states
+that boundary and leaves the copying to the operator.
+
 ### Rules of operation
 
 The invariants that bind every adapter, every caller, and every generation boundary.
