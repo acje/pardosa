@@ -922,7 +922,8 @@ Each of the two describes its own half, and neither describes the other's.
 A schema descriptor carries the payload type's own structure; the enumerations
 reachable from that type, each with the discriminant every one of its variants
 carries; and the bound of every bounded value the type holds. It carries no
-rendering of those values into bytes.
+rendering of those values into bytes. The structure a descriptor carries is
+finite, and the types reachable from it form no cycle.
 
 #### C6.23 — SURFACE
 
@@ -999,6 +1000,102 @@ open is available wherever pardosa builds.
 pardosa states the size of the group that maintains it. Triage of a report a
 consumer files is best effort, and pardosa commits to no time within which a report
 is answered.
+
+#### When a mismatch is reported
+
+The conditions a mismatch resolves to, and what pardosa establishes about each.
+
+#### C6.33 — SURFACE
+
+A difference between the payload type a consumer names and the payload type an
+artefact was written with, and a difference between the event envelope this
+specification fixes and the envelope an artefact was written with, are two
+conditions pardosa names separately. Each stands at the top level of the failure
+enumeration, and a caller reaches neither through a constructor shared with the
+other. Each condition's name states which of the two subjects moved.
+
+#### C6.34 — INVARIANT
+
+pardosa establishes for every artefact it opens whether a mismatch holds, and
+reports that verdict on every path that compares. Which of the two conditions
+holds is established from the artefact's own schema descriptor. Where that
+descriptor does not yield the answer, pardosa reports the mismatch and states its
+condition as unestablished.
+
+#### What a descriptor's production establishes
+
+The claim pardosa makes about where a descriptor came from, and the limit of that
+claim.
+
+#### C6.35 — INVARIANT
+
+pardosa establishes that a schema descriptor was produced by one of the producers
+this specification fixes. Whether a descriptor describes the events an artefact
+holds faithfully stands outside what pardosa establishes, and pardosa states that
+limit wherever it names what a descriptor gives a reader.
+
+#### What a metadata record carries about itself
+
+The version the identity structure versions, and the reach of one artefact's
+record.
+
+#### C6.36 — INVARIANT
+
+The version an artefact's identity structure carries is the version of that
+structure's own shape. The generation an artefact belongs to is carried by the
+chain of generation pointers, and the description of the events it holds is
+carried by its schema descriptor. The identity structure's version carries neither
+of those two facts.
+
+#### C6.37 — INVARIANT
+
+An artefact's metadata record carries the identity of the dragline that artefact
+is, and carries the identity of no other dragline. A reader establishing which
+draglines make up one logical identity reads the metadata record of each artefact
+carrying that identity.
+
+#### What each envelope field tells a consumer
+
+The promise attached to each standard-owned field, and who reads it.
+
+#### C6.38 — INVARIANT
+
+An event's identifier is unique among the events of its artefact's current
+generation and is assigned by pardosa when the event is committed. It promises
+nothing across a generation boundary. An event's fiber identifier is unique within
+the dragline holding that event.
+
+#### C6.39 — SURFACE
+
+A consumer reads an event's own identifier and its fiber identifier from the event
+value it holds. The identity of the dragline that committed the event is reported
+to an operator and is reached from no event value.
+
+#### C6.40 — INVARIANT
+
+An event envelope records whether that event is the one at which its fiber
+detaches, and exactly one event of a detaching fiber carries that record. A
+fiber's current condition follows from the events it holds taken in order. The
+record states a fact about the fiber and states nothing about the entity a
+consumer models with that fiber.
+
+#### C6.41 — SURFACE
+
+The discriminant each variant of a payload type carries is the consumer's own
+value. pardosa reserves no discriminant, reads no meaning from any discriminant
+value, and recognises each event kind it requires by the mark it defines for that
+kind.
+
+#### Taking authority to append
+
+The operation by which a writer acquires the right to append, and what it reports.
+
+#### C6.42 — SURFACE
+
+pardosa offers one operation by which a writer takes exclusive authority to append
+to an artefact. The operation grants that authority or names the condition
+standing in its way, and names that condition in the vocabulary this specification
+fixes. It takes no predicate from the caller and names no storage construct.
 
 ### Verification
 
