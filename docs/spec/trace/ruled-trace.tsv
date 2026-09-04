@@ -1,0 +1,10 @@
+# docs/spec/trace/ruled-trace.tsv -- clause<->ruling trace for docs/spec/pardosa-1.0.md.
+# One row per ruled_n in 1..=244, ascending, tab-separated, four fields:
+#   ruled_n      the RULED item number on wayfinder map pardosa-jn1.
+#   disposition  SPEC-BEARING (the ruling lands in >= 1 numbered clause)
+#                or MAP-GOVERNANCE (it governs the map, the ADR corpus, bd hygiene,
+#                citation audits, or the clean-room transfer, and has no clause here).
+#   clause_ids   semicolon-separated clause ids for SPEC-BEARING rows; "-" otherwise.
+#   note         short note for SPEC-BEARING rows; for MAP-GOVERNANCE rows, the reason,
+#                at least 20 characters.
+ruled_n	disposition	clause_ids	note
