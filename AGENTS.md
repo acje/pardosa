@@ -35,6 +35,33 @@ implementation being specified is in the sibling `gh-report` checkout under
 `crates/pardosa*`, and is reference material rather than the thing being
 published.
 
+## Checking the spec
+
+```sh
+./scripts/check.sh
+```
+
+This is the repo's only quality gate, and it runs locally — there is no CI. It
+runs the `spec-coverage` checker in `scripts/` over `docs/spec/pardosa-1.0.md`
+and the RULED trace, and exits non-zero if any check fails. The nine checks
+assert that the trace and the spec stay mutually consistent: every RULED row in
+range is present exactly once, every SPEC-BEARING row carries a clause id, every
+cited clause id resolves to a real clause heading, every clause heading is cited
+by at least one row, no clause body restates a regime marker or a PGN token, the
+STATUS block is well formed, and clause ids run in non-decreasing layer order
+with dense per-layer numbering. Run it after any edit to the spec or the trace.
+
+The script passes `--allow-regime-prose C5.1` and the flag is load-bearing:
+C5.1 is the clause that *defines* the regime-marker scheme, so it must write
+both marker tokens, and without the exemption `regime_marker_unique` fires on it.
+The exemption is spelled out at the call site rather than defaulted inside the
+binary, so that the one clause holding it stays visible.
+
+There is no GitHub Actions workflow, and that is a decision rather than an
+omission: the repo has no `.github/` at all, and adding one would mint a CI
+surface with permission and gate-failure commitments nobody has asked for.
+`scripts/check.sh` is the named local entry point instead.
+
 ### Two notes on the bd-generated sections below
 
 **Git policy.** The managed Beads block prescribes a "Conservative (default)"
