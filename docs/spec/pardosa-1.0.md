@@ -225,7 +225,7 @@ fixed with it.
 
 #### C4.12 — SURFACE
 
-An artefact's metadata record has its shape fixed at 1.0. The operator interface
+An artefact's ownership record has its shape fixed at 1.0. The operator interface
 reading that record answers three questions: which owner holds this artefact,
 whether that owner is provably dead, and which migrations ran under which rescue
 policy. The record's event set as an interface, access to its individual fields,
@@ -233,7 +233,7 @@ and the abstraction beneath it stay internal and are not fixed.
 
 #### C4.13 — SURFACE
 
-The metadata record carries nine kinds of record, and that set is fixed at 1.0.
+The ownership record carries nine kinds of record, and that set is fixed at 1.0.
 The nine are the ownership claim, the clean release, the migration start, the
 migration end, the inbound pointer, the outbound pointer, the rescue-policy
 choice recorded with the migration start, the identity structure, and the schema
@@ -241,7 +241,7 @@ descriptor. A record of a kind pardosa does not recognise is rejected.
 
 #### C4.14 — INVARIANT
 
-From 0.5.1 the metadata record carries an identity structure that holds across
+From 0.5.1 the ownership record carries an identity structure that holds across
 any number of draglines: a logical identity distinct from the artefact's physical
 locator, a version, the identifiers of the draglines that make up that identity,
 and the rule partitioning fibers across them.
@@ -444,10 +444,10 @@ name the caller acts on.
 #### C5.20 — INVARIANT
 
 Every generation boundary mints fresh identity. Each migrated event receives a
-new event identity and a new fiber identity, and no identity crosses the
-boundary. A reference a consumer holds into a generation, a link between two
-events, and a pointer from outside the artefact each address the generation that
-issued it.
+new event identity and a new fiber identity, and neither of those identities
+crosses the boundary. A reference a consumer holds into a generation, a link
+between two events, and a pointer from outside the artefact each address the
+generation that issued it.
 
 #### C5.21 — SURFACE
 
@@ -794,10 +794,9 @@ observations of one dragline is that dragline's rolling commitment.
 
 #### C6.6 — SURFACE
 
-An artefact's metadata record identifies each dragline making up its logical
-identity, and the read-only operator interface reports those identifiers. An
-identity a consumer could hold for a dragline enters no part of the surface a
-library consumer names. An operator names a dragline; a library consumer does not.
+An artefact's ownership record identifies the dragline that artefact is, and the
+read-only operator interface reports those identifiers. An identity a consumer
+could hold for a dragline enters no part of the surface a library consumer names. An operator names a dragline; a library consumer does not.
 
 #### What a caller receives
 
@@ -873,9 +872,9 @@ behalf.
 
 #### C6.16 — INVARIANT
 
-A migration is recorded in the metadata records of both generations. The metadata
+A migration is recorded in the ownership records of both generations. The metadata
 record of the artefact a migration writes carries the record of the incoming
-migration, written by the migration manager. The metadata record of the artefact a
+migration, written by the migration manager. The ownership record of the artefact a
 migration reads carries the pointer to the next generation, written by that
 artefact's own owner. Each record is written by the owner of the artefact holding
 it.
@@ -901,7 +900,7 @@ field of the envelope in the artefact the migration writes.
 
 The caller names the rescue policy at each migration it starts, and names it at the
 call that starts that migration. pardosa records the named policy with the
-migration's record in the metadata record. No event of any artefact carries it.
+migration's record in the ownership record. No event of any artefact carries it.
 
 #### C6.20 — INVARIANT
 
@@ -1040,7 +1039,7 @@ this specification fixes. Whether a descriptor describes the events an artefact
 holds faithfully stands outside what pardosa establishes, and pardosa states that
 limit wherever it names what a descriptor gives a reader.
 
-#### What a metadata record carries about itself
+#### What a ownership record carries about itself
 
 The version the identity structure versions, and the reach of one artefact's
 record.
@@ -1055,9 +1054,9 @@ of those two facts.
 
 #### C6.37 — INVARIANT
 
-An artefact's metadata record carries the identity of the dragline that artefact
+An artefact's ownership record carries the identity of the dragline that artefact
 is, and carries the identity of no other dragline. A reader establishing which
-draglines make up one logical identity reads the metadata record of each artefact
+draglines make up one logical identity reads the ownership record of each artefact
 carrying that identity.
 
 #### What each envelope field tells a consumer

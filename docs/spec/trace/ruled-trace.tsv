@@ -32,7 +32,7 @@ ruled_n	disposition	clause_ids	note
 37	SPEC-BEARING	C5.18	Migration is operator-initiated; pardosa never starts one. Stated at 1.0 without permanence across majors.
 39	SPEC-BEARING	C5.21	The named-constructor obligation extends to migration tooling as one rule rather than two.
 40	SPEC-BEARING	C5.22	The resume cursor is retained in the fixed surface, carries generation identity, and is rejected under its own name across a boundary.
-41	SPEC-BEARING	C4.12	Format/API split: metadata record shape fixed at 1.0, a narrow read-only operator interface answering three questions, everything else internal and unfixed.
+41	SPEC-BEARING	C4.12	Format/API split: ownership record shape fixed at 1.0, a narrow read-only operator interface answering three questions, everything else internal and unfixed.
 42	SPEC-BEARING	C4.13	Record-kind set fixed at 1.0 with unrecognised kinds rejected. The nine kinds are enumerated by name in the clause.
 43	SPEC-BEARING	C5.9	An ownership record with no claim is unowned and claimable through the ordinary compare-and-set path.
 44	SPEC-BEARING	C5.13	The governing distinction stated once: a missing safety mechanism refuses, missing decision-cheapening evidence is indeterminate, and a platform lacking identity evidence remains a full writer.
@@ -68,7 +68,7 @@ ruled_n	disposition	clause_ids	note
 98	SPEC-BEARING	C4.16	One dragline per artefact converted from an implementation fact into a promise binding from 0.5.1.
 100	SPEC-BEARING	C4.18	No second dedicated envelope slot; an event never names its dragline. The slot already bought is the standing escape hatch.
 101	SPEC-BEARING	C5.30	The language rule applied as a refusal: a backend noun reaches no type, variant or path a consumer names. The replacement word for the routing parameter is layer-12 vocabulary material.
-102	SPEC-BEARING	C4.14	The metadata record's identity structure, multi-dragline-ready from 0.5.1: logical identity, version, member identifiers, partitioning rule.
+102	SPEC-BEARING	C4.14	The ownership record's identity structure, multi-dragline-ready from 0.5.1: logical identity, version, member identifiers, partitioning rule.
 103	SPEC-BEARING	C5.25	One fiber in exactly one dragline, and therefore in exactly one artefact.
 105	SPEC-BEARING	C4.17	Cross-fiber order within a dragline holds between migrations as documented default behaviour, not as a contract; migrations may remove but not reorder. Depends on open escalation pardosa-8q05 over how far the dragline definition in C2.1 reaches; C4.17 takes the safest reading and states the order without widening C2.1.
 106	SPEC-BEARING	C5.40	The cross-fiber ordering refusal, sited as the opening clause of the titled refusal run inside the layer-5 section. Assumption named: the brief requires a citable refusal section and the section order is fixed by user instruction, so the run is a titled subsection rather than a tenth section. The refusal's scope is unchanged by the siting.
@@ -126,7 +126,7 @@ ruled_n	disposition	clause_ids	note
 182	SPEC-BEARING	C5.49	The in-tree hand-written implementations are the named exception without which the derive-only restriction is false on its face.
 184	SPEC-BEARING	C5.57	Logical identity is operator-supplied, carries a generation boundary, and makes no tamper claim. ESCALATION OPEN: C5.20's sentence that no identity crosses the boundary reads wider than this exception; analysis in bd bead pardosa-de69, not self-resolved.
 187	SPEC-BEARING	C5.58	The partitioning rule is operator-declared and never inferred, and an uncovered fiber is a refusal at open rather than a default assignment.
-189	SPEC-BEARING	C4.14	Presence of the identity record is unconditional. C4.14 states the metadata record carries the identity structure with no absence case, so no second absence semantics is minted.
+189	SPEC-BEARING	C4.14	Presence of the identity record is unconditional. C4.14 states the ownership record carries the identity structure with no absence case, so no second absence semantics is minted.
 194	SPEC-BEARING	C5.54	The record-yielding reader sits outside the schema comparison by design, and what it is given instead is the mandatory descriptor. Stated, not left inferable.
 195	SPEC-BEARING	C5.52	Purge acts on a tombstoned fiber under the purging migration policy alone; the link is made inside the existing policy set without minting a variant.
 196	SPEC-BEARING	C5.51	Exactly one mandated variant, the tombstone, and C5.51 states that set as complete at one.
@@ -146,12 +146,12 @@ ruled_n	disposition	clause_ids	note
 3	SPEC-BEARING	C6.1	The public lifecycle types stay as vocabulary a consumer names, with no serialized form supplied and the rendering left to a consumer that needs one.
 11	SPEC-BEARING	C6.13	The epoch is read from the artefact's own ownership record, never from an external coordinator and never from an operator.
 22	SPEC-BEARING	C5.6	Read-only open available on every target is already stated in C5.6 as part of the exclusion clause; RULED 92 forbids a second statement of the same capability, so no C6 clause is minted.
-23	SPEC-BEARING	C6.16	Both generations' metadata records carry a migration record, each written by the owner of the artefact holding it. Depends on open escalation pardosa-de69 over how far C5.20's no-identity-crosses sentence reaches; C6.16 names generations without widening it.
+23	SPEC-BEARING	C6.16	Both generations' ownership records carry a migration record, each written by the owner of the artefact holding it. Depends on open escalation pardosa-de69 over how far C5.20's no-identity-crosses sentence reaches; C6.16 names generations without widening it.
 24	SPEC-BEARING	C6.14	A read-only open of an artefact with no ownership record succeeds and reports unowned with generation unknown, rather than refusing.
 30	SPEC-BEARING	C6.2	The three in-flight-only conditions stay in the public vocabulary, with the fact that a reopened artefact never yields them stated of each.
 33	SPEC-BEARING	C6.3	The per-fiber classification a migration makes stays pardosa's own; what a consumer names is stated positively as the state and the policies.
 34	SPEC-BEARING	C6.20	The written artefact's disclosure: a dense chain from genesis, a purged precursor yielding a genesis event, and nothing disclosed about what was removed.
-35	SPEC-BEARING	C6.19	The caller names the rescue policy at the call that starts the migration, and the choice is recorded in the metadata record and in no event.
+35	SPEC-BEARING	C6.19	The caller names the rescue policy at the call that starts the migration, and the choice is recorded in the ownership record and in no event.
 38	SPEC-BEARING	C6.18	The closure maps payload to payload and may refuse; the envelope is unreachable to it and wholly pardosa-assigned.
 50	SPEC-BEARING	C6.15	pardosa reports which generation state holds and never opens another artefact for the caller. Consulting the record is pardosa's obligation, not the reader's.
 52	SPEC-BEARING	C6.17	The pointer is written at completion, so its presence establishes a complete target unconditionally. Depends on open escalation pardosa-de69; C6.17 states completeness without asserting anything about identity across the boundary.
@@ -198,7 +198,7 @@ ruled_n	disposition	clause_ids	note
 181	SPEC-BEARING	C6.35	The limit stated plainly and as a property: production by a fixed producer set is established, faithfulness to the events is not.
 183	SPEC-BEARING	C5.49	The record's spec-bearing half is that the producer restriction is stated truthfully, and C5.49 already names the hand-written implementations that make it true. The remainder is a defect record against the reference implementation's wording and is not clause content.
 185	SPEC-BEARING	C6.36	The identity structure's version versions that structure's own shape; the generation is carried by the generation chain and the description by the descriptor, and neither is re-rendered.
-186	SPEC-BEARING	C6.37	No roster: each artefact's metadata record names its own dragline, and membership of a logical identity is derived by the reader. OPEN ESCALATION pardosa-s3j1: C6.6, authored in sub-mission 06 from RULED 104, states that an artefact's metadata record identifies each dragline making up its logical identity, which asserts the roster this ruling dissolves. Not self-resolved; C6.6 left unedited.
+186	SPEC-BEARING	C6.37	No roster: each artefact's ownership record names its own dragline, and membership of a logical identity is derived by the reader. OPEN ESCALATION pardosa-s3j1: C6.6, authored in sub-mission 06 from RULED 104, states that an artefact's ownership record identifies each dragline making up its logical identity, which asserts the roster this ruling dissolves. Not self-resolved; C6.6 left unedited.
 190	SPEC-BEARING	C6.38;C6.39	The identifier promises are stated as promises and the surface through which they are read is stated apart from them. The recorded precursor and its commitment are carried by C5.41 and are restated by pointer per RULED 92.
 192	SPEC-BEARING	C6.40	The field is a transition marker: it records the single detaching event, the fiber's condition follows from the series, and the fiber fact is held apart from the consumer's domain fact.
 193	SPEC-BEARING	C6.39;C6.6	The visibility line drawn in both directions: the envelope identifiers are consumer-facing, and the dragline identity reaches an operator only. Depends on open escalation pardosa-de69; neither clause asserts anything about identity across a generation boundary.
