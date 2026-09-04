@@ -1101,14 +1101,137 @@ fixes. It takes no predicate from the caller and names no storage construct.
 
 The checks that hold the specified behaviour in place, and the strength of each.
 
+#### C8.1 — INVARIANT
+
+Where an adapter's durability step replaces the whole of an artefact's stored
+content, that adapter compares the epoch the writer carries against the epoch
+recorded for the artefact at every durability step. A durability step carrying a
+superseded epoch is refused, the artefact stands as it stood, and the events
+remain with the caller to present again.
+
+#### C8.2 — INVARIANT
+
+The conformance suite asserts that an artefact's schema descriptor is
+structurally complete: the descriptor is present, every type reachable from the
+payload type appears in it, every enumeration carries its explicit
+discriminants, every bounded type carries its bound, and every constructor the
+descriptor uses is one this specification defines. Structural completeness is
+asserted on every adapter the suite covers.
+
+#### C8.3 — INVARIANT
+
+A consumer declares its payload type's schema version in the source that defines
+that type. Across a migration the conformance suite asserts that the target
+type's version stands later than the source type's, and a migration whose
+version stands still or stands earlier is a conformance failure.
+
 ### Timing
 
 The windows and waits the specified behaviour depends on.
+
+#### C9.1 — INVARIANT
+
+A migration whose source is under active append converges by transferring events
+while the source continues to take them, and completes across a freeze window.
+The window opens when the untransferred remainder is small, spans the transfer of
+that remainder, and closes when the writer role passes to the application writing
+the target. The source takes no append for as long as the window stands open.
 
 ### Artefacts
 
 The on-disk structures, their topology, and what each one carries.
 
+#### C10.1 — INVARIANT
+
+An artefact's ownership record is itself an artefact of the kind pardosa manages.
+It holds an ordered, append-only line of typed records, pardosa reads and writes
+it through the machinery that reads and writes event data, and on every adapter
+it offers the capability an ordinary artefact offers.
+
+#### C10.2 — INVARIANT
+
+Creating an ownership record and seeding the claim it carries is one indivisible
+step. The step lands where no ownership record stands for the artefact and is
+refused where one already stands, so exactly one of any number of concurrent
+creators establishes the record.
+
+#### C10.3 — INVARIANT
+
+A writer holds exclusion on the artefact carrying the event data for the whole of
+its writing session, and that exclusion is released when the session ends.
+pardosa takes the exclusion the adapter offers and names each condition under
+which the exclusion it took does not hold. What the exclusion establishes reaches
+writers that take part in it.
+
+#### C10.4 — INVARIANT
+
+One ownership record stands for one artefact, and no ownership record spans two
+generations. The artefact a migration writes carries an ownership record created
+with it. A reader moving from one generation to the next follows the pointer the
+record carries, and consults no artefact standing outside the two.
+
+#### C10.5 — INVARIANT
+
+An artefact's ownership record and its event data are held in one container
+format, the ownership record's typed records being payloads of that format. On a
+filesystem the two stand in one directory and share a stem, and the stem is
+matched exactly, case included, on every platform.
+
+#### C10.6 — INVARIANT
+
+Every crate pardosa publishes carries, inside the published archive itself, the
+full text of each licence under which that crate is offered.
+
 ### Vocabulary and constants
 
 The fixed names, variant sets, and concrete values, and the meaning reserved for each.
+
+#### Where this specification stands
+
+The path holding the normative prose, and what that path names.
+
+#### C12.1 — INVARIANT
+
+This specification stands at `docs/spec/pardosa-1.0.md`. The path names the line
+the document specifies rather than the version currently published, and each
+major line is specified by a document at a path of its own, so a clause citation
+resolves to the same clause for as long as that line stands.
+
+#### What a caller chooses for a fiber
+
+The complete set of treatments a migration offers, and the word for each.
+
+#### C12.2 — SURFACE
+
+A caller starting a migration chooses, for each fiber, exactly one of three
+treatments: the fiber is kept, and its events are carried into the target; the
+fiber is purged, and its events are erased from the target; or the fiber is
+locked and pruned, and the rescue policy the caller names governs what the target
+retains of it. These three are the whole of the migration-policy vocabulary a
+caller holds.
+
+#### The conditions a writer is given a name for
+
+Three conditions on the ownership path, each with the name a caller matches on
+and the remedy that follows from it.
+
+#### C12.3 — INVARIANT
+
+Creating an artefact that already stands yields one condition, whatever moment
+that artefact came to stand, and the caller's remedy is to open the artefact
+instead. That condition is distinct from the condition a writer receives when its
+claim to an already-standing artefact does not land.
+
+#### C12.4 — INVARIANT
+
+A write refused because a later owner has taken the artefact is a condition of
+its own and carries one name on every adapter. It stands distinct from the
+condition a writer receives when its claim does not land: a caller holding it
+owned the artefact and owns it no longer, events it has already written may stand
+in the artefact unreachable, and presenting those events again is unfounded.
+
+#### C12.5 — INVARIANT
+
+An artefact whose ownership record pardosa cannot establish is refused under one
+name, and that name stands the same on every adapter. The name states that the
+artefact's ownership is unestablished.
