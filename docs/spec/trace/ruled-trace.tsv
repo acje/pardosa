@@ -101,3 +101,45 @@ ruled_n	disposition	clause_ids	note
 236	SPEC-BEARING	C3.11	Envelope shape stays with this specification; the byte container's version belongs to the format specification. Never conflated.
 238	SPEC-BEARING	C4.10	The exclusion trait stays internal; the obligation is held by conformance rather than by the type system. Accepted cost: symmetry is tested, not structural.
 239	SPEC-BEARING	C4.10	The backend marker trait stays method-less and the two seals stay orthogonal, leaving a future backend nothing to break.
+123	SPEC-BEARING	C5.32	Homogeneity is the promise to a reader without the Rust types; C5.32 already states it and RULED 92 forbids a second statement of it.
+125	SPEC-BEARING	C5.46	The descriptor is mandatory in every artefact; the option to ship a self-undescribing artefact is closed.
+131	SPEC-BEARING	C5.47	Schema identity is a function of the descriptor; equality is the only comparison and version is the identity-differs relation and nothing more.
+132	SPEC-BEARING	C5.48	Identity is shape plus name, the consumer supplies the name, and the name is a component never a key; pardosa runs no registry.
+138	SPEC-BEARING	C4.19	Equality absolutely, and schema change is a migration. C4.19 already carries the always-refuse plus no-computed-compatibility family; no second clause is authored.
+145	SPEC-BEARING	C5.56	One word per concept, with the word schema owned by the payload type's identity and description.
+146	SPEC-BEARING	C5.55	The schema condition names the property rather than the detecting mechanism; the instance of the standing rule C5.55 states.
+149	SPEC-BEARING	C5.53	The comparison binds every event-yielding path on every adapter, and the suite asserts it, so symmetry is structural rather than incidental.
+150	SPEC-BEARING	C5.50	The payload type's root is an enumeration, each variant one event kind with a recorded discriminant; structures stay legal below the root.
+152	SPEC-BEARING	C5.51	Mandated variants are declared by the consumer and never injected; recognition is by pardosa's mark, not by the consumer's chosen name.
+153	SPEC-BEARING	C5.55	Judged spec-bearing rather than governance over this pass: the ruling governs every name in pardosa's own vocabulary, which is surface a stranger reads.
+156	MAP-GOVERNANCE	-	Refuses a PR-level decision-currency gate over this effort's own records. The ruling states its own class: a mechanism and process refusal changing nothing pardosa promises a stranger, and expressly not a citable refusal.
+160	MAP-GOVERNANCE	-	Fixes how closed bd tickets are read against the map body. The ruling states its own class: a record-keeping rule, not a spec clause.
+162	SPEC-BEARING	C4.19	Re-grounds the envelope identity value on the from-0.5.1 equality refusal that C4.19 carries. The ruling mints no clause of its own and preserves an outcome already stated.
+167	MAP-GOVERNANCE	-	Fixes that a non-substantive PAR ADR edit supersedes nothing. It governs this effort's ADR corpus and record-keeping, not the library's behaviour.
+169	SPEC-BEARING	C5.59	The obligation half survives as a property clause on how a public structure is constructed; the mechanism half is struck and stays unmandated.
+173	MAP-GOVERNANCE	-	The refuse-at-open tier is already carried by C5.35; the inexpressibility tier is design discipline governing how pardosa decides, and RULED 175 states it is not a spec clause.
+174	MAP-GOVERNANCE	-	Fixes when the RULED 173 design discipline fires. It governs a discipline that is itself not a spec clause, so it lands in none of its own.
+176	SPEC-BEARING	C5.35	States the existing refuse-at-open rule's reach as already covering consumer configuration; C5.35 states configuration unqualified and needs no widening.
+177	MAP-GOVERNANCE	-	Sets the PAR ADR edit-versus-supersede boundary. The ruling states its own class: a record-keeping rule, not a spec clause.
+178	MAP-GOVERNANCE	-	The scope-movement tie-breaker for PAR ADR supersession. Same class as RULED 177: record-keeping over the ADR corpus, not a spec clause.
+179	SPEC-BEARING	C5.49	Descriptor production is restricted to the published derive, with relaxation available as an addition within a major line.
+182	SPEC-BEARING	C5.49	The in-tree hand-written implementations are the named exception without which the derive-only restriction is false on its face.
+184	SPEC-BEARING	C5.57	Logical identity is operator-supplied, carries a generation boundary, and makes no tamper claim. ESCALATION OPEN: C5.20's sentence that no identity crosses the boundary reads wider than this exception; analysis in bd bead pardosa-de69, not self-resolved.
+187	SPEC-BEARING	C5.58	The partitioning rule is operator-declared and never inferred, and an uncovered fiber is a refusal at open rather than a default assignment.
+189	SPEC-BEARING	C4.14	Presence of the identity record is unconditional. C4.14 states the metadata record carries the identity structure with no absence case, so no second absence semantics is minted.
+194	SPEC-BEARING	C5.54	The record-yielding reader sits outside the schema comparison by design, and what it is given instead is the mandatory descriptor. Stated, not left inferable.
+195	SPEC-BEARING	C5.52	Purge acts on a tombstoned fiber under the purging migration policy alone; the link is made inside the existing policy set without minting a variant.
+196	SPEC-BEARING	C5.51	Exactly one mandated variant, the tombstone, and C5.51 states that set as complete at one.
+197	SPEC-BEARING	C5.44	Detach is refused and the refusal is recorded positively: the envelope already carries the fact, so no second durable rendering is required of a consumer.
+198	SPEC-BEARING	C5.45	Snapshot, migration record and correction are each refused as required kinds and recorded rather than left as silent absence.
+205	MAP-GOVERNANCE	-	Bounds what the citation sweep over this map's bd corpus may claim. It governs a tool over the corpus and reports nothing about pardosa's behaviour.
+217	MAP-GOVERNANCE	-	Fixes which agents the clean-room wall binds and where Notes-level rules reach. It governs the transfer map's charter, not the library's behaviour.
+218	MAP-GOVERNANCE	-	Rewrites contrastive charter entries positively. It governs the transfer map's charter text, not any statement a consumer of the library relies on.
+220	MAP-GOVERNANCE	-	Binds the map's own closing decision to an audited constraints list. It governs the map's closure and record-keeping, not the library's behaviour.
+221	MAP-GOVERNANCE	-	Records that a cyclic descriptor graph is refused by the language the consumer writes its payload type in, and that pardosa builds no mechanism of its own. There is no pardosa behaviour for a clause to state.
+225	MAP-GOVERNANCE	-	Ratifies a foreign governance corpus as advice this map may consult. It governs this map's citation practice, and the spec cites no foreign corpus normatively.
+226	MAP-GOVERNANCE	-	No ruling may rest solely on a foreign ADR. A citation-audit rule over this map's own record-keeping, with no library behaviour behind it.
+228	MAP-GOVERNANCE	-	Fixes that advice cannot overturn a ruling, with TigerStyle as the named instance. Precedence among this map's inputs, never a statement about pardosa.
+232	MAP-GOVERNANCE	-	Preserves record-without-a-gate where an ADR venue exists. It governs this effort's ADR corpus and review discipline, not the library's behaviour.
+241	SPEC-BEARING	C5.60	No release publishes a clause binding from 0.5.1 knowingly unmet, and the exclusion mechanism with its conformance assertion exists on every shipped adapter from the first published release.
+243	SPEC-BEARING	C4.2	The axis test is not widened to a quality judgement; C4.2 states the test unmodified, which is what this ruling preserves so no marked clause reopens.

@@ -615,6 +615,137 @@ several artefacts holds one rolling commitment per artefact, each establishing
 what it covers and nothing about its siblings. pardosa establishes no commitment
 spanning two artefacts, and offers no aggregate over the commitments of several.
 
+#### C5.44 — INVARIANT
+
+pardosa requires no event kind standing for a fiber's detachment. An event's
+envelope records whether the fiber it belongs to stood detached when that event
+was written, and that record is the whole of what pardosa keeps on this axis. A
+consumer holds pardosa to no second rendering of it.
+
+#### C5.45 — INVARIANT
+
+pardosa requires no event kind standing for a snapshot of accumulated state, for
+a migration having occurred, or for a correction of an earlier event. A consumer
+modelling any of the three declares it among the kinds of its own payload type
+and carries its meaning itself.
+
+#### The payload type and its descriptor
+
+What a consumer's events are described by, who may produce that description, and
+what identity it fixes.
+
+#### C5.46 — INVARIANT
+
+Every artefact carries a schema descriptor for the payload type its events hold.
+The descriptor is present in every artefact pardosa writes, and pardosa admits no
+artefact that omits it.
+
+#### C5.47 — INVARIANT
+
+An artefact's schema identity is a function of its schema descriptor. A change to
+the described structure yields a different schema identity. Two schema identities
+are compared for equality, and two schemas stand in a version relation when their
+identities differ, which is the whole of what that relation records.
+
+#### C5.48 — INVARIANT
+
+A schema's identity comprises the described structure together with the names the
+payload type and its nested types carry. The consumer supplies those names. A
+name is a component of identity and never a key: pardosa keeps no registry of
+names and settles no collision between two consumers that choose the same one.
+Two payload types coincide in identity when they coincide in structure and in
+name.
+
+#### C5.49 — SURFACE
+
+A schema descriptor is produced by the derive macro pardosa publishes for that
+purpose and by the hand-written implementations pardosa ships within its own
+crates. That set of producers is fixed at 1.0, and pardosa names the hand-written
+implementations it ships. Admitting a further producer is an addition within a
+major line.
+
+#### C5.50 — INVARIANT
+
+A payload type is an enumeration at its root, and each of its variants is one
+event kind. Each variant carries an explicit discriminant, and the schema
+descriptor records those discriminants. A structure stands as a variant's payload
+and as a field's type, and stands as the root of no payload type.
+
+#### C5.51 — SURFACE
+
+A consumer's payload type declares the event kinds pardosa requires of it, and
+that set is complete at one: the tombstone. The consumer writes the variant into
+its own type and names it, and pardosa recognises the variant by the mark pardosa
+defines for that kind rather than by the name the consumer chose. pardosa places
+no variant into a consumer's payload type of its own accord.
+
+#### C5.52 — INVARIANT
+
+A migration removes a fiber whose latest event is a tombstone under the migration
+policy that purges, and retains such a fiber under every other migration policy
+this specification offers.
+
+#### C5.53 — INVARIANT
+
+Every path that yields events to a consumer compares the artefact's recorded
+schema identity against the identity of the payload type the consumer names, and
+does so on every adapter. A path yielding events without that comparison is a
+path pardosa does not open. The conformance suite asserts this of each adapter.
+
+#### C5.54 — INVARIANT
+
+A reader yielding an artefact's records rather than its events makes no
+comparison of schema identity, and this specification states that shape for it.
+What that reader is given in place of the comparison is the artefact's schema
+descriptor, from which it establishes the payload type for itself.
+
+#### Naming
+
+The rules governing every name pardosa teaches a consumer.
+
+#### C5.55 — SURFACE
+
+Every name pardosa gives a condition, a type or an item names the property that
+holds, and names no mechanism by which pardosa established it. Where an
+implementer needs the mechanism, the diagnostic an implementation renders carries
+it.
+
+#### C5.56 — SURFACE
+
+Each concept pardosa teaches owns one word, and each word names one concept. The
+word *schema* names a payload type's identity together with its description.
+
+#### Membership, construction and release
+
+Which dragline a fiber belongs to, how a consumer builds what pardosa exposes,
+and what a release carries.
+
+#### C5.57 — INVARIANT
+
+An artefact's logical identity is the operator's naming of a dataset. The
+operator supplies it, and it carries across a generation boundary unchanged. It
+establishes nothing about whether the artefact has been tampered with.
+
+#### C5.58 — INVARIANT
+
+The rule partitioning fibers across the draglines of one logical identity is
+declared by the operator. pardosa reads the declared rule and infers none. Where
+a fiber falls outside the declared rule, pardosa refuses to open the artefact and
+assigns that fiber to no dragline.
+
+#### C5.59 — SURFACE
+
+A public structure pardosa exposes is constructed through the constructors and
+builders pardosa names for it. A consumer constructs such a structure by naming
+one of those, and pardosa fixes no mechanism by which the restriction is held.
+
+#### C5.60 — INVARIANT
+
+pardosa publishes no release in which a clause binding from 0.5.1 is knowingly
+unmet. Every adapter pardosa ships holds the exclusion this specification states
+from its first published release, and the conformance suite asserts that
+exclusion on each adapter it covers.
+
 ### Public surface
 
 What the library exposes, what each type carries, and where each fact is recorded.
