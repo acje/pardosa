@@ -143,3 +143,41 @@ ruled_n	disposition	clause_ids	note
 232	MAP-GOVERNANCE	-	Preserves record-without-a-gate where an ADR venue exists. It governs this effort's ADR corpus and review discipline, not the library's behaviour.
 241	SPEC-BEARING	C5.60	No release publishes a clause binding from 0.5.1 knowingly unmet, and the exclusion mechanism with its conformance assertion exists on every shipped adapter from the first published release.
 243	SPEC-BEARING	C4.2	The axis test is not widened to a quality judgement; C4.2 states the test unmodified, which is what this ruling preserves so no marked clause reopens.
+3	SPEC-BEARING	C6.1	The public lifecycle types stay as vocabulary a consumer names, with no serialized form supplied and the rendering left to a consumer that needs one.
+11	SPEC-BEARING	C6.13	The epoch is read from the artefact's own ownership record, never from an external coordinator and never from an operator.
+22	SPEC-BEARING	C5.6	Read-only open available on every target is already stated in C5.6 as part of the exclusion clause; RULED 92 forbids a second statement of the same capability, so no C6 clause is minted.
+23	SPEC-BEARING	C6.16	Both generations' metadata records carry a migration record, each written by the owner of the artefact holding it. Depends on open escalation pardosa-de69 over how far C5.20's no-identity-crosses sentence reaches; C6.16 names generations without widening it.
+24	SPEC-BEARING	C6.14	A read-only open of an artefact with no ownership record succeeds and reports unowned with generation unknown, rather than refusing.
+30	SPEC-BEARING	C6.2	The three in-flight-only conditions stay in the public vocabulary, with the fact that a reopened artefact never yields them stated of each.
+33	SPEC-BEARING	C6.3	The per-fiber classification a migration makes stays pardosa's own; what a consumer names is stated positively as the state and the policies.
+34	SPEC-BEARING	C6.20	The written artefact's disclosure: a dense chain from genesis, a purged precursor yielding a genesis event, and nothing disclosed about what was removed.
+35	SPEC-BEARING	C6.19	The caller names the rescue policy at the call that starts the migration, and the choice is recorded in the metadata record and in no event.
+38	SPEC-BEARING	C6.18	The closure maps payload to payload and may refuse; the envelope is unreachable to it and wholly pardosa-assigned.
+50	SPEC-BEARING	C6.15	pardosa reports which generation state holds and never opens another artefact for the caller. Consulting the record is pardosa's obligation, not the reader's.
+52	SPEC-BEARING	C6.17	The pointer is written at completion, so its presence establishes a complete target unconditionally. Depends on open escalation pardosa-de69; C6.17 states completeness without asserting anything about identity across the boundary.
+54	SPEC-BEARING	C6.7	Three types for three questions, with a condition reached on a successful path never carried by the failure type. Stale premise named: this ruling's non-exhaustive attribute on the top-level failure enumeration was reopened and dropped by RULED 142, which C4.6 carries; C6.7 states the three-family split only.
+56	SPEC-BEARING	C6.9	Adapter detail rides in a pardosa-owned field and no adapter error type is reachable by any route, including a walked chain of causes.
+61	SPEC-BEARING	C6.10	The remedy is documented with the condition and follows from the type held; no predicate over a condition is published.
+62	SPEC-BEARING	C6.8	One qualified-result type spanning the five states, enumerated completely, so a caller need not choose a question before knowing what it holds.
+63	SPEC-BEARING	C6.11	The diagnostic payload is the whole of the operator-facing report; the fixed surface carries no further channel.
+77	SPEC-BEARING	C6.31	A positive supported-writer list, no exclusion list, and an unestablished platform recorded as unestablished. The target names themselves are layer-12 constant material and land in a later slice.
+81	SPEC-BEARING	C6.32	The maintainer relationship is disclosed and triage is best effort, with no response time committed on the non-security path.
+91	MAP-GOVERNANCE	-	Governs this document's own front matter. The status block exists at the head and, by RULED 92, carries no clause number and no marker, so a library specification has no clause for it. Assumption named: the disposition's stated categories do not enumerate this document's own construction, and the same reading was taken for the documentation bar at RULED 84/85 and confirmed by RULED 242.
+92	MAP-GOVERNANCE	-	Governs this document's own construction: the block points at the clause stating the regime scheme and does not restate it. C5.1 states that scheme once and the block cites it, so no second statement and no self-referential clause exists to record. Same reading as the RULED 91 row.
+93	SPEC-BEARING	C6.4	Dragline is taught vocabulary with no public item a consumer names, and a consumer reaches every capability without addressing one.
+94	SPEC-BEARING	C2.1	One entity is taught at this level and event line is stated as an aspect of a dragline, which C2.1 already carries; RULED 92 forbids a second statement, so no C6 clause is minted.
+99	SPEC-BEARING	C6.5	No identity a library consumer holds; the locator names the dragline from outside and the rolling commitment is the comparable value. Depends on open escalation pardosa-de69; C6.5 asserts nothing about identity across a generation boundary.
+104	SPEC-BEARING	C6.6	The two tiers of visibility stated positively: the operator interface reports dragline identifiers, and no such identity enters the consumer surface.
+109	SPEC-BEARING	C5.3;C5.40	The exclusion property is stated mechanism-free in C5.3 and the ordering refusal it must not be read into is C5.40, sited one titled run apart. The ruling's own instruction is to point rather than restate, so RULED 92 forbids a third statement and no C6 clause is minted.
+112	MAP-GOVERNANCE	-	Allocates a rationale between this specification and the PAR ADR corpus and rules that the specification owes nothing on the axis. It governs the ADR corpus's content, not the library's behaviour, so it lands in no clause by its own terms.
+115	SPEC-BEARING	C6.12	One backward walk with strict semantics: genesis is an ordinary ending and the two abnormal terminations each carry their own name.
+119	SPEC-BEARING	C6.30	Each alteration-detection claim is stated per mechanism with its scope attached, and the aggregate sentence is refused structurally rather than left to drafting care.
+124	SPEC-BEARING	C6.21	The schema/standard boundary stated positively, with each side describing its own half and the envelope's field semantics left unenumerated.
+126	SPEC-BEARING	C6.22	The descriptor's three parts: the payload type's structure, the reachable enumerations with their discriminants, and every bound. Encoding is excluded.
+127	SPEC-BEARING	C6.23	The descriptor's vocabulary is a complete set of constructors this specification defines, decoded by implementing them rather than by parsing a language.
+129	SPEC-BEARING	C6.25	One descriptor per artefact in the artefact-scoped metadata, found in a known place, with the promise identical on every adapter and the mechanism free to differ.
+130	SPEC-BEARING	C6.29	The two derived values are separated by which document each moves with. Assumption named: RULED 233 rules the standard carries no named revision, so C6.29 states the envelope factor as a function of the shape this specification fixes and mints no revision identity.
+133	SPEC-BEARING	C6.26	The version is ordered and a reader establishes which came later; ordering is scoped to one schema name, yields no decodability conclusion, and is kept distinct from generation order.
+134	SPEC-BEARING	C6.27	The version sits inside the descriptor and therefore inside identity, so identity still determines the description.
+136	SPEC-BEARING	C6.28	Schema identity is stated positively as an accident-resistant discriminator recomputable from the descriptor, and as evidence of no alteration.
+137	SPEC-BEARING	C6.24	One rendering of the description, so the public surface cannot present the same shape twice and let the two drift.

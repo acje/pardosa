@@ -750,6 +750,256 @@ exclusion on each adapter it covers.
 
 What the library exposes, what each type carries, and where each fact is recorded.
 
+#### What the surface names
+
+The vocabulary a consumer holds, and the entities pardosa teaches without publishing
+a type for them.
+
+#### C6.1 — SURFACE
+
+The lifecycle types pardosa publishes are vocabulary a consumer names: a fiber's
+state, the migration policy a caller selects, and the rescue policy governing a
+locked fiber's migration. pardosa gives none of them a serialized form. A consumer
+transporting one of these values across a boundary of its own supplies the
+rendering itself.
+
+#### C6.2 — INVARIANT
+
+A fiber's locked state, a fiber's migrating condition, and a non-empty set of
+removed fiber identities are reachable only within a running migration. An artefact
+opened after a migration has finished yields none of the three, and pardosa states
+this of each of them where it names them.
+
+#### C6.3 — SURFACE
+
+The classification a migration makes of each fiber it considers is pardosa's own.
+What a consumer names of a fiber is its state and the policies the consumer selects
+for it.
+
+#### C6.4 — SURFACE
+
+pardosa teaches *dragline* as vocabulary this specification defines. No public item
+a consumer names is a dragline, and a consumer reaches every capability pardosa
+offers without addressing one.
+
+#### C6.5 — SURFACE
+
+A dragline carries no identity a library consumer holds. The artefact's locator
+names the dragline from outside, and the value a consumer compares between two
+observations of one dragline is that dragline's rolling commitment.
+
+#### C6.6 — SURFACE
+
+An artefact's metadata record identifies each dragline making up its logical
+identity, and the read-only operator interface reports those identifiers. An
+identity a consumer could hold for a dragline enters no part of the surface a
+library consumer names. An operator names a dragline; a library consumer does not.
+
+#### What a caller receives
+
+The types that carry pardosa's answers, and what each of them discloses.
+
+#### C6.7 — SURFACE
+
+pardosa answers three questions with three types. One names the condition under
+which an operation failed. One is given to each sub-domain whose conditions are
+closed by construction — the liveness verdict, the proof a verdict of death
+carries, and whether an artefact is under migration — and enumerates that
+sub-domain completely. One carries what pardosa knows about an artefact a caller
+has just opened. A condition reached on a path that succeeded is carried by the
+third and never by the first.
+
+#### C6.8 — SURFACE
+
+One type carries what a caller knows about the artefact it has just opened:
+whether the artefact's generation is known, whether that generation is superseded,
+which of the two migration disagreements holds, and whether a presented cursor
+belongs to another generation. Its states are one complete enumeration, and a
+caller reads them from the value it already holds rather than by choosing which
+question to ask first.
+
+#### C6.9 — INVARIANT
+
+A failure pardosa reports carries diagnostic detail in a field pardosa owns. An
+error type belonging to a storage backend is reachable from that failure by no
+route pardosa provides, and a chain of causes a consumer walks reaches only types
+pardosa names.
+
+#### C6.10 — SURFACE
+
+pardosa documents, for each condition it names, what a caller does next. The remedy
+follows from the type the caller holds and from the condition that type names.
+pardosa publishes no predicate over a condition.
+
+#### C6.11 — SURFACE
+
+The diagnostic detail a failure carries is the whole of what pardosa reports to an
+operator about that failure. The surface fixed at 1.0 carries no further channel
+for it.
+
+#### C6.12 — SURFACE
+
+pardosa offers one walk backward along a fiber's precursor chain. The walk ends at
+the fiber's genesis event, and that ending is an ordinary one. A recorded precursor
+outside the artefact and a recorded precursor belonging to another fiber each end
+the walk under a name of its own.
+
+#### Reading an artefact and finding its generation
+
+What a read reports, where each record is written, and who writes it.
+
+#### C6.13 — INVARIANT
+
+An artefact's ownership record carries the epoch. pardosa reads the epoch from that
+record on every path that needs it, takes it from no coordinator outside the
+artefact, and accepts none an operator supplies.
+
+#### C6.14 — INVARIANT
+
+A read-only open of an artefact whose ownership record is absent succeeds. pardosa
+reports the artefact as unowned with its generation unknown, and yields the events
+the artefact holds.
+
+#### C6.15 — INVARIANT
+
+Every read-only open reports which generation state holds for the artefact it
+opened. Where the artefact's generation is superseded, pardosa names that state and
+yields the artefact the caller named. pardosa opens no other artefact on a caller's
+behalf.
+
+#### C6.16 — INVARIANT
+
+A migration is recorded in the metadata records of both generations. The metadata
+record of the artefact a migration writes carries the record of the incoming
+migration, written by the migration manager. The metadata record of the artefact a
+migration reads carries the pointer to the next generation, written by that
+artefact's own owner. Each record is written by the owner of the artefact holding
+it.
+
+#### C6.17 — INVARIANT
+
+The pointer to the next generation is written once that generation is complete. Its
+presence establishes that the generation it names is complete, and a reader
+following it reaches a complete generation without establishing that for itself.
+
+#### What a migration takes, and what it leaves
+
+The values a caller supplies to a migration, and what the resulting artefact
+discloses.
+
+#### C6.18 — SURFACE
+
+The closure a caller supplies to a migration maps one payload value to another and
+may refuse. It receives no event envelope and returns none. pardosa assigns every
+field of the envelope in the artefact the migration writes.
+
+#### C6.19 — INVARIANT
+
+The caller names the rescue policy at each migration it starts, and names it at the
+call that starts that migration. pardosa records the named policy with the
+migration's record in the metadata record. No event of any artefact carries it.
+
+#### C6.20 — INVARIANT
+
+The artefact a migration writes holds the surviving fibers' events, re-identified
+and chained densely from genesis. An event whose recorded precursor the migration
+removed is a genesis event in the artefact written. The artefact written discloses
+nothing about what the migration removed.
+
+#### The schema descriptor and what it discloses
+
+What describes a consumer's events, in what vocabulary, where it lives, and what a
+reader may conclude from it.
+
+#### C6.21 — INVARIANT
+
+An artefact's schema descriptor describes the payload type its events carry. This
+specification fixes the event envelope and the arrangement of a dragline's events.
+Each of the two describes its own half, and neither describes the other's.
+
+#### C6.22 — INVARIANT
+
+A schema descriptor carries the payload type's own structure; the enumerations
+reachable from that type, each with the discriminant every one of its variants
+carries; and the bound of every bounded value the type holds. It carries no
+rendering of those values into bytes.
+
+#### C6.23 — SURFACE
+
+A schema descriptor is written in the type constructors this specification names,
+and that set of constructors is complete. Each constructor means what this
+specification states it means. A reader decodes a descriptor by implementing the
+constructors this specification names, and parses no programming language to do so.
+
+#### C6.24 — SURFACE
+
+The schema descriptor is the whole of the description pardosa publishes for a
+payload type. pardosa publishes one item carrying that description and no second
+rendering of it.
+
+#### C6.25 — INVARIANT
+
+Every artefact carries its schema descriptor once, in the artefact-scoped metadata
+its adapter offers, and a reader finds it in a place it knows before it opens the
+artefact. Each adapter meets this through the artefact-scoped mechanism available
+to it, and the promise a reader receives is the same on every adapter.
+
+#### C6.26 — INVARIANT
+
+A schema carries a version, and two versions of one schema are ordered. A reader
+compares them and establishes which of the two was declared later. That order holds
+among the versions of schemas sharing one name, and pardosa states no relation
+between the versions of two schemas carrying different names. Which schemas a
+reader decodes does not follow from that order, and the order over an artefact's
+generations is a separate order.
+
+#### C6.27 — INVARIANT
+
+The version is a field of the schema descriptor. Two schemas differing in version
+alone differ in identity, and the description a reader recovers from an identity
+therefore includes the version that identity was computed over.
+
+#### C6.28 — INVARIANT
+
+A schema identity distinguishes one described structure from another and resists
+accidental coincidence between two of them. A reader recomputes it from the
+descriptor the artefact carries. It establishes nothing about who wrote that
+descriptor and stands as evidence of no alteration.
+
+#### C6.29 — INVARIANT
+
+A reader meets two derived values and compares each. One is a function of the
+schema descriptor, and moves with the payload type a consumer defines. The other is
+a function of the event envelope's shape, which this specification fixes, and moves
+with this specification. Neither is a function of the other's subject, and a
+difference in either names the document whose subject changed.
+
+#### What pardosa discloses about itself
+
+The claims pardosa makes, the platforms it names, and the relationship a consumer
+enters.
+
+#### C6.30 — INVARIANT
+
+pardosa states each claim it makes about detecting alteration for one mechanism at
+a time, and states the scope of that mechanism alongside it. pardosa states no
+claim spanning two such mechanisms and offers no single sentence a reader carries
+away in place of them.
+
+#### C6.31 — INVARIANT
+
+pardosa names the platforms on which it opens an artefact for writing, and that
+naming is the list of platforms pardosa supports for writing. pardosa publishes no
+list of platforms it excludes. Where a platform's standing is unestablished,
+pardosa records it as unestablished and claims it in neither direction. A read-only
+open is available wherever pardosa builds.
+
+#### C6.32 — INVARIANT
+
+pardosa states the size of the group that maintains it. Triage of a report a
+consumer files is best effort, and pardosa commits to no time within which a report
+is answered.
+
 ### Verification
 
 The checks that hold the specified behaviour in place, and the strength of each.
