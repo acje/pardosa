@@ -138,15 +138,15 @@ each answers its own question.
 
 ### Evolution and compatibility
 
-What is frozen, what remains free to change, and who may extend the system.
+What is frozen, what remains free to change, and who extends the system.
 
 #### C4.1 — INVARIANT
 
 This specification carries two kinds of commitment, and every clause carries
 exactly one of them. A commitment on the invariant axis binds from 0.5.1 and
 pardosa holds it from that release onward. A commitment on the surface axis is
-fixed at 1.0: within the 0.5.x line the shape it describes may change at a minor
-release, and from 1.0 it changes only at a major release. A consumer reads a
+fixed at 1.0: within the 0.5.x line the shape it describes is free to change at a
+minor release, and from 1.0 it changes only at a major release. A consumer reads a
 clause's axis and knows which of the two it has been given.
 
 #### C4.2 — INVARIANT
@@ -154,9 +154,9 @@ clause's axis and knows which of the two it has been given.
 Every clause records its own axis, and the axis is a property of that clause
 rather than of the section holding it. The axis answers one question: does
 breaking this clause break a consumer. It answers nothing about whether the
-clause's text may change. A clause therefore holds a binding commitment while
-its content stays open, and a clause that enumerates may add to its enumeration
-in any release without altering what it promises. Every clause of this
+clause's text changes. A clause therefore holds a binding commitment while
+its content stays open, and a clause that enumerates is free to add to its
+enumeration in any release without altering what it promises. Every clause of this
 specification binds from 0.5.1, and a clause's axis names which commitment that
 clause carries rather than whether it carries one.
 
@@ -272,11 +272,11 @@ commitment covering the whole of that artefact.
 #### C4.19 — INVARIANT
 
 Between migrations, the order a dragline establishes over the events of different
-fibers holds. A migration may remove events, and the order surviving a migration
-is a subsequence of the order preceding it. A migration does not reorder the
-events within a dragline. pardosa documents this order as a dragline's default
-behaviour and offers no contract over it: a consumer may observe it and may not
-hold pardosa to it.
+fibers holds. A migration is free to remove events, and the order surviving a
+migration is a subsequence of the order preceding it. A migration does not reorder
+the events within a dragline. pardosa documents this order as a dragline's default
+behaviour and offers no contract over it: a consumer observes it and holds pardosa
+to none of it.
 
 #### C4.20 — INVARIANT
 
@@ -403,15 +403,15 @@ deciding it reads the contents of neither.
 Where pardosa cannot read an artefact's ownership record while fencing a write,
 it refuses the write under a name distinct from the name it gives a stale-epoch
 rejection. The refused write leaves the artefact as it stood and leaves the
-events resident with the caller, and the caller may present them again.
+events resident with the caller, and the caller presents them again.
 
 #### C5.13 — INVARIANT
 
 A safety mechanism pardosa relies on and cannot take is a refusal. Evidence that
 would only make a decision cheaper, and whose absence leaves the fence intact, is
 an indeterminate verdict. pardosa applies this distinction at every point where a
-platform withholds something it depends on, and a platform withholding identity
-evidence alone remains a full writer.
+platform withholds something pardosa depends on, and pardosa remains a full writer
+on a platform that withholds identity evidence alone.
 
 #### C5.14 — INVARIANT
 
@@ -430,8 +430,8 @@ winner between them.
 
 #### C5.16 — INVARIANT
 
-An outcome where a write may or may not have landed is an outcome of its own,
-belonging neither to failure nor to success. A caller receiving it establishes
+An outcome that leaves whether a write landed undetermined is an outcome of its
+own, belonging neither to failure nor to success. A caller receiving it establishes
 what landed before deciding, and a duplicate append is observable to that caller.
 
 #### C5.17 — INVARIANT
@@ -484,7 +484,7 @@ unconstrained after it.
 
 A migration preserves the relative order of every pair of events it retains in
 one dragline, and pardosa holds this from 0.5.1 across every migration policy a
-caller may select. The conformance suite asserts it.
+caller selects. The conformance suite asserts it.
 
 #### C5.25 — INVARIANT
 
@@ -646,7 +646,7 @@ and carries its meaning itself.
 
 #### The payload type and its descriptor
 
-What a consumer's events are described by, who may produce that description, and
+What a consumer's events are described by, who produces that description, and
 what identity it fixes.
 
 #### C5.46 — INVARIANT
@@ -905,8 +905,8 @@ discloses.
 #### C6.18 — SURFACE
 
 The closure a caller supplies to a migration maps one payload value to another and
-may refuse. It receives no event envelope and returns none. pardosa assigns every
-field of the envelope in the artefact the migration writes.
+is free to refuse. It receives no event envelope and returns none. pardosa assigns
+every field of the envelope in the artefact the migration writes.
 
 #### C6.19 — INVARIANT
 
@@ -924,7 +924,7 @@ nothing about what the migration removed.
 #### The schema descriptor and what it discloses
 
 What describes a consumer's events, in what vocabulary, where it lives, and what a
-reader may conclude from it.
+reader concludes from it.
 
 #### C6.21 — INVARIANT
 
@@ -1051,7 +1051,7 @@ this specification fixes. Whether a descriptor describes the events an artefact
 holds faithfully stands outside what pardosa establishes, and pardosa states that
 limit wherever it names what a descriptor gives a reader.
 
-#### What a ownership record carries about itself
+#### What an ownership record carries about itself
 
 The version the identity structure versions, and the reach of one artefact's
 record.
@@ -1244,8 +1244,9 @@ claim to an already-standing artefact does not land.
 A write refused where a later owner has taken the artefact is a condition of
 its own and carries one name on every adapter. It stands distinct from the
 condition a writer receives when its claim does not land: a caller holding it
-owned the artefact and owns it no longer, events it has already written may stand
-in the artefact unreachable, and presenting those events again is unfounded.
+owned the artefact and owns it no longer, whether events it has already written
+stand in the artefact unreachable is undetermined, and presenting those events
+again is unfounded.
 
 #### C12.5 — INVARIANT
 
