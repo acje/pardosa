@@ -212,21 +212,29 @@ admit a further field; this specification refuses to add one.
 #### C4.10 — SURFACE
 
 The trait an adapter implements is sealed: pardosa names the implementations
-that exist, and an implementation authored outside pardosa is not admitted. The
-obligations an adapter meets are public, and a third party establishes for
-itself that an adapter meets them. Opening the seal is an addition within a major
-line; closing it again is a major change. The trait marking which backend an
-artefact belongs to carries no method, and the trait governing how bytes reach
-durable storage seals separately from it. The trait carrying the exclusion
-obligations stays internal, and conformance is what holds an adapter to them.
+that exist, and an implementation authored outside pardosa is not admitted.
+Opening the seal is an addition within a major line; closing it again is a major
+change.
 
 #### C4.11 — SURFACE
+
+The obligations an adapter meets are public, and a third party establishes for
+itself that an adapter meets them.
+
+#### C4.12 — SURFACE
+
+The trait marking which backend an artefact belongs to carries no method, and
+the trait governing how bytes reach durable storage seals separately from it.
+The trait carrying the exclusion obligations stays internal, and conformance is
+what holds an adapter to them.
+
+#### C4.13 — SURFACE
 
 The migration manager is a module of the pardosa crate. It is part of the public
 surface fixed at 1.0, and the vocabulary a migration failure surfaces through is
 fixed with it.
 
-#### C4.12 — SURFACE
+#### C4.14 — SURFACE
 
 An artefact's ownership record has its shape fixed at 1.0. The operator interface
 reading that record answers three questions: which owner holds this artefact,
@@ -234,7 +242,7 @@ whether that owner is provably dead, and which migrations ran under which rescue
 policy. The record's event set as an interface, access to its individual fields,
 and the abstraction beneath it stay internal and are not fixed.
 
-#### C4.13 — SURFACE
+#### C4.15 — SURFACE
 
 The ownership record carries nine kinds of record, and that set is fixed at 1.0.
 The nine are the ownership claim, the clean release, the migration start, the
@@ -242,26 +250,26 @@ migration end, the inbound pointer, the outbound pointer, the rescue-policy
 choice recorded with the migration start, the identity structure, and the schema
 descriptor. A record of a kind pardosa does not recognise is rejected.
 
-#### C4.14 — INVARIANT
+#### C4.16 — INVARIANT
 
 From 0.5.1 the ownership record carries an identity structure that holds across
 any number of draglines: a logical identity distinct from the artefact's physical
 locator, a version, the identifiers of the draglines that make up that identity,
 and the rule partitioning fibers across them.
 
-#### C4.15 — INVARIANT
+#### C4.17 — INVARIANT
 
 The order a dragline establishes over its events, the per-fiber precursor chain,
 and the dense re-chaining across a generation boundary bind from 0.5.1. How those
 events are physically laid down is fixed at 1.0. A clause governing an artefact's
 layout states which of the two halves it governs.
 
-#### C4.16 — INVARIANT
+#### C4.18 — INVARIANT
 
 An artefact holds exactly one dragline. A consumer relies on one rolling
 commitment covering the whole of that artefact.
 
-#### C4.17 — INVARIANT
+#### C4.19 — INVARIANT
 
 Between migrations, the order a dragline establishes over the events of different
 fibers holds. A migration may remove events, and the order surviving a migration
@@ -270,7 +278,7 @@ events within a dragline. pardosa documents this order as a dragline's default
 behaviour and offers no contract over it: a consumer may observe it and may not
 hold pardosa to it.
 
-#### C4.18 — INVARIANT
+#### C4.20 — INVARIANT
 
 The event envelope reserves one optional slot, which 1.0 leaves unused and
 unexposed. pardosa offers no interface for reading or writing event metadata, and
@@ -278,7 +286,7 @@ an event does not name the dragline it belongs to. A consumer carrying metadata
 of its own carries it within the event type it defines, and that type is the
 extension point pardosa documents.
 
-#### C4.19 — INVARIANT
+#### C4.21 — INVARIANT
 
 An envelope whose recorded shape differs from the shape pardosa expects is
 refused, on every path. pardosa does not compute whether one schema is compatible
@@ -286,19 +294,19 @@ with another. A schema change is a migration, and migration is what a consumer
 reaches for in place of computed compatibility. This refusal holds throughout the
 1.0 line.
 
-#### C4.20 — SURFACE
+#### C4.22 — SURFACE
 
 The event envelope carries five fields this specification owns, and that set is
 fixed at 1.0. The format admits a sixth field; this specification refuses to add
 one.
 
-#### C4.21 — SURFACE
+#### C4.23 — SURFACE
 
 pardosa's public surface is five modules, and that count is fixed at 1.0.
 Material that would otherwise mint a sixth module is placed in the module whose
 concept already holds it.
 
-#### C4.22 — INVARIANT
+#### C4.24 — INVARIANT
 
 An artefact is read by the major line that wrote it. Across a major boundary the
 operator links both major lines and copies the events through. pardosa states
