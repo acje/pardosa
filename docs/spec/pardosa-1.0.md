@@ -156,7 +156,9 @@ rather than of the section holding it. The axis answers one question: does
 breaking this clause break a consumer. It answers nothing about whether the
 clause's text may change. A clause therefore holds a binding commitment while
 its content stays open, and a clause that enumerates may add to its enumeration
-in any release without altering what it promises.
+in any release without altering what it promises. Every clause of this
+specification binds from 0.5.1, and a clause's axis names which commitment that
+clause carries rather than whether it carries one.
 
 #### C4.3 — INVARIANT
 
@@ -204,7 +206,8 @@ caller makes.
 #### C4.9 — SURFACE
 
 A public struct's field set does not grow within a major line. A consumer
-constructing a public struct names every field the struct carries.
+constructing a public struct names every field the struct carries. The types
+admit a further field; this specification refuses to add one.
 
 #### C4.10 — SURFACE
 
