@@ -10,37 +10,80 @@
 ruled_n	disposition	clause_ids	note
 1	SPEC-BEARING	C2.3	Mechanism stated in pardosa's own terms; no compliance claim, obligation rests with the consumer.
 2	SPEC-BEARING	C3.1	Erasure scoped to the artefact a migration writes; the artefact read is the consumer's to dispose.
+4	SPEC-BEARING	C5.17	A migration holds exclusive access to what it writes, with a named failure when it does not; the rule is stated and the locking mechanism left unspecified.
 5	SPEC-BEARING	C2.4;C3.1	Refusal posture: guarantees stop at the pardosa layer. Backend-split migration-manager half is layer-4/5 and lands in a later slice.
+6	SPEC-BEARING	C5.3	Single writer, many readers as the universal invariant, with the source read and the target exclusively written during a migration and the writer role passing at cutover.
+7	SPEC-BEARING	C5.20	Fresh identity at every generation boundary; no event or fiber identity crosses, so no consumer-held reference survives.
 9	SPEC-BEARING	C4.11	Migration manager is a module of the pardosa crate and enters the surface fixed at 1.0; its failure vocabulary is fixed with it. The three-published-crate half is layer-6 and lands in a later slice.
+10	SPEC-BEARING	C5.4	The writer fence is unconditional, with no setting that withdraws it.
+12	SPEC-BEARING	C5.7	Compare-and-set to claim, with the losing writer stopping rather than retrying, and every write carrying the epoch.
+14	SPEC-BEARING	C5.19	Exactly two generations, and a second concurrent migration refused under a name the caller acts on.
+15	SPEC-BEARING	C5.11	The pairing of ownership record and event data stated as a property: bound by a shared name, decidable without reading either. The file-backend extensions are layer-10 artefact material.
+16	SPEC-BEARING	C5.8	The ownership recursion terminates: the ownership record carries its own claim as its first content and nothing governs it from above.
 17	SPEC-BEARING	C2.5	Verdict discipline only: indeterminate never folds into death. NOTE for the vocabulary slice: the ruling labels the verdict THREE-VALUED but enumerates two variants; the variant set is jn1.29's to state, not stated here.
+19	SPEC-BEARING	C5.10	Ordered creation, the two orphan verdicts derived from it, and repair refused in both directions.
 20	SPEC-BEARING	C3.2	The transfer test, stated normatively. Assumption named: the ruling left the test's document status unruled, and the document admits no non-normative slot.
+21	SPEC-BEARING	C5.5	Stale-epoch rejection assigned to every adapter's write path, where the invariant binds.
 26	MAP-GOVERNANCE	-	Draws the boundary between this map and the clean-room transfer map by kind of question. It governs which map rules what, and has no clause in a library specification.
+27	SPEC-BEARING	C5.6	No writer opens where the exclusion mechanism is unavailable; readers unaffected. The condition is named distinctly from another owner holding the artefact.
+29	SPEC-BEARING	C5.12	An unreadable ownership record refuses the write under its own name, distinct from stale-epoch rejection, leaving the artefact unchanged and the events with the caller.
 32	SPEC-BEARING	C4.8	Both caller-facing policy enums are public at 1.0 with complete variant sets; a later variant costs a major.
 36	SPEC-BEARING	C3.3	Pruning ships at 1.0 via the migration policy; no separate log-rewrite entry point; compaction policy deferred and kept distinct from the permanent refusal in C3.2.
+37	SPEC-BEARING	C5.18	Migration is operator-initiated; pardosa never starts one. Stated at 1.0 without permanence across majors.
+39	SPEC-BEARING	C5.21	The named-constructor obligation extends to migration tooling as one rule rather than two.
+40	SPEC-BEARING	C5.22	The resume cursor is retained in the fixed surface, carries generation identity, and is rejected under its own name across a boundary.
 41	SPEC-BEARING	C4.12	Format/API split: metadata record shape fixed at 1.0, a narrow read-only operator interface answering three questions, everything else internal and unfixed.
 42	SPEC-BEARING	C4.13	Record-kind set fixed at 1.0 with unrecognised kinds rejected. The seven-then-nine enumeration by name is layer-10 artefact material and lands in a later slice.
+43	SPEC-BEARING	C5.9	An ownership record with no claim is unowned and claimable through the ordinary compare-and-set path.
+44	SPEC-BEARING	C5.13	The governing distinction stated once: a missing safety mechanism refuses, missing decision-cheapening evidence is indeterminate, and a platform lacking identity evidence remains a full writer.
+45	SPEC-BEARING	C5.8	Self-claim confined to the recursion base, so exactly one way exists to own any other artefact. Carried in the same clause as RULED 16, which states the base case.
 46	SPEC-BEARING	C3.4	Scope half only: wire shape and field encodings belong to the format specification. The operator-label design half is layer-6 and lands in a later slice.
 49	SPEC-BEARING	C3.5	Pair-movement requirement stated with its named failures; atomicity and tooling both refused.
+51	SPEC-BEARING	C5.15	Two split-brain directions, two names, and the read proceeding under either with no winner selected.
+53	SPEC-BEARING	C5.14	Takeover on proof only: a clean-release record proves release from any host, and the unproven residue is indeterminate and operator-initiated.
 55	SPEC-BEARING	C4.6	Superseded in direction by RULED 142, which reopened it: the top-level failure enumeration is complete and carries no open arm. C4.6 states the surviving position.
+57	SPEC-BEARING	C5.16	An indeterminate write outcome is its own outcome, folded into neither failure nor success, because the caller's next action differs.
+64	SPEC-BEARING	C5.33	Conformance asserts the promise and never the mechanism, so a stricter adapter conforms; every symmetric promise is an obligation.
+65	SPEC-BEARING	C5.34	Passing the published suite is what supporting a backend means, and a third party establishes conformance by running it.
+66	SPEC-BEARING	C5.35	The refusal line is drawn by what pardosa promises: refuse at open where a configuration breaks a promised invariant, document where the property is not promised.
+67	SPEC-BEARING	C5.36	The corruption guard is present in every build; no build option removes it. Stated as the property, with the dependency choice left to the implementation.
 68	SPEC-BEARING	C4.10	The adapter trait stays sealed at 1.0; a third party verifies conformance and does not ship an adapter. Opening the seal is an in-major addition, closing it a major change.
+69	SPEC-BEARING	C5.31	Type names and full public item paths are the surface; diagnostic string contents are data an operator reads.
 70	SPEC-BEARING	C4.5	Openness is designated by this specification rather than hand-maintained; C4.5 states the designation duty and records that no enumeration is designated open.
+74	SPEC-BEARING	C5.37	Lockstep release with sibling ranges rather than exact pins, so a consumer resolves one version of each pardosa crate.
+75	SPEC-BEARING	C5.38	The compiler floor stated as a rule rather than a number: oldest stable that compiles the fixed surface, a raise in any minor, no promised window. The current value is layer-12 constant material.
 76	SPEC-BEARING	C4.1	The two-regime promise, stated once as the axis every later marker is read against: invariants bind from 0.5.1, the surface is fixed at 1.0.
 78	SPEC-BEARING	C4.18	The format's reserved optional slot is bought and left unexposed; the consumer's own event type is the documented extension point.
 79	SPEC-BEARING	C3.6	Correlation deferred to W3C Trace Context; pardosa carries nothing natively and the spec states the deferral.
+80	SPEC-BEARING	C5.39	Published security policy with contact and process, no time commitment, direct monitoring of the non-Rust dependency edge, and withdrawal confined to correctness or safety defects.
+82	SPEC-BEARING	C3.9	The prohibition on contrastive definition governs this document's prose; its operative effect is the positive fiber definition C3.9 already carries. No clause instructs this document's authors.
+83	SPEC-BEARING	C5.2	Normative force lives in this specification alone; other published material orients, adds nothing, and carries no citation duty. Consistent with RULED 242, which withdrew the landing-page bar's clause status.
 84	MAP-GOVERNANCE	-	Superseded in direction by RULED 242: the landing-page bar carries no regime marker and is not a clause, so its enumeration's openness governs no clause. The bar survives, judged and recorded in the PAR ADR venue chosen at RULED 230, which is this effort's own record-keeping and not the library's behaviour. See escalation bead noted against RULED 90.
 85	MAP-GOVERNANCE	-	Superseded in direction by RULED 242, with the erratum owed under RULED 244 already filed on jn1.47: the documentation bar binds as a commitment but is not a clause and carries no marker. Its home is the PAR ADR corpus, which a library specification does not govern.
-89	SPEC-BEARING	C4.2	Per-clause axis marking, stated as the property. The two axes' names and binding dates are C4.1; the regime scheme's rules of operation are C5.1's, reserved for a later slice, and are not restated here.
+89	SPEC-BEARING	C4.2;C5.1	Per-clause axis marking, stated as the property. The two axes' names and binding dates are C4.1; the regime scheme's rules of operation are C5.1, added in sub-mission 04 as that row's own note anticipated, and are not restated in C4.2.
 90	SPEC-BEARING	C4.2	The marker's test and the standing rule that content mutability and regime are independent axes. OPEN ESCALATION pardosa-52d5: this ruling's landing-page application was superseded by RULED 242, and the sub-mission brief still directs the superseded reading; the standing rule itself survives and is what C4.2 carries.
 95	SPEC-BEARING	C4.15	Layout splits by axis: ordering and chaining bind from 0.5.1, byte arrangement is fixed at 1.0, and a layout clause must say which half it governs.
 96	SPEC-BEARING	C2.1	Ratified definition text carried verbatim. OPEN ESCALATION pardosa-8q05: its per-fiber narrowing was adopted to avoid pre-empting jn1.54, which has since contracted the total order in C3.8; not self-resolved.
 97	SPEC-BEARING	C3.7	Multi-dragline split is across artefacts; pardosa never partitions within one, and orders nothing between two.
 98	SPEC-BEARING	C4.16	One dragline per artefact converted from an implementation fact into a promise binding from 0.5.1.
 100	SPEC-BEARING	C4.18	No second dedicated envelope slot; an event never names its dragline. The slot already bought is the standing escape hatch.
+101	SPEC-BEARING	C5.30	The language rule applied as a refusal: a backend noun reaches no type, variant or path a consumer names. The replacement word for the routing parameter is layer-12 vocabulary material.
 102	SPEC-BEARING	C4.14	The metadata record's identity structure, multi-dragline-ready from 0.5.1: logical identity, version, member identifiers, partitioning rule.
+103	SPEC-BEARING	C5.25	One fiber in exactly one dragline, and therefore in exactly one artefact.
 105	SPEC-BEARING	C4.17	Cross-fiber order within a dragline holds between migrations as documented default behaviour, not as a contract; migrations may remove but not reorder. Depends on open escalation pardosa-8q05 over how far the dragline definition in C2.1 reaches; C4.17 takes the safest reading and states the order without widening C2.1.
+106	SPEC-BEARING	C5.40	The cross-fiber ordering refusal, sited as the opening clause of the titled refusal run inside the layer-5 section. Assumption named: the brief requires a citable refusal section and the section order is fixed by user instruction, so the run is a titled subsection rather than a tenth section. The refusal's scope is unchanged by the siting.
+107	SPEC-BEARING	C5.23	Reorder defined pairwise rather than sequence-wise, so one rule covers every migration policy and no taxonomy is needed.
+108	SPEC-BEARING	C5.24	Pairwise order preservation binds from 0.5.1 and the conformance suite asserts it. The invariant constrains pardosa where C5.40 constrains the consumer.
 110	SPEC-BEARING	C3.8	Order existence and replay determinism contracted; order content refused. See open escalation pardosa-8q05 against C2.1's narrower definition.
 111	SPEC-BEARING	C4.3	For a refusal clause the axis attaches to the refusal's force rather than to its deletion, stated so later refusal clauses inherit a rule.
+113	SPEC-BEARING	C5.41	Link integrity within a generation as the claim, with the three non-claims stated in the same clause. Sited in the refusal run, stating what pardosa establishes first and the refusals as consequences.
+114	SPEC-BEARING	C5.26	The two-tier frontier claim with the anchor gap named as a third value: unanchored is its own verdict rather than invalid, and tier two is an operator-elected capability.
+116	SPEC-BEARING	C5.27	Chain validation mandatory on every adapter and every reading path, with the invariant-breaking configuration inexpressible rather than defaulted off.
+117	SPEC-BEARING	C5.28	A discovered chain break refuses on every ordinary path under a third name beside refusal-for-missing-mechanism and indeterminate-for-missing-evidence; entry is an election named at the call site.
+118	SPEC-BEARING	C5.29;C5.43	The per-artefact per-generation anchor obligation an operator satisfies is C5.29; the structural bar on any commitment spanning two artefacts is C5.43 in the refusal run.
+120	SPEC-BEARING	C5.32	The schema covers the payload type taken whole, variants included, and one type per artefact makes homogeneity a fact stated rather than a rule enforced.
 121	SPEC-BEARING	C2.2	Event kind is first-class pardosa vocabulary a stranger is taught, not merely a constraint on the payload type.
+122	SPEC-BEARING	C5.42	Naming the kinds that exist does not yield selection by kind; the refusal is stated where the new vocabulary makes the inference available.
 139	SPEC-BEARING	C4.19	Computed compatibility is a refusal without across-major permanence, with migration named as the positive substitute; C4.19 confines it to the 1.0 line.
 140	SPEC-BEARING	C4.19	The three statements bind from 0.5.1 as one clause family under one marker: always-refuse on a non-identical envelope shape, no computed compatibility, schema change is a migration.
 142	SPEC-BEARING	C4.6	The top-level failure enumeration is complete; the open-domain attribute is dropped. Reopens and replaces RULED 55.
