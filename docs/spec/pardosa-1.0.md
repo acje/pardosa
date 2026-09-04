@@ -154,11 +154,11 @@ clause's axis and knows which of the two it has been given.
 Every clause records its own axis, and the axis is a property of that clause
 rather than of the section holding it. The axis answers one question: does
 breaking this clause break a consumer. It answers nothing about whether the
-clause's text changes. A clause therefore holds a binding commitment while
-its content stays open, and a clause that enumerates is free to add to its
+clause's text is free to change. A clause therefore holds a binding commitment
+while its content stays open, and a clause that enumerates is free to add to its
 enumeration in any release without altering what it promises. Every clause of this
-specification binds from 0.5.1, and a clause's axis names which commitment that
-clause carries rather than whether it carries one.
+specification is normative from 0.5.1, and a clause's axis names which commitment
+that clause carries rather than whether it carries one.
 
 #### C4.3 — INVARIANT
 
@@ -275,8 +275,8 @@ Between migrations, the order a dragline establishes over the events of differen
 fibers holds. A migration is free to remove events, and the order surviving a
 migration is a subsequence of the order preceding it. A migration does not reorder
 the events within a dragline. pardosa documents this order as a dragline's default
-behaviour and offers no contract over it: a consumer observes it and holds pardosa
-to none of it.
+behaviour and offers no contract over it: a consumer is free to observe it and
+holds pardosa to none of it.
 
 #### C4.20 — INVARIANT
 
@@ -403,7 +403,7 @@ deciding it reads the contents of neither.
 Where pardosa cannot read an artefact's ownership record while fencing a write,
 it refuses the write under a name distinct from the name it gives a stale-epoch
 rejection. The refused write leaves the artefact as it stood and leaves the
-events resident with the caller, and the caller presents them again.
+events resident with the caller, and the caller is free to present them again.
 
 #### C5.13 — INVARIANT
 
@@ -484,7 +484,7 @@ unconstrained after it.
 
 A migration preserves the relative order of every pair of events it retains in
 one dragline, and pardosa holds this from 0.5.1 across every migration policy a
-caller selects. The conformance suite asserts it.
+caller is free to select. The conformance suite asserts it.
 
 #### C5.25 — INVARIANT
 
