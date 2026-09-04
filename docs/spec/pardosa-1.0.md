@@ -234,7 +234,10 @@ and the abstraction beneath it stay internal and are not fixed.
 #### C4.13 — SURFACE
 
 The metadata record carries nine kinds of record, and that set is fixed at 1.0.
-A record of a kind pardosa does not recognise is rejected.
+The nine are the ownership claim, the clean release, the migration start, the
+migration end, the inbound pointer, the outbound pointer, the rescue-policy
+choice recorded with the migration start, the identity structure, and the schema
+descriptor. A record of a kind pardosa does not recognise is rejected.
 
 #### C4.14 — INVARIANT
 
@@ -282,8 +285,9 @@ reaches for in place of computed compatibility. This refusal holds throughout th
 
 #### C4.20 — SURFACE
 
-The event envelope carries five fields the standard owns, and that set is fixed
-at 1.0. The format admits a sixth field; the standard refuses to add one.
+The event envelope carries five fields this specification owns, and that set is
+fixed at 1.0. The format admits a sixth field; this specification refuses to add
+one.
 
 #### C4.21 — SURFACE
 
@@ -564,8 +568,8 @@ across its graph.
 #### C5.38 — INVARIANT
 
 pardosa's compiler floor is the oldest stable Rust release that compiles the
-fixed surface. A raise of that floor lands in any minor release, and pardosa
-promises no window over which a given floor holds.
+fixed surface. At 1.0 that release is 1.89.0. A raise of that floor lands in any
+minor release, and pardosa promises no window over which a given floor holds.
 
 #### C5.39 — INVARIANT
 
@@ -990,10 +994,12 @@ away in place of them.
 #### C6.31 — INVARIANT
 
 pardosa names the platforms on which it opens an artefact for writing, and that
-naming is the list of platforms pardosa supports for writing. pardosa publishes no
-list of platforms it excludes. Where a platform's standing is unestablished,
-pardosa records it as unestablished and claims it in neither direction. A read-only
-open is available wherever pardosa builds.
+naming is the list of platforms pardosa supports for writing. That list is aix,
+cygwin, freebsd, fuchsia, hurd, illumos, linux, netbsd, openbsd and solaris,
+together with Apple's platforms. pardosa publishes no list of platforms it
+excludes. Where a platform's standing is unestablished, pardosa records it as
+unestablished and claims it in neither direction. A read-only open is available
+wherever pardosa builds.
 
 #### C6.32 — INVARIANT
 
@@ -1224,7 +1230,7 @@ claim to an already-standing artefact does not land.
 
 #### C12.4 — INVARIANT
 
-A write refused because a later owner has taken the artefact is a condition of
+A write refused where a later owner has taken the artefact is a condition of
 its own and carries one name on every adapter. It stands distinct from the
 condition a writer receives when its claim does not land: a caller holding it
 owned the artefact and owns it no longer, events it has already written may stand

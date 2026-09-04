@@ -33,7 +33,7 @@ ruled_n	disposition	clause_ids	note
 39	SPEC-BEARING	C5.21	The named-constructor obligation extends to migration tooling as one rule rather than two.
 40	SPEC-BEARING	C5.22	The resume cursor is retained in the fixed surface, carries generation identity, and is rejected under its own name across a boundary.
 41	SPEC-BEARING	C4.12	Format/API split: metadata record shape fixed at 1.0, a narrow read-only operator interface answering three questions, everything else internal and unfixed.
-42	SPEC-BEARING	C4.13	Record-kind set fixed at 1.0 with unrecognised kinds rejected. The seven-then-nine enumeration by name is layer-10 artefact material and lands in a later slice.
+42	SPEC-BEARING	C4.13	Record-kind set fixed at 1.0 with unrecognised kinds rejected. The nine kinds are enumerated by name in the clause.
 43	SPEC-BEARING	C5.9	An ownership record with no claim is unowned and claimable through the ordinary compare-and-set path.
 44	SPEC-BEARING	C5.13	The governing distinction stated once: a missing safety mechanism refuses, missing decision-cheapening evidence is indeterminate, and a platform lacking identity evidence remains a full writer.
 45	SPEC-BEARING	C5.8	Self-claim confined to the recursion base, so exactly one way exists to own any other artefact. Carried in the same clause as RULED 16, which states the base case.
@@ -51,7 +51,7 @@ ruled_n	disposition	clause_ids	note
 69	SPEC-BEARING	C5.31	Type names and full public item paths are the surface; diagnostic string contents are data an operator reads.
 70	SPEC-BEARING	C4.5	Openness is designated by this specification rather than hand-maintained; C4.5 states the designation duty and records that no enumeration is designated open.
 74	SPEC-BEARING	C5.37	Lockstep release with sibling ranges rather than exact pins, so a consumer resolves one version of each pardosa crate.
-75	SPEC-BEARING	C5.38	The compiler floor stated as a rule rather than a number: oldest stable that compiles the fixed surface, a raise in any minor, no promised window. The current value is layer-12 constant material.
+75	SPEC-BEARING	C5.38	The compiler floor stated as a rule rather than a number: oldest stable that compiles the fixed surface, a raise in any minor, no promised window. The clause also carries the value the rule yields at 1.0.
 76	SPEC-BEARING	C4.1	The two-regime promise, stated once as the axis every later marker is read against: invariants bind from 0.5.1, the surface is fixed at 1.0.
 78	SPEC-BEARING	C4.18	The format's reserved optional slot is bought and left unexposed; the consumer's own event type is the documented extension point.
 79	SPEC-BEARING	C3.6	Correlation deferred to W3C Trace Context; pardosa carries nothing natively and the spec states the deferral.
@@ -160,7 +160,7 @@ ruled_n	disposition	clause_ids	note
 61	SPEC-BEARING	C6.10	The remedy is documented with the condition and follows from the type held; no predicate over a condition is published.
 62	SPEC-BEARING	C6.8	One qualified-result type spanning the five states, enumerated completely, so a caller need not choose a question before knowing what it holds.
 63	SPEC-BEARING	C6.11	The diagnostic payload is the whole of the operator-facing report; the fixed surface carries no further channel.
-77	SPEC-BEARING	C6.31	A positive supported-writer list, no exclusion list, and an unestablished platform recorded as unestablished. The target names themselves are layer-12 constant material and land in a later slice.
+77	SPEC-BEARING	C6.31	A positive supported-writer list, no exclusion list, and an unestablished platform recorded as unestablished. The clause names the supported writer targets.
 81	SPEC-BEARING	C6.32	The maintainer relationship is disclosed and triage is best effort, with no response time committed on the non-security path.
 91	MAP-GOVERNANCE	-	Governs this document's own front matter. The status block exists at the head and, by RULED 92, carries no clause number and no marker, so a library specification has no clause for it. Assumption named: the disposition's stated categories do not enumerate this document's own construction, and the same reading was taken for the documentation bar at RULED 84/85 and confirmed by RULED 242.
 92	MAP-GOVERNANCE	-	Governs this document's own construction: the block points at the clause stating the regime scheme and does not restate it. C5.1 states that scheme once and the block cites it, so no second statement and no self-referential clause exists to record. Same reading as the RULED 91 row.
