@@ -8,3 +8,21 @@
 #   note         short note for SPEC-BEARING rows; for MAP-GOVERNANCE rows, the reason,
 #                at least 20 characters.
 ruled_n	disposition	clause_ids	note
+1	SPEC-BEARING	C2.3	Mechanism stated in pardosa's own terms; no compliance claim, obligation rests with the consumer.
+2	SPEC-BEARING	C3.1	Erasure scoped to the artefact a migration writes; the artefact read is the consumer's to dispose.
+5	SPEC-BEARING	C2.4;C3.1	Refusal posture: guarantees stop at the pardosa layer. Backend-split migration-manager half is layer-4/5 and lands in a later slice.
+17	SPEC-BEARING	C2.5	Verdict discipline only: indeterminate never folds into death. NOTE for the vocabulary slice: the ruling labels the verdict THREE-VALUED but enumerates two variants; the variant set is jn1.29's to state, not stated here.
+20	SPEC-BEARING	C3.2	The transfer test, stated normatively. Assumption named: the ruling left the test's document status unruled, and the document admits no non-normative slot.
+26	MAP-GOVERNANCE	-	Draws the boundary between this map and the clean-room transfer map by kind of question. It governs which map rules what, and has no clause in a library specification.
+36	SPEC-BEARING	C3.3	Pruning ships at 1.0 via the migration policy; no separate log-rewrite entry point; compaction policy deferred and kept distinct from the permanent refusal in C3.2.
+46	SPEC-BEARING	C3.4	Scope half only: wire shape and field encodings belong to the format specification. The operator-label design half is layer-6 and lands in a later slice.
+49	SPEC-BEARING	C3.5	Pair-movement requirement stated with its named failures; atomicity and tooling both refused.
+79	SPEC-BEARING	C3.6	Correlation deferred to W3C Trace Context; pardosa carries nothing natively and the spec states the deferral.
+96	SPEC-BEARING	C2.1	Ratified definition text carried verbatim. OPEN ESCALATION pardosa-8q05: its per-fiber narrowing was adopted to avoid pre-empting jn1.54, which has since contracted the total order in C3.8; not self-resolved.
+97	SPEC-BEARING	C3.7	Multi-dragline split is across artefacts; pardosa never partitions within one, and orders nothing between two.
+110	SPEC-BEARING	C3.8	Order existence and replay determinism contracted; order content refused. See open escalation pardosa-8q05 against C2.1's narrower definition.
+121	SPEC-BEARING	C2.2	Event kind is first-class pardosa vocabulary a stranger is taught, not merely a constraint on the payload type.
+163	SPEC-BEARING	C3.9	The fiber's ordered same-fiber series is the enabling affordance, already promised; nothing further owed at 1.0.
+164	MAP-GOVERNANCE	-	Fixes whether PAR ADRs are living documents or immutable-plus-supersession. It governs this effort's own ADR corpus and record-keeping, not the library's behaviour.
+199	SPEC-BEARING	C3.10	Tombstone read at migration only, keeping the no-query-surface refusal alive.
+236	SPEC-BEARING	C3.11	Envelope shape stays with this specification; the byte container's version belongs to the format specification. Never conflated.
