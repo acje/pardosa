@@ -1,11 +1,3 @@
-//! Shift C4.11..C4.22 -> C4.13..C4.24 (descending, token-exact) across the
-//! spec and the ruled-trace, then reassign the three C4.10 trace rows per
-//! the C4.10 three-way split (ruling RC-1b, epic pardosa-ba8c).
-//!
-//! Usage: cargo run --bin c4-split-renumber -- <spec.md> <trace.tsv> [--apply]
-//! Default is dry-run (report only). Pass --apply to write both files.
-//! Output: tab-separated COUNT/ABORT/OK records on stdout.
-
 use std::path::Path;
 
 struct Reassignment {
