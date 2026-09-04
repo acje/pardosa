@@ -795,8 +795,9 @@ observations of one dragline is that dragline's rolling commitment.
 #### C6.6 — SURFACE
 
 An artefact's ownership record identifies the dragline that artefact is, and the
-read-only operator interface reports those identifiers. An identity a consumer
-could hold for a dragline enters no part of the surface a library consumer names. An operator names a dragline; a library consumer does not.
+read-only operator interface reports that identity. An identity a consumer could
+hold for a dragline enters no part of the surface a library consumer names. An
+operator names a dragline; a library consumer does not.
 
 #### What a caller receives
 
