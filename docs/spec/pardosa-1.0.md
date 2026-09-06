@@ -1206,6 +1206,14 @@ API. Re-initialisation is an operator action: remove the ownership-record and
 event-data pair, then call `create()`. This is not permission for a durability
 step to discard logical history; C8.1 governs physical durability replacement.
 
+#### C6.45 — SURFACE
+
+The ownership record's format requires an operator label. Supplying that label
+is optional for the caller: when the caller supplies none, pardosa derives a
+default from the process. The field's encoding and wire shape belong to the
+format specification under C3.4; access to ownership-record fields remains
+governed by C4.14.
+
 ### Verification
 
 The checks that hold the specified behaviour in place, and the strength of each.

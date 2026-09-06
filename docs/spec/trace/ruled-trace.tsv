@@ -37,7 +37,7 @@ ruled_n	disposition	clause_ids	note
 43	SPEC-BEARING	C5.9	An ownership record with no claim is unowned and claimable through the ordinary compare-and-set path.
 44	SPEC-BEARING	C5.13	The governing distinction stated once: a missing safety mechanism refuses, missing decision-cheapening evidence is indeterminate, and pardosa remains a full writer on a platform withholding identity evidence alone.
 45	SPEC-BEARING	C5.8	Self-claim confined to the recursion base, so exactly one way exists to own any other artefact. Carried in the same clause as RULED 16, which states the base case.
-46	SPEC-BEARING	C3.4	Wire shape and field encodings belong to the format specification. The operator-label half remains an identified delivery gap: required format field, optional caller input, process-derived default (jn1.42 RULED 46). No later slice is claimed delivered by this trace.
+46	SPEC-BEARING	C3.4;C6.45	Field encoding and wire shape remain format-specification work. C6.45 delivers the operator-label obligation: required in the ownership-record format, optional caller input, process-derived default; no default algorithm or broader field-access API is specified.
 49	SPEC-BEARING	C3.5	Pair-movement requirement stated with its named failures; atomicity and tooling both refused.
 51	SPEC-BEARING	C5.15	Two split-brain directions, two names, and the read proceeding under either with no winner selected.
 53	SPEC-BEARING	C5.14	Takeover on proof only: a clean-release record proves release from any host, and the unproven residue is indeterminate and operator-initiated.
