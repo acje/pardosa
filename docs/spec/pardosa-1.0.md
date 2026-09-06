@@ -11,6 +11,16 @@ document: normative
 C5.1 states the regime scheme and what each clause's marker obliges.
 <!-- /STATUS -->
 
+### Documentation authoring — non-normative process note
+
+Public documentation that uses *dragline*, including the docs.rs landing page,
+must cite its specification definition in [C2.1](#c21--invariant) through the
+documentation authoring process. A missing citation breaches that process
+commitment, not the normative library contract. Judgement is recorded through
+the existing documentation process, per release in its standing PAR ADR edited
+in place, without a gate. This note is not a numbered clause and adds no
+normative consumer guarantee.
+
 ### Stance
 
 The frame pardosa speaks from, and the posture every refusal below follows from.
@@ -356,8 +366,8 @@ marker that clause carries.
 This specification is the whole of pardosa's normative commitment. Material
 pardosa publishes elsewhere orients a reader towards the clauses here and adds
 nothing to them, and a statement holds normative force through the clause that
-carries it. Published material outside this specification carries no obligation
-to cite a clause.
+carries it. Published material outside this specification carries no normative
+obligation to cite a clause.
 
 #### C5.3 — INVARIANT
 
