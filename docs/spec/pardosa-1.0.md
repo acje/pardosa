@@ -921,13 +921,14 @@ The types that carry pardosa's answers, and what each of them discloses.
 
 #### C6.7 — SURFACE
 
-pardosa answers three questions with three types. One names the condition under
-which an operation failed. One is given to each sub-domain whose conditions are
-closed by construction — the liveness verdict, the proof a verdict of death
-carries, and whether an artefact is under migration — and enumerates that
-sub-domain completely. One carries what pardosa knows about an artefact a caller
-has just opened. A condition reached on a path that succeeded is carried by the
-third and never by the first.
+pardosa's answers fall into three families of types. The first names the condition
+under which an operation failed. The second gives a separate type to each
+sub-domain whose conditions are closed by construction — the liveness verdict,
+the proof a verdict of death carries, and whether an artefact is under migration —
+and each type enumerates its sub-domain completely. The third is one qualified-result
+type carrying what pardosa knows about an artefact a caller has just opened. A
+condition reached on a path that succeeded is carried by the third family and
+never by the first.
 
 The following register collects established conditions and their owning clauses.
 It does not yet define an exhaustive top-level variant inventory or the legal
