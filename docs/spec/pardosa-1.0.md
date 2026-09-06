@@ -311,9 +311,8 @@ concept already holds it.
 
 #### C4.21 — INVARIANT
 
-An artefact is read by the major line that wrote it. Across a major boundary the
-operator links both major lines and copies the events through. pardosa states
-that boundary and leaves the copying to the operator.
+An artefact is read only by the major line that wrote it. Export across a major
+boundary is the operator's responsibility.
 
 #### C4.22 — SURFACE
 
