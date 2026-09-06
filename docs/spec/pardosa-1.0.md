@@ -306,8 +306,9 @@ The format admits a sixth field; this specification refuses to add one.
 #### C4.23 — SURFACE
 
 pardosa's public surface is five modules: `pardosa::store` for the runtime,
-`pardosa::schema` for typed-payload vocabulary, `pardosa::encoding` for the wire
-contract, `pardosa::file` for the container, and `pardosa::prelude` for re-exports
+`pardosa::schema` for payload-type identity and description, `pardosa::encoding`
+for the wire contract and value constraints, `pardosa::file` for the container,
+and `pardosa::prelude` for re-exports
 that broaden none of those surfaces. That count is fixed at 1.0.
 Material that would otherwise mint a sixth module is placed in the module whose
 concept already holds it.
@@ -317,6 +318,22 @@ concept already holds it.
 An artefact is read by the major line that wrote it. Across a major boundary the
 operator links both major lines and copies the events through. pardosa states
 that boundary and leaves the copying to the operator.
+
+#### C4.25 — SURFACE
+
+The published feature set is `uuid`, `nats`, and `unstable-test-support`.
+The default set is exactly `uuid`; changing that default set is a breaking
+change. `uuid` adds integration implementations. `nats` selects backend
+capability, not consumer vocabulary. `unstable-test-support` is off by default,
+as is `nats`; its `unstable-` prefix excludes its surface from the freeze and
+permits changes at a minor release. The same test-support feature on
+`pardosa-nats` is forwarded when `nats` is enabled.
+
+Features are public API. A stable feature may be added at a minor release and
+removed only at a major release. Enabling a feature only adds capability: it
+removes, narrows or reshapes no existing public item. Features never gate the
+vocabulary a consumer uses or an invariant this specification promises.
+`zstd`, `blake3`, and the derive capability are unconditional, not features.
 
 ### Rules of operation
 
@@ -836,6 +853,36 @@ sub-domain completely. One carries what pardosa knows about an artefact a caller
 has just opened. A condition reached on a path that succeeded is carried by the
 third and never by the first.
 
+The following register collects established conditions and their owning clauses.
+It does not yet define an exhaustive top-level variant inventory or the legal
+combinations of these facts; the completeness commitment in C4.6 remains to be
+fully supplied in this draft. A descriptive row without an identifier does not
+mint a variant spelling.
+
+| Family | Established condition or members | Meaning and owning clause |
+| --- | --- | --- |
+| Operation failure | `StoreAlreadyExists` | Creation finds an artefact already present; open instead (C12.3). |
+| Operation failure | `ConcurrencyConflict` | A claim on an existing artefact loses compare-and-set; the claimant stops (C5.7, C12.3). |
+| Operation failure | Stale-epoch write rejection | The writer had ownership and lost it; distinct from claim loss, no retry (C12.4). |
+| Operation failure | Ownership cannot be established on write open | Shared refusal across adapters, not refusal of a qualified orphan read (C12.5). |
+| Operation failure | Ownership record unreadable while fencing | Distinct from known loss of ownership (C5.12). |
+| Operation failure | Exclusion unavailable, migration exclusion absent, or migration already running | Distinct conditions under C5.6, C5.17 and C5.19 respectively. |
+| Operation failure | Discovered chain break or uncovered partition membership | Refusals under C5.28 and C5.58 respectively. |
+| Operation failure | `SchemaMismatch`, `EnvelopeMismatch` | Separate top-level conditions under C6.33; unestablished mismatch cause follows C6.34. |
+| Artefact-pair failure | `ArtefactMismatch` | The pair does not belong together; do not open it. Which pairing check failed belongs in diagnostic detail. |
+| Value-decoding failure | `ValueConstraintViolated { constraint: ValueConstraint }` | A value violates a bound or validity constraint, not a payload-schema identity condition. |
+| Closed value sub-domain | `ValueConstraint`: `TooLong`, `Empty`, `NotReal`, `InvalidChar`, `InvalidUtf8` | The five value-constraint codes; none is a catch-all. |
+| Closed liveness sub-domain | `ProvenDead { proof }`, `Indeterminate` | Proof of death or absence of proof, never a proof of liveness (C2.5). `DeathProof` carries the death proof. |
+| Closed migration-mode sub-domain | Steady, migrating | Whether an artefact is under migration; reopened-state limits remain C6.2. |
+| Qualified successful read | Generation known or unknown, superseded generation, either migration-disagreement direction | C6.8, C6.14, C6.15 and C5.15; not top-level failures. |
+| Cursor condition | Cursor from another generation | Rejected under C5.22; composition and staging with the open result remain unspecified here. |
+| Indeterminate write outcome | Whether the write landed is unknown | Neither success nor failure; establish what landed before deciding (C5.16). |
+
+The death-proof facts include machine reboot, process absence and process-id
+reuse. Clean release proves release under C5.14. This register does not assign
+unruled variant spellings or settle how these facts compose with migration and
+generation knowledge.
+
 #### C6.8 — SURFACE
 
 One type carries what a caller knows about the artefact it has just opened:
@@ -844,6 +891,11 @@ which of the two migration disagreements holds, and whether a presented cursor
 belongs to another generation. Its states are one complete enumeration, and a
 caller reads them from the value it already holds rather than by choosing which
 question to ask first.
+
+The facts named here do not yet determine every reachable combined state or the
+operation stage at which a foreign cursor is rejected. In particular, a
+superseded generation and a directional migration disagreement can coexist;
+their complete representation remains an outstanding definition in this draft.
 
 #### C6.9 — INVARIANT
 
@@ -1049,6 +1101,9 @@ conditions pardosa names separately. Each stands at the top level of the failure
 enumeration, and a caller reaches neither through a constructor shared with the
 other. Each condition's name states which of the two subjects moved.
 
+The payload condition is `SchemaMismatch`; the envelope condition is
+`EnvelopeMismatch`. Neither name asserts corruption or a named standard revision.
+
 #### C6.34 — INVARIANT
 
 pardosa establishes for every artefact it opens whether a mismatch holds, and
@@ -1137,6 +1192,19 @@ fixes. It takes no predicate from the caller and names no storage construct.
 The three published crates are `pardosa`, `pardosa-derive`, and `pardosa-nats`.
 The migration manager belongs inside `pardosa` under C4.13 rather than in a
 fourth published crate.
+
+#### C6.44 — SURFACE
+
+`create()` and `open()` are distinct, strict named constructors. Creation refuses
+an artefact that already exists, as C12.3 states. Open refuses when no artefact
+exists; it does not create one as a convenience. An ownership record present
+without event data is instead the artefact-under-creation case C5.10 already
+permits to open and complete. An event-data-only read follows C6.14.
+
+There is no `open_or_create` constructor and no destructive re-initialisation
+API. Re-initialisation is an operator action: remove the ownership-record and
+event-data pair, then call `create()`. This is not permission for a durability
+step to discard logical history; C8.1 governs physical durability replacement.
 
 ### Verification
 

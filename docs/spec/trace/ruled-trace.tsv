@@ -21,7 +21,7 @@ ruled_n	disposition	clause_ids	note
 15	SPEC-BEARING	C5.11	The pairing of ownership record and event data stated as a property: bound by a shared name, decidable without reading either. The file-backend extensions are layer-10 artefact material.
 16	SPEC-BEARING	C5.8	The ownership recursion terminates: the ownership record carries its own claim as its first content and nothing governs it from above.
 17	SPEC-BEARING	C2.5	Verdict discipline only: indeterminate never folds into death. NOTE for the vocabulary slice: the ruling labels the verdict THREE-VALUED but enumerates two variants; the variant set is jn1.29's to state, not stated here.
-19	SPEC-BEARING	C5.10	Ordered creation and write-path orphan refusal; RULED 24 explicitly preserves this write scope while permitting qualified read-only open. Repair remains refused.
+19	SPEC-BEARING	C5.10;C6.44	Ordered creation and write-path orphan refusal; RULED 24 preserves qualified reads. Supplementary source jn1.23 strict create/open and no destructive re-initialisation rulings land in C6.44 without refusing C5.10 creation completion.
 20	SPEC-BEARING	C3.2	The transfer test, stated normatively. Assumption named: the ruling left the test's document status unruled, and the document admits no non-normative slot.
 21	SPEC-BEARING	C5.5	Stale-epoch rejection assigned to every adapter's write path, where the invariant binds.
 26	MAP-GOVERNANCE	-	Draws the boundary between this map and the clean-room transfer map by kind of question. It governs which map rules what, and has no clause in a library specification.
@@ -37,7 +37,7 @@ ruled_n	disposition	clause_ids	note
 43	SPEC-BEARING	C5.9	An ownership record with no claim is unowned and claimable through the ordinary compare-and-set path.
 44	SPEC-BEARING	C5.13	The governing distinction stated once: a missing safety mechanism refuses, missing decision-cheapening evidence is indeterminate, and pardosa remains a full writer on a platform withholding identity evidence alone.
 45	SPEC-BEARING	C5.8	Self-claim confined to the recursion base, so exactly one way exists to own any other artefact. Carried in the same clause as RULED 16, which states the base case.
-46	SPEC-BEARING	C3.4	Scope half only: wire shape and field encodings belong to the format specification. The operator-label design half is layer-6 and lands in a later slice.
+46	SPEC-BEARING	C3.4	Wire shape and field encodings belong to the format specification. The operator-label half remains an identified delivery gap: required format field, optional caller input, process-derived default (jn1.42 RULED 46). No later slice is claimed delivered by this trace.
 49	SPEC-BEARING	C3.5	Pair-movement requirement stated with its named failures; atomicity and tooling both refused.
 51	SPEC-BEARING	C5.15	Two split-brain directions, two names, and the read proceeding under either with no winner selected.
 53	SPEC-BEARING	C5.14	Takeover on proof only: a clean-release record proves release from any host, and the unproven residue is indeterminate and operator-initiated.
@@ -46,7 +46,7 @@ ruled_n	disposition	clause_ids	note
 64	SPEC-BEARING	C5.33	Conformance asserts the promise and never the mechanism, so a stricter adapter conforms; every symmetric promise is an obligation.
 65	SPEC-BEARING	C5.34	Passing the published suite is what supporting a backend means, and a third party establishes conformance by running it.
 66	SPEC-BEARING	C5.35	The refusal line is drawn by what pardosa promises: refuse at open where a configuration breaks a promised invariant, document where the property is not promised.
-67	SPEC-BEARING	C5.36	The corruption guard is present in every build; no build option removes it. Stated as the property, with the dependency choice left to the implementation.
+67	SPEC-BEARING	C5.36;C4.25	Corruption guard present in every build; blake3 unconditional. C4.25 also restores jn1.10 feature membership and policy after this amendment: default uuid, optional nats, unstable-test-support exception, no vocabulary gating; zstd and derive unconditional.
 68	SPEC-BEARING	C4.10;C4.11	The adapter trait stays sealed at 1.0; a third party verifies conformance and does not ship an adapter. Opening the seal is an in-major addition, closing it a major change.
 69	SPEC-BEARING	C5.31	Type names and full public item paths are the surface; diagnostic string contents are data an operator reads.
 70	SPEC-BEARING	C4.5	Openness is designated by this specification rather than hand-maintained; C4.5 states the designation duty and records that no enumeration is designated open.
@@ -92,11 +92,11 @@ ruled_n	disposition	clause_ids	note
 163	SPEC-BEARING	C3.9	The fiber's ordered same-fiber series is the enabling affordance, already promised; nothing further owed at 1.0.
 164	MAP-GOVERNANCE	-	Fixes whether PAR ADRs are living documents or immutable-plus-supersession. It governs this effort's own ADR corpus and record-keeping, not the library's behaviour.
 168	SPEC-BEARING	C4.9	A public struct's field set does not grow within a major line, and the clause states that the capability exists and is refused — the types admit a further field and the specification declines to add one — so a reader inspecting the types finds the freedom named rather than a capability the prose appears to forbid. Stated on C4.22's construction.
-170	SPEC-BEARING	C4.4	The in-major additive surface is closed at exactly three additions under one principle: the surface grows only by an addition a consumer cannot silently mis-handle.
-188	SPEC-BEARING	C4.15	The amended record set is re-fixed at 1.0 at nine kinds with the unrecognised-kind rejection unchanged. Enumeration by name deferred to the layer-10 artefact slice.
+170	SPEC-BEARING	C4.4;C4.25	The in-major additive surface remains three additions. C4.25 supplies the feature-policy component inherited from jn1.10, including the explicitly unstable exception rather than silently freezing it.
+188	SPEC-BEARING	C4.15	The amended nine-kind record set is enumerated by name in C4.15 and fixed at 1.0, with unrecognised kinds rejected; no later enumeration slice is owed.
 191	SPEC-BEARING	C4.22	The five standard-owned envelope fields are fixed at 1.0, and the clause states that the format admits a sixth while the standard refuses one.
 199	SPEC-BEARING	C3.10	Tombstone read at migration only, keeping the no-query-surface refusal alive.
-214	SPEC-BEARING	C4.23	Five modules preserved; membership restored from jn1.18 resolution section 1: store, schema, encoding, file, prelude. Internal crate renaming remains transfer-map construction.
+214	SPEC-BEARING	C4.23	Five modules preserved from jn1.18: store, schema, encoding, file, prelude. RULED 214 assigns payload identity/description to schema and value constraints to encoding. Internal crate renaming remains transfer-map construction.
 234	SPEC-BEARING	C4.24	Artefacts are read only by the major line that wrote them; the operator links both majors and copies through. The technique is deliberately not taught here per RULED 235.
 236	SPEC-BEARING	C3.11	Envelope shape stays with this specification; the byte container's version belongs to the format specification. Never conflated.
 238	SPEC-BEARING	C4.12	The exclusion trait stays internal; the obligation is held by conformance rather than by the type system. Accepted cost: symmetry is tested, not structural.
@@ -155,10 +155,10 @@ ruled_n	disposition	clause_ids	note
 38	SPEC-BEARING	C6.18	The closure maps payload to payload and is free to refuse; the envelope is unreachable to it and wholly pardosa-assigned.
 50	SPEC-BEARING	C6.15	pardosa reports which generation state holds and never opens another artefact for the caller. Consulting the record is pardosa's obligation, not the reader's.
 52	SPEC-BEARING	C6.17	Pointer written at completion establishes a complete target unconditionally. Escalation pardosa-de69 CLOSED; no new cutover or recovery lifecycle is inferred.
-54	SPEC-BEARING	C6.7	Three types for three questions, with a condition reached on a successful path never carried by the failure type. Stale premise named: this ruling's non-exhaustive attribute on the top-level failure enumeration was reopened and dropped by RULED 142, which C4.6 carries; C6.7 states the three-family split only.
+54	SPEC-BEARING	C6.7	Three families and a source-backed condition register, with successful-read knowledge never folded into failure. RULED 142 replaces the old non-exhaustive top-level premise (C4.6). Complete inventory/composition remains explicitly outstanding, not proven by the register.
 56	SPEC-BEARING	C6.9	Adapter detail rides in a pardosa-owned field and no adapter error type is reachable by any route, including a walked chain of causes.
 61	SPEC-BEARING	C6.10	The remedy is documented with the condition and follows from the type held; no predicate over a condition is published.
-62	SPEC-BEARING	C6.8	One qualified-result type spanning the five states, enumerated completely, so a caller need not choose a question before knowing what it holds.
+62	SPEC-BEARING	C6.8	One qualified-result type carrying the named knowledge facts; exhaustive enumeration is the obligation, not proof that the draft defines every combination. Combined knowledge and foreign-cursor staging remain review D4.
 63	SPEC-BEARING	C6.11	The diagnostic payload is the whole of the operator-facing report; the fixed surface carries no further channel.
 77	SPEC-BEARING	C6.31	A positive supported-writer list, no exclusion list, and an unestablished platform recorded as unestablished. The clause names the supported writer targets.
 81	SPEC-BEARING	C6.32	The maintainer relationship is disclosed and triage is best effort, with no response time committed on the non-security path.
@@ -208,7 +208,7 @@ ruled_n	disposition	clause_ids	note
 213	SPEC-BEARING	C6.33;C5.56	The names carry the schema-moved / standard-moved distinction at the call site; C6.33 states the two conditions and C5.56 owns the word for the payload type's identity. Per RULED 215 no clause is minted for the nouns themselves.
 215	SPEC-BEARING	C5.50	The one noun earning a clause is the event vocabulary, and C5.50 carries it. Stale premise named: the slice reads as though this clause is still owed, and sub-mission 04 authored it; the other seven nouns are identifiers or conditions already governed by clauses that exist.
 216	MAP-GOVERNANCE	-	Relocates the clean-room wall so this map sits on the contaminated side and names the spec as the only channel across. It governs the transfer map's charter, not the library's behaviour.
-219	MAP-GOVERNANCE	-	Routes every named constraint to the artefact carrying it across the wall. The routing is transfer-map governance; each routed constraint reaches its clause under its own ruled_n.
+219	MAP-GOVERNANCE	-	Routes named constraints across the wall, not proof of clause delivery. Bounded M7 reconciliation accounts for supplied clauses and retained gaps; the dragline-documentation citation duty versus C5.2 remains an unresolved scope tension, not silently waived or imposed.
 224	SPEC-BEARING	C6.22	Finiteness and acyclicity of the descriptor's transitive closure, stated for the reader who has no compiler. Assumption named: the ruling directs this into the descriptor clause that already exists, so C6.22 gains the sentence rather than a second clause being minted.
 227	MAP-GOVERNANCE	-	Confines foreign citations to PAR ADRs. It governs this document's citation practice; consistent with C5.2, no clause cites a foreign corpus normatively and no clause records the rule about itself.
 229	MAP-GOVERNANCE	-	Counts the unmechanisable-judgement class and finds three of four instances already discharged by their own texts. It governs the map's own accounting, not the library's behaviour.
@@ -247,8 +247,8 @@ ruled_n	disposition	clause_ids	note
 208	SPEC-BEARING	C5.56	The contested word is assigned to the domain sense and the substrate sense yields, which is exactly the one-word-one-concept rule C5.56 states. Per RULED 215 the yielded identifiers are rustdoc material and mint no clause.
 209	SPEC-BEARING	C5.30;C5.55	The routing parameter's replacement is built from vocabulary the map owns and names a destination, satisfying C5.30's backend-noun refusal and C5.55's property-naming rule. Stale premise named: the RULED 101 row forwards the replacement word to this layer as clause material, and RULED 215 rules it an identifier that mints none.
 210	SPEC-BEARING	C6.12;C5.55	One walk survives, which C6.12 already states with its two abnormal terminations; the dropped qualifier was contrastive and mechanism-named, which is C5.55 with RULED 82. Per RULED 215 an identifier mints no clause.
-211	SPEC-BEARING	C6.7;C5.55	Three mechanism-named conditions collapse to one property-named condition over the artefact pair, sitting in the failure family C6.7 fixes under the naming rule C5.55 states. Per RULED 215 the condition is already governed and mints no clause.
-212	SPEC-BEARING	C6.7;C5.55	The two identifiers naming pardosa's reaction are renamed to name the value condition, and the five codes below them stand unchanged. C6.7 fixes the family and C5.55 the rule; per RULED 215 no clause is minted.
+211	SPEC-BEARING	C6.7;C5.55	ArtefactMismatch and its do-not-open remedy restored in C6.7: one artefact-pair condition, with the detecting check in opaque diagnostics. No additional clause or invented top-level placement.
+212	SPEC-BEARING	C6.7;C5.55	ValueConstraintViolated and ValueConstraint with TooLong, Empty, NotReal, InvalidChar, InvalidUtf8 restored inside C6.7. Value decoding is distinct from payload-schema identity; no extra clause or invented failure composition.
 222	MAP-GOVERNANCE	-	Declines a ninth failure noun on the ground that a program the compiler rejects reaches no runtime, so no condition ever surfaces to a consumer. Consistent with the RULED 221 row: there is no pardosa behaviour for a clause to state.
 223	MAP-GOVERNANCE	-	Records that an inexpressibility claim is today unproven and owes a compile-fail fixture in the derive crate's own tests, expressly not in the conformance suite. It governs this effort's test debt, and a consumer receives no promise from it.
 231	MAP-GOVERNANCE	-	Sets the documentation-bar judgement as one standing ADR edited in place, per release, with git holding prior state. It governs this effort's ADR corpus and record-keeping, not the library's behaviour.
