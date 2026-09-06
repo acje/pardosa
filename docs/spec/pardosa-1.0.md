@@ -432,7 +432,12 @@ artefact's contents are read to determine it.
 Where pardosa cannot read an artefact's ownership record while fencing a write,
 it refuses the write under a name distinct from the name it gives a stale-epoch
 rejection. The refused write leaves the artefact as it stood and leaves the
-events resident with the caller, and the caller is free to present them again.
+events resident with the caller. The caller may resubmit after establishing
+current append authority and determining which events already landed; this
+permission does not extend to re-appending events already known to have landed.
+No new session is required solely because the ownership record was unreadable.
+This is permission for caller resubmission, not automatic retry. The stale-session
+retry prohibition in C8.1 and C12.4 remains in force.
 
 #### C5.13 — INVARIANT
 
