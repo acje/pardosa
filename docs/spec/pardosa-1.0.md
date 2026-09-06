@@ -346,7 +346,7 @@ vocabulary a consumer uses or an invariant this specification promises.
 #### C4.23 — INVARIANT
 
 pardosa's compiler floor is the oldest stable Rust release that compiles the
-fixed surface. The ruled requirement for pardosa is 1.89.0; that value is not
+fixed surface. The requirement for pardosa is 1.89.0; that value is not
 yet verified as the floor of the complete dependency graph. Verification against
 every dependency's own minimum supported Rust version is owed before publication.
 A raise of the floor lands in any minor release, and pardosa promises no window
@@ -954,34 +954,90 @@ type carrying what pardosa knows about an artefact a caller has just opened. A
 condition reached on a path that succeeded is carried by the third family and
 never by the first.
 
-The following register collects established conditions and their owning clauses.
-It does not yet define an exhaustive top-level variant inventory; the completeness
-commitment in C4.6 remains to be fully supplied in this draft. Coexisting facts
-remain independently visible, subject to the constraints in C6.8. A descriptive
-row without an identifier does not mint a variant spelling.
+The following register accounts for the answer and admission distinctions required
+by this specification. Its rows name semantic conditions and their refinements,
+not a count or layout of top-level Rust variants. C4.5, C4.6 and C5.59 require
+complete enumerations without catch-alls; the register preserves those obligations
+without prescribing unassigned spellings or representation. Coexisting facts remain
+independently visible subject to C6.8. The separate descriptor-constructor inventory
+remains incomplete under C6.23; answer coverage does not complete that inventory.
 
 | Family | Established condition or members | Meaning and owning clause |
 | --- | --- | --- |
 | Operation failure | `StoreAlreadyExists` | Creation finds an artefact already present; open instead (C12.3). |
+| Operation failure | No artefact exists on open | Strict open refuses; the metadata-only creation-completion case is different (C5.62, C5.10). |
 | Operation failure | `ConcurrencyConflict` | A claim on an existing artefact loses compare-and-set; the claimant stops (C5.7, C12.3). |
 | Operation failure | Stale-epoch write rejection | The writer had ownership and lost it; distinct from claim loss, no retry (C12.4). |
 | Operation failure | Ownership cannot be established on write open | Shared refusal across adapters, not refusal of a qualified orphan read (C12.5). |
 | Operation failure | Ownership record unreadable while fencing | Distinct from known loss of ownership (C5.12). |
-| Operation failure | Exclusion unavailable, migration exclusion absent, or migration already running | Distinct conditions under C5.6, C5.17 and C5.19 respectively. |
-| Operation failure | Discovered chain break or uncovered partition membership | Refusals under C5.28 and C5.56 respectively. |
-| Operation failure | `SchemaMismatch`, `EnvelopeMismatch` | Separate top-level conditions under C6.33; unestablished mismatch cause follows C6.34. |
+| Operation failure | Exclusion mechanism unavailable | Required safety mechanism cannot be taken; not merely unavailable owner-identity evidence (C5.6, C5.13). |
+| Authority acquisition prevented | Another owner holds the required exclusion | Named distinctly from unavailable exclusion and from an attempted claim losing compare-and-set (C5.6, C5.65, C6.41); no wait or timeout policy is specified. |
+| Operation failure | Migration exclusion absent | Migration started without exclusive access to its target (C5.17). |
+| Operation failure | Migration already running | A second concurrent migration is refused (C5.19). |
+| Operation failure | Discovered precursor chain break | Ordinary-path refusal under C5.28; the walk's two abnormal endings are refined below, not additional independent breaks. |
+| Operation failure | Uncovered partition membership | Open refuses; no dragline is assigned by inference (C5.56). |
+| Operation failure | `SchemaMismatch` | Payload type differs on an event-yielding path (C5.51, C6.33); the record-reader carve-out is C5.52. |
+| Operation failure | `EnvelopeMismatch` | Envelope shape differs on any path; separate from the payload condition at the top level (C4.18, C6.33). |
+| Failure qualification | Mismatch established, differing subject unestablished | The mismatch refusal stands; its decomposition is unknown, not guessed and not successful delivery of mismatching events (C6.34). This lack of decomposition does not itself add a descriptor-corruption refusal. |
 | Artefact-pair failure | `ArtefactMismatch` | The pair does not belong together; do not open it. Which pairing check failed belongs in diagnostic detail. |
-| Value-decoding failure | `ValueConstraintViolated { constraint: ValueConstraint }` | A value violates a bound or validity constraint, not a payload-schema identity condition. |
+| Value-decoding failure | `DecodeError::ValueConstraintViolated { constraint: ValueConstraint }` | A value violates a bound or validity constraint, not a payload-schema identity condition. |
+| Typed decoding failure | Unrecognised wire tag | C4.13 requires typed rejection and loud older-reader rejection; an unrecognised ownership-record kind is an application of this requirement. |
+| Operation failure | Invariant-breaking open configuration | Refuse at open under C5.35; the cost of an unpromised property is instead documented. |
+| Artefact admission refusal | Missing schema descriptor | No artefact omitting its descriptor is admitted (C5.45, C6.25); distinct from an existing descriptor not establishing mismatch decomposition. |
+| Migration failure | Caller transformation refuses | The payload transformation may refuse under C6.18; refusal is not successful migration or indeterminate write landing. |
 | Closed value sub-domain | `ValueConstraint`: `TooLong`, `Empty`, `NotReal`, `InvalidChar`, `InvalidUtf8` | The five value-constraint codes; none is a catch-all. |
 | Closed liveness sub-domain | `ProvenDead { proof }`, `Indeterminate` | Proof of death or absence of proof, never a proof of liveness (C2.5). `DeathProof` carries the death proof. |
+| Closed death-proof sub-domain | `DeathProof`: machine reboot, process absence, process-id reuse | These three are the death-proof facts; clean release proves release instead (C5.14, C6.43). |
 | Closed migration-mode sub-domain | Steady, migrating | Whether an artefact is under migration; reopened-state limits remain C6.2. |
-| Qualified successful read | Generation known or unknown, superseded generation, either migration-disagreement direction; independently qualified history integrity, migration-result completeness and append authority | C6.8, C6.14, C6.15 and C5.15; not top-level failures. |
+| Closed precursor-walk error sub-domain | `CausalChainError`: `PrecursorOutOfRange`, `PrecursorWrongFiber` | Recorded precursor outside the artefact or in another fiber respectively (C6.12); genesis is ordinary termination, not a third error. |
+| Closed lifecycle vocabulary | `FiberState`: `Undefined`, `Defined`, `Detached`, `Purged`, `Locked` | Complete membership under C6.1; C6.2 excludes locked, migrating and nonempty removed-identity states on reopen. |
+| Closed caller policy vocabulary | `FiberMigrationPolicy`: `Keep`, `Purge`, `LockAndPrune` | Complete treatments under C6.1 and C12.2, with tombstone-selection modality under C5.50. |
+| Closed caller policy vocabulary | `LockedRescuePolicy`: `PreserveAuditTrail`, `AcceptDataLoss` | Complete rescue choices under C6.1 and C6.19, not the separate election to enter a chain-broken artefact. |
 | Indeterminate write outcome | Whether the write landed is unknown | Neither success nor failure; establish what landed before deciding (C5.16). |
 
-The death-proof facts include machine reboot, process absence and process-id
-reuse. Clean release proves release under C5.14. This register does not assign
-unruled variant spellings. Independent visibility does not turn mutually exclusive
-alternatives within a closed sub-domain into coexisting facts.
+Lifecycle and caller-policy vocabularies are not extra response families. The
+following successful-read qualifications belong to the one qualified-result family;
+each retains its owning clause's knowledge limits rather than forming an
+unrestricted product or a new flat enumeration.
+
+| Qualified fact | Required distinction and owning clause |
+| --- | --- |
+| Ownership | An eligible read without an ownership record is explicitly unowned (C5.10, C6.14). |
+| Generation knowledge | Known or explicitly unknown; the ownership-record-absent read has unknown generation (C6.8, C6.14, C6.15). |
+| Supersession | A known superseded generation is named, and the requested artefact is returned without redirection (C6.15); unknown generation is not silently current. |
+| Migration disagreement | Outbound announced without target acknowledgement, and inbound recorded without source announcement, each have their own name; eligible reads continue without choosing a winner (C5.15). |
+| History integrity | State the integrity established for the history read, with each mechanism's scope; unanchored is distinct from invalid, and anchoring adds generation-local rewrite evidence (C5.26–C5.28, C5.40, C6.15). |
+| Migration-result completeness | Known complete, known incomplete, or unknown relative to the intended policy/transformation result; interruption or absent pointer proves neither extreme (C6.15, C6.17). |
+| Append-authority knowledge | Identify the generation holding authority when established, including whether the target read holds it; otherwise unknown, independently of integrity and completeness (C6.15). |
+
+Admission conditions and ordinary ownership outcomes remain distinct from both
+failure refinements and successful-read knowledge:
+
+| Condition | Admission or outcome and owning clause |
+| --- | --- |
+| Retired migration source | Every later append is rejected, including from a newly acquired writer; retirement is not merely a stale epoch (C5.63). |
+| Source freeze window | No source append is admitted while the window is open (C5.63); no response or scheduling mechanism is selected here. |
+| Interrupted or uncertain cutover | Renewed ordinary writes to either generation remain blocked until authority is established, potentially indefinitely; valid chase and manager writes remain governed by C5.3 (C5.63). |
+| Writing major line | Read admission is confined to the major line that wrote the artefact (C4.21); no additional error spelling follows. |
+| Empty ownership record | Unowned and ordinarily claimable; claim contention has the existing claim-loss condition (C5.9). |
+| Ownership record without event data | Under creation and open for completion, not nonexistent and not automatically repaired (C5.10). |
+| Clean release | Proof of release from any host, distinct from proof of owner death (C5.14). |
+
+Independent visibility admits no ordinary event delivery beyond a discovered chain
+break, wrong-envelope acceptance, event-yielding payload-mismatch acceptance, or
+missing-descriptor admission. Qualified orphan reads retain ordinary checks.
+Readability and completeness establish no append authority. The lifecycle limits
+of C6.2 and the admission limits above remain in force. Mutually exclusive
+alternatives within a closed sub-domain do not become coexisting facts.
+
+Construction constraints are not runtime failure members: dragline-local cursors
+are valid by construction and meaningless across migrations (C5.22); payload roots,
+required kinds and finite acyclic descriptor closure belong to C5.48, C5.49 and
+C6.22. Rejection of a cyclic type is a compiler matter, not a runtime cycle error.
+Required-kind diagnostics and the public-documentation build obligation are also
+distinct from runtime answers (C5.49, C8.4). Record kinds, envelope and claim fields,
+identity structure, producer classes, modules, crates and features keep their own
+structural inventories; platform disclosures under C6.31 are not result variants.
 
 #### C6.8 — SURFACE
 
@@ -1323,7 +1379,7 @@ fourth published crate.
 
 The ownership claim carries seven semantic fields: the monotonic epoch, machine
 identity, boot identity, process identifier, process start time, claim time, and
-an opaque operator label. The epoch is the fencing token under C5.5; identity
+an opaque operator label. The epoch serves C5.5's write-admission rule; identity
 facts support ownership-death proofs rather than replacing the fence. Boot
 identity distinguishes machine reboot, and process identifier paired with process
 start time distinguishes process-id reuse. Unavailable boot-identity evidence
