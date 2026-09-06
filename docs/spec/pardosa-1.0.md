@@ -1352,9 +1352,11 @@ The suite asserts structural completeness on every adapter it covers.
 #### C8.3 — INVARIANT
 
 A consumer declares its payload type's schema version in the source that defines
-that type. Across a migration the conformance suite asserts that the target
-type's version stands later than the source type's, and a migration whose
-version stands still or stands earlier is a conformance failure.
+that type. The application owns schema mapping, upcasting and schema-migration
+admissibility, whether the source and target schemas share a name or carry
+different names. pardosa imposes no schema-version advancement requirement on a
+migration, in its runtime or its conformance suite. The migration and read-safety
+requirements stated elsewhere in this specification remain in force.
 
 #### C8.4 — INVARIANT
 
