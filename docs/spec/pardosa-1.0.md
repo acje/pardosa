@@ -513,9 +513,8 @@ constructing.
 
 #### C5.22 — SURFACE
 
-A resume cursor carries the identity of the generation that issued it. A cursor
-issued in one generation and presented against another is rejected under its own
-name.
+pardosa exposes a resume cursor that is dragline-local and valid by construction.
+Cursors are regenerated during migrations and have no meaning across migrations.
 
 #### C5.23 — INVARIANT
 
@@ -961,7 +960,6 @@ row without an identifier does not mint a variant spelling.
 | Closed liveness sub-domain | `ProvenDead { proof }`, `Indeterminate` | Proof of death or absence of proof, never a proof of liveness (C2.5). `DeathProof` carries the death proof. |
 | Closed migration-mode sub-domain | Steady, migrating | Whether an artefact is under migration; reopened-state limits remain C6.2. |
 | Qualified successful read | Generation known or unknown, superseded generation, either migration-disagreement direction; independently qualified history integrity, migration-result completeness and append authority | C6.8, C6.14, C6.15 and C5.15; not top-level failures. |
-| Cursor condition | Cursor from another generation | Its use is rejected under C5.22; successful artefact open does not make that cursor usable. The cursor fact belongs to the qualified-result family in C6.8. |
 | Indeterminate write outcome | Whether the write landed is unknown | Neither success nor failure; establish what landed before deciding (C5.16). |
 
 The death-proof facts include machine reboot, process absence and process-id
@@ -973,9 +971,8 @@ alternatives within a closed sub-domain into coexisting facts.
 
 One type carries what a caller knows about the artefact it has just opened:
 whether the artefact's generation is known, whether that generation is superseded,
-which of the two migration disagreements holds, and whether a presented cursor
-belongs to another generation. For a migration target it also carries the
-independent integrity, migration-result completeness and append-authority
+and which of the two migration disagreements holds. For a migration target it
+also carries the independent integrity, migration-result completeness and append-authority
 knowledge C6.15 states. These facts belong to one qualified-result family, with
 closed, exhaustive alternatives and explicit unknowns. Coexisting facts remain
 independently visible: a caller reads them from the value it already holds rather
@@ -991,9 +988,7 @@ visibility relaxes neither C5.28's ordinary-path refusal on a discovered chain
 break nor C6.2's reopened-state limits.
 
 This composition rule does not require a complete combination table; the closed
-alternatives and every required distinction remain required. Successful artefact
-open does not make a cursor from another generation usable: its use remains
-rejected under C5.22.
+alternatives and every required distinction remain required.
 
 #### C6.9 — INVARIANT
 
