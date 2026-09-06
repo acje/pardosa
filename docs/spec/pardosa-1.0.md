@@ -252,10 +252,11 @@ descriptor. A record of a kind pardosa does not recognise is rejected.
 
 #### C4.16 — INVARIANT
 
-From 0.5.1 the ownership record carries an identity structure that holds across
-any number of draglines: a logical identity distinct from the artefact's physical
-locator, a version, the identifiers of the draglines that make up that identity,
-and the rule partitioning fibers across them.
+From 0.5.1 each artefact's ownership record carries an identity structure:
+a shared logical dataset identity distinct from the artefact's physical locator,
+the structure's version, that artefact's own dragline identifier, and the rule
+partitioning fibers across the dataset's draglines. C6.37 states how a reader
+establishes membership without a roster in any one record.
 
 #### C4.17 — INVARIANT
 
@@ -296,13 +297,18 @@ reaches for in place of computed compatibility. This refusal holds throughout th
 
 #### C4.22 — SURFACE
 
-The event envelope carries five fields this specification owns, and that set is
-fixed at 1.0. The format admits a sixth field; this specification refuses to add
-one.
+The event envelope carries five fields this specification owns: `event_id`,
+`fiber_id`, `detached`, `precursor`, and `precursor_hash`. That set is fixed at
+1.0. C6.38–C6.40 state the identifier and detachment promises; C5.41 states the
+within-generation link-integrity promise of the precursor and its commitment.
+The format admits a sixth field; this specification refuses to add one.
 
 #### C4.23 — SURFACE
 
-pardosa's public surface is five modules, and that count is fixed at 1.0.
+pardosa's public surface is five modules: `pardosa::store` for the runtime,
+`pardosa::schema` for typed-payload vocabulary, `pardosa::encoding` for the wire
+contract, `pardosa::file` for the container, and `pardosa::prelude` for re-exports
+that broaden none of those surfaces. That count is fixed at 1.0.
 Material that would otherwise mint a sixth module is placed in the module whose
 concept already holds it.
 
@@ -389,8 +395,9 @@ ordinary way.
 pardosa creates an artefact's ownership record first and its event data second.
 An ownership record present without its event data is an artefact under creation:
 pardosa opens it, and the claimant or a later owner completes it. Event data
-present without its ownership record is refused, and the refusal holds on every
-path. pardosa repairs neither state.
+present without its ownership record is refused on every write path. Read-only
+open follows C6.14, subject to the ordinary schema and integrity checks.
+pardosa repairs neither state.
 
 #### C5.11 — INVARIANT
 
@@ -632,10 +639,10 @@ spanning two artefacts, and offers no aggregate over the commitments of several.
 
 #### C5.44 — INVARIANT
 
-pardosa requires no event kind standing for a fiber's detachment. An event's
-envelope records whether the fiber it belongs to stood detached when that event
-was written, and that record is the whole of what pardosa keeps on this axis. A
-consumer holds pardosa to no second rendering of it.
+pardosa requires no event kind standing for a fiber's detachment. The envelope's
+`detached` field marks the event that detaches its fiber, as C6.40 states; it is
+not a snapshot of the fiber's current state. A consumer holds pardosa to no
+second durable rendering of that transition.
 
 #### C5.45 — INVARIANT
 
@@ -657,19 +664,19 @@ artefact that omits it.
 
 #### C5.47 — INVARIANT
 
-An artefact's schema identity is a function of its schema descriptor. A change to
-the described structure yields a different schema identity. Two schema identities
-are compared for equality, and two schemas stand in a version relation when their
-identities differ, which is the whole of what that relation records.
+An artefact's schema identity is derived from its schema descriptor. A change to
+the descriptor yields a different schema identity. Identity comparison establishes
+equality or difference, not direction. The descriptor's version supplies the
+ordering C6.26 states and is itself an identity input under C6.27.
 
 #### C5.48 — INVARIANT
 
-A schema's identity comprises the described structure together with the names the
-payload type and its nested types carry. The consumer supplies those names. A
+A schema's identity includes the described structure, the names the payload type
+and its nested types carry, and the declared version. The consumer supplies those names. A
 name is a component of identity and never a key: pardosa keeps no registry of
 names and settles no collision between two consumers that choose the same one.
-Two payload types coincide in identity when they coincide in structure and in
-name.
+Two payload types coincide in identity when their descriptors coincide, including
+structure, names and version.
 
 #### C5.49 — SURFACE
 
@@ -772,22 +779,27 @@ a type for them.
 
 #### C6.1 — SURFACE
 
-The lifecycle types pardosa publishes are vocabulary a consumer names: a fiber's
-state, the migration policy a caller selects, and the rescue policy governing a
-locked fiber's migration. pardosa gives none of them a serialized form. A consumer
+The lifecycle types pardosa publishes are vocabulary a consumer names:
+`FiberState` with `Undefined`, `Defined`, `Detached`, `Purged`, and `Locked`;
+`FiberMigrationPolicy` with `Keep`, `Purge`, and `LockAndPrune`, whose treatments
+C12.2 states; and `LockedRescuePolicy` with `PreserveAuditTrail` and
+`AcceptDataLoss`, the audit-preservation versus accepted-data-loss choice for a
+locked fiber's migration, selected and recorded under C6.19.
+pardosa gives none of them a serialized form. A consumer
 transporting one of these values across a boundary of its own supplies the
 rendering itself.
 
 #### C6.2 — INVARIANT
 
 A fiber's locked state, a fiber's migrating condition, and a non-empty set of
-removed fiber identities are reachable only within a running migration. An artefact
-opened after a migration has finished yields none of the three, and pardosa states
+removed fiber identities are reachable only within a running migration. A reopened
+artefact yields none of the three, and pardosa states
 this of each of them where it names them.
 
 #### C6.3 — SURFACE
 
-The classification a migration makes of each fiber it considers is pardosa's own.
+The classification a migration makes of each fiber it considers, `FiberAction`,
+is internal at 1.0.
 What a consumer names of a fiber is its state and the policies the consumer selects
 for it.
 
@@ -946,6 +958,12 @@ A schema descriptor is written in the type constructors this specification names
 and that set of constructors is complete. Each constructor means what this
 specification states it means. A reader decodes a descriptor by implementing the
 constructors this specification names, and parses no programming language to do so.
+
+The settled constructor families are integers described by width and signedness,
+bounded vocabulary types carrying their maximum bound, enumerations carrying
+explicit discriminants, structures carrying ordered fields, and `Option`.
+This family list does not yet supply the complete constructor inventory or the
+specific widths; those definitions remain outstanding for this draft.
 
 #### C6.24 — SURFACE
 
@@ -1114,6 +1132,12 @@ to an artefact. The operation grants that authority or names the condition
 standing in its way, and names that condition in the vocabulary this specification
 fixes. It takes no predicate from the caller and names no storage construct.
 
+#### C6.43 — SURFACE
+
+The three published crates are `pardosa`, `pardosa-derive`, and `pardosa-nats`.
+The migration manager belongs inside `pardosa` under C4.13 rather than in a
+fourth published crate.
+
 ### Verification
 
 The checks that hold the specified behaviour in place, and the strength of each.
@@ -1124,7 +1148,8 @@ Where an adapter's durability step replaces the whole of an artefact's stored
 content, that adapter compares the epoch the writer carries against the epoch
 recorded for the artefact at every durability step. A durability step carrying a
 superseded epoch is refused, the artefact stands as it stood, and the events
-remain with the caller to present again.
+remain with the caller. Their retention grants no renewed write authority: the
+fenced session must not retry, as C12.4 states.
 
 #### C8.2 — INVARIANT
 
@@ -1141,6 +1166,11 @@ A consumer declares its payload type's schema version in the source that defines
 that type. Across a migration the conformance suite asserts that the target
 type's version stands later than the source type's, and a migration whose
 version stands still or stands earlier is a conformance failure.
+
+#### C8.4 — INVARIANT
+
+From 0.5.1, `deny(missing_docs)` is a build gate for pardosa's public items.
+An undocumented public item fails the build.
 
 ### Timing
 
@@ -1250,6 +1280,7 @@ again is unfounded.
 
 #### C12.5 — INVARIANT
 
-An artefact whose ownership record pardosa cannot establish is refused under one
-name, and that name stands the same on every adapter. The name states that the
-artefact's ownership is unestablished.
+The write-path refusal for an artefact whose ownership record pardosa cannot
+establish carries one name, the same on every adapter. The name states that the
+artefact's ownership is unestablished. It does not refuse the read-only open
+C6.14 permits.
