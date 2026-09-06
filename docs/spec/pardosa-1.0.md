@@ -1268,9 +1268,14 @@ attempted through a writer held before cutover or a newly acquired source writer
 The retired source remains available for historical reads under the ordinary
 schema and integrity checks and C6.15's generation reporting.
 
-This successful-cutover condition does not determine append authority after an
-interrupted or uncertain cutover. Absence of migration metadata does not establish
-source append authority; recovery and partial-target eligibility remain unspecified.
+After interrupted or uncertain cutover, pardosa must establish which generation
+has append authority before permitting renewed ordinary writes to either source
+or target. While that authority remains uncertain, those writes remain blocked,
+potentially indefinitely. Operator assertion alone is insufficient to establish
+that authority. Absence of migration metadata does not establish source append
+authority. This requirement leaves valid source chase writes and migration-manager
+target writes under C5.3 intact, and does not prohibit operator initiation under
+C5.14. Recovery mechanisms and partial-target eligibility remain unspecified.
 
 ### Artefacts
 
