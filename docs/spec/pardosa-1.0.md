@@ -171,10 +171,11 @@ Every clause records its own axis, and the axis is a property of that clause
 rather than of the section holding it. The axis answers one question: does
 breaking this clause break a consumer. It answers nothing about whether the
 clause's text is free to change. A clause therefore holds a binding commitment
-while its content stays open, and a clause that enumerates is free to add to its
-enumeration in any release without altering what it promises. Every clause of this
-specification is normative from 0.5.1, and a clause's axis names which commitment
-that clause carries rather than whether it carries one.
+while its content stays open. An open-ended clause may add to its enumeration
+without altering promised membership, subject to C4.4–C4.6's closed-set
+constraints; this grants no freedom to enlarge a closed public enumeration.
+Every clause of this specification is normative from 0.5.1, and a clause's axis
+names which commitment that clause carries rather than whether it carries one.
 
 #### C4.3 — INVARIANT
 
@@ -255,6 +256,10 @@ The nine are the ownership claim, the clean release, the migration start, the
 migration end, the inbound pointer, the outbound pointer, the rescue-policy
 choice recorded with the migration start, the identity structure, and the schema
 descriptor. A record of a kind pardosa does not recognise is rejected.
+
+An unknown wire tag produces a typed decode error. An older reader rejects
+an added tag loudly rather than preserving and skipping it. The format-version
+bump required when adding a tag belongs to the format specification under C3.11.
 
 #### C4.14 — INVARIANT
 
@@ -341,8 +346,11 @@ vocabulary a consumer uses or an invariant this specification promises.
 #### C4.23 — INVARIANT
 
 pardosa's compiler floor is the oldest stable Rust release that compiles the
-fixed surface. At 1.0 that release is 1.89.0. A raise of that floor lands in any
-minor release, and pardosa promises no window over which a given floor holds.
+fixed surface. The ruled requirement for pardosa is 1.89.0; that value is not
+yet verified as the floor of the complete dependency graph. Verification against
+every dependency's own minimum supported Rust version is owed before publication.
+A raise of the floor lands in any minor release, and pardosa promises no window
+over which a given floor holds.
 
 #### C4.24 — SURFACE
 
@@ -549,7 +557,8 @@ Where an operator has wired an anchor destination, the artefact additionally
 establishes that it has not been rewritten since an anchor an external observer
 holds; that second establishment is a capability an operator elects. An artefact
 with no anchor is unanchored, and unanchored is its own verdict rather than a
-verdict of invalid.
+verdict of invalid. An unanchored rolling commitment does not resist a full
+rewrite: a writer rewriting the whole artefact can recompute a valid commitment.
 
 #### C5.27 — INVARIANT
 
@@ -737,9 +746,10 @@ requirement fixes the diagnostic's content, not its exact wording.
 
 #### C5.50 — INVARIANT
 
-A migration removes a fiber whose latest event is a tombstone under the migration
-policy that purges, and retains such a fiber under every other migration policy
-this specification offers.
+Under `Purge`, a migration may purge fibers whose latest tombstone marks them
+deleted. Under `Keep` and `LockAndPrune`, it does not perform tombstone-triggered
+purging. C12.2 governs what each selected treatment retains or erases; this
+permission does not require selecting every tombstoned fiber for purge.
 
 #### C5.51 — INVARIANT
 
@@ -1203,10 +1213,12 @@ together with Apple's platforms. pardosa publishes no list of platforms it
 excludes. Where a platform's standing is unestablished, pardosa records it as
 unestablished and claims it in neither direction. A read-only open is available
 wherever pardosa builds.
+Read-only support additionally requires the toolchain needed by `zstd-sys`.
+WASI read-only buildability is unverified and is claimed in neither direction.
 
 #### C6.32 — INVARIANT
 
-pardosa states the size of the group that maintains it. Triage of a report a
+pardosa has one maintainer. Triage of a report a
 consumer files is best effort, and pardosa commits to no time within which a report
 is answered.
 
@@ -1309,7 +1321,16 @@ fourth published crate.
 
 #### C6.43 — SURFACE
 
-The ownership record's format requires an operator label. Supplying that label
+The ownership claim carries seven semantic fields: the monotonic epoch, machine
+identity, boot identity, process identifier, process start time, claim time, and
+an opaque operator label. The epoch is the fencing token under C5.5; identity
+facts support ownership-death proofs rather than replacing the fence. Boot
+identity distinguishes machine reboot, and process identifier paired with process
+start time distinguishes process-id reuse. Unavailable boot-identity evidence
+yields an indeterminate verdict under C5.13, not a refusal of write capability.
+Claim time and the label are diagnostic; the opaque label is never a verdict input.
+
+The ownership record's format requires the operator label. Supplying that label
 is optional for the caller: when the caller supplies none, pardosa derives a
 default from the process. The field's encoding and wire shape belong to the
 format specification under C3.4; access to ownership-record fields remains
