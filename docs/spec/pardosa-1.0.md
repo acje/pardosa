@@ -362,8 +362,9 @@ to cite a clause.
 A dragline admits one writer and any number of readers, on every adapter. During
 a migration the source dragline keeps its own writer and the migration manager
 reads it; the target dragline has the migration manager as its writer and is
-readable throughout; at cutover the target's writer role passes from the migration
-manager to the application, subject to C9.1's source-retirement condition. The
+readable throughout with C6.15's qualifications; at cutover the target's writer
+role passes from the migration manager to the application, subject to C9.1's
+source-retirement condition. The
 migration manager takes exclusion by the mechanism the
 adapter offers, and the exclusion a caller relies on is the same one every
 pardosa writer relies on.
@@ -450,7 +451,8 @@ initiate.
 pardosa names two conditions where a source and a target disagree about a
 migration: the source announcing an outbound migration the target holds no record
 of, and the target holding an inbound record the source announces nothing of.
-Each carries its own name. The read proceeds under either, and pardosa selects no
+Each carries its own name. The read proceeds under either, subject to the ordinary
+schema and integrity checks and C6.15's qualifications, and pardosa selects no
 winner between them.
 
 #### C5.16 — INVARIANT
@@ -875,7 +877,7 @@ mint a variant spelling.
 | Closed value sub-domain | `ValueConstraint`: `TooLong`, `Empty`, `NotReal`, `InvalidChar`, `InvalidUtf8` | The five value-constraint codes; none is a catch-all. |
 | Closed liveness sub-domain | `ProvenDead { proof }`, `Indeterminate` | Proof of death or absence of proof, never a proof of liveness (C2.5). `DeathProof` carries the death proof. |
 | Closed migration-mode sub-domain | Steady, migrating | Whether an artefact is under migration; reopened-state limits remain C6.2. |
-| Qualified successful read | Generation known or unknown, superseded generation, either migration-disagreement direction | C6.8, C6.14, C6.15 and C5.15; not top-level failures. |
+| Qualified successful read | Generation known or unknown, superseded generation, either migration-disagreement direction; independently qualified history integrity, migration-result completeness and append authority | C6.8, C6.14, C6.15 and C5.15; not top-level failures. |
 | Cursor condition | Cursor from another generation | Rejected under C5.22; composition and staging with the open result remain unspecified here. |
 | Indeterminate write outcome | Whether the write landed is unknown | Neither success nor failure; establish what landed before deciding (C5.16). |
 
@@ -889,7 +891,9 @@ generation knowledge.
 One type carries what a caller knows about the artefact it has just opened:
 whether the artefact's generation is known, whether that generation is superseded,
 which of the two migration disagreements holds, and whether a presented cursor
-belongs to another generation. Its states are one complete enumeration, and a
+belongs to another generation. For a migration target it also carries the
+independent integrity, migration-result completeness and append-authority
+knowledge C6.15 states. Its states are one complete enumeration, and a
 caller reads them from the value it already holds rather than by choosing which
 question to ask first.
 
@@ -947,6 +951,28 @@ opened. Where the artefact's generation is superseded, pardosa names that state 
 yields the artefact the caller named. pardosa opens no other artefact on a caller's
 behalf.
 
+For a migration target, pardosa qualifies the read independently by the integrity
+established for the history read, completeness relative to the intended migration
+result, and knowledge of append authority. Valid partial target history remains
+readable, including after interruption, under the ordinary schema and integrity
+checks. Integrity retains the scopes and limits of C5.26–C5.28 and C5.41;
+partial-history qualification does not relax those checks or their refusals.
+
+Migration-result completeness is reported as known complete, known incomplete,
+or unknown. The referent is the result required by the migration's selected
+policies and payload transformation, not equality with the source's event count
+or identities. A partial target need not be a contiguous source prefix.
+Interruption alone, or absence of an outbound pointer, establishes neither completeness nor
+incompleteness; where neither is established, pardosa reports unknown.
+
+Append-authority knowledge independently identifies which generation holds that
+authority when established, including whether the target being read holds it;
+otherwise authority is reported as unknown. Readability, valid integrity and known
+completion do not themselves establish append authority. Unknown authority permits
+an otherwise eligible qualified read and leaves C9.1's ordinary-write admission
+requirement intact. These qualifications are knowledge about the history, not
+additional reopened lifecycle states under C6.2.
+
 #### C6.16 — INVARIANT
 
 A migration is recorded in the ownership records of both generations. The metadata
@@ -961,6 +987,9 @@ it.
 The pointer to the next generation is written once that generation is complete. Its
 presence establishes that the generation it names is complete, and a reader
 following it reaches a complete generation without establishing that for itself.
+This is sufficient evidence of migration-result completeness under C6.15, not a
+requirement that every complete target have such a pointer. Append authority
+remains independently qualified under C6.15 and governed by C9.1.
 
 #### What a migration takes, and what it leaves
 
@@ -1275,7 +1304,8 @@ potentially indefinitely. Operator assertion alone is insufficient to establish
 that authority. Absence of migration metadata does not establish source append
 authority. This requirement leaves valid source chase writes and migration-manager
 target writes under C5.3 intact, and does not prohibit operator initiation under
-C5.14. Recovery mechanisms and partial-target eligibility remain unspecified.
+C5.14. Partial-target reads follow C6.15. Recovery mechanisms and the evidence by
+which renewed append authority is established remain unspecified.
 
 ### Artefacts
 
