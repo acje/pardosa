@@ -360,6 +360,11 @@ crates. That set of producers is fixed at 1.0, and pardosa names the hand-writte
 implementations it ships. Admitting a further producer is an addition within a
 major line.
 
+The published derive guides a consumer towards the supported constrained
+representations in C6.23. It rejects unsupported type shapes, identifies the
+unsupported shape and points to supported constrained forms where applicable,
+rather than silently accepting a broader representation.
+
 ### Rules of operation
 
 The invariants that bind every adapter, every caller, and every generation boundary.
@@ -1199,6 +1204,13 @@ A schema descriptor is written in the type constructors this specification names
 and that set of constructors is complete. Each constructor means what this
 specification states it means. A reader decodes a descriptor by implementing the
 constructors this specification names, and parses no programming language to do so.
+
+pardosa admits a finite, curated vocabulary of constrained representations for
+event payloads, rather than every Rust type. Enumerations, structures and newtypes
+compose the admitted representations. Library-supported construction and decoding
+preserve the constraints this specification assigns to those representations,
+including when they are composed. These constraints do not include arbitrary
+application predicates merely because a custom type or constructor enforces them.
 
 The settled constructor families are integers described by width and signedness,
 bounded vocabulary types carrying their maximum bound, enumerations carrying
