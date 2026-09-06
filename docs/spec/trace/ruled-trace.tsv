@@ -97,7 +97,7 @@ ruled_n	disposition	clause_ids	note
 191	SPEC-BEARING	C4.19	The five standard-owned envelope fields are fixed at 1.0, and the clause states that the format admits a sixth while the standard refuses one.
 199	SPEC-BEARING	C3.10	Tombstone read at migration only, keeping the no-query-surface refusal alive.
 214	SPEC-BEARING	C4.20	Five modules preserved from jn1.18: store, schema, encoding, file, prelude. RULED 214 assigns payload identity/description to schema and value constraints to encoding. Internal crate renaming remains transfer-map construction.
-234	SPEC-BEARING	C4.21	Artefacts are read only by the major line that wrote them; the operator links both majors and copies through. The technique is deliberately not taught here per RULED 235.
+234	SPEC-BEARING	C4.21	Artefacts are read only by the major line that wrote them; export across a major boundary is the operator's responsibility. Only the boundary is stated, not the technique, per RULED 235.
 236	SPEC-BEARING	C3.11	Envelope shape stays with this specification; the byte container's version belongs to the format specification. Never conflated.
 238	SPEC-BEARING	C4.10	The exclusion trait stays internal; the obligation is held by conformance rather than by the type system. Accepted cost: symmetry is tested, not structural.
 239	SPEC-BEARING	C4.10	The backend marker trait stays method-less and the two seals stay orthogonal, leaving a future backend nothing to break.
@@ -188,7 +188,7 @@ ruled_n	disposition	clause_ids	note
 155	MAP-GOVERNANCE	-	Allocates an accepted residual gap in the semver gate to the PAR ADR that adopts the tool, and rules that no spec clause and no second mechanism follow. It governs the ADR corpus and this effort's tooling posture, not the library's behaviour.
 157	MAP-GOVERNANCE	-	Records that the narrower framing does not reach jn1.11 B1's ground and that B1 is not re-litigated. It fixes what the decision record says so the pair is not offered again, and states no library behaviour.
 158	MAP-GOVERNANCE	-	Rules that a prior-art source is recorded in both its corroborating and its contradicting halves, or in neither. It governs how the ADR corpus records prior art, not the library's behaviour.
-159	MAP-GOVERNANCE	-	Fixes that jn1.30 did not supersede jn1.5 and which ticket discharges the routed finding. It corrects the map's own routing record and names where a drafter looks; the goal statement it points at is already carried by the opening sections.
+159	MAP-GOVERNANCE	-	Fixes that jn1.30 did not supersede jn1.5 and identifies jn1.5 and jn1.45(a) as the opening's two feeders. The unnumbered Purpose section carries jn1.45(a)'s schema-migration and event-sourcing goal as non-normative positioning, not a numbered guarantee.
 161	SPEC-BEARING	C5.40;C6.30	Link integrity and provenance are held apart: C5.40 states the within-generation link claim with its three non-claims, and C6.30 requires each alteration-detection claim to be stated per mechanism with its scope attached. No second statement is authored.
 165	MAP-GOVERNANCE	-	Fixes that PAR ADR supersession is recorded forward only, with no backward pointer the tool already derives. It governs the ADR corpus's rendering, not the library's behaviour.
 166	MAP-GOVERNANCE	-	States explicitly that the PGN corpus's immutability is undisturbed by the PAR corpus's mutability. It governs two ADR corpora, and a library specification has no clause for either.

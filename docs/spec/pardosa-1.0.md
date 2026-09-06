@@ -11,6 +11,12 @@ document: normative
 C5.1 states the regime scheme and what each clause's marker obliges.
 <!-- /STATUS -->
 
+### Purpose — non-normative positioning
+
+pardosa's purpose is to enable schema migrations and event sourcing without
+having to maintain multiple schema versions in applications and managers.
+This is the purpose the core feature serves, not a normative guarantee.
+
 ### Documentation authoring — non-normative process note
 
 Public documentation that uses *dragline*, including the docs.rs landing page,
@@ -210,9 +216,9 @@ caller makes.
 
 #### C4.8 — SURFACE
 
-A public struct's field set does not grow within a major line. A consumer
-constructing a public struct names every field the struct carries. The types
-admit a further field; this specification refuses to add one.
+A public struct's field set does not grow within a major line. Construction
+follows C5.57. The types admit a further field; this specification refuses to
+add one.
 
 #### C4.9 — SURFACE
 
