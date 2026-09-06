@@ -961,7 +961,7 @@ row without an identifier does not mint a variant spelling.
 | Closed liveness sub-domain | `ProvenDead { proof }`, `Indeterminate` | Proof of death or absence of proof, never a proof of liveness (C2.5). `DeathProof` carries the death proof. |
 | Closed migration-mode sub-domain | Steady, migrating | Whether an artefact is under migration; reopened-state limits remain C6.2. |
 | Qualified successful read | Generation known or unknown, superseded generation, either migration-disagreement direction; independently qualified history integrity, migration-result completeness and append authority | C6.8, C6.14, C6.15 and C5.15; not top-level failures. |
-| Cursor condition | Cursor from another generation | Rejected under C5.22; the operation stage and relation to successful open remain unspecified here. |
+| Cursor condition | Cursor from another generation | Its use is rejected under C5.22; successful artefact open does not make that cursor usable. The cursor fact belongs to the qualified-result family in C6.8. |
 | Indeterminate write outcome | Whether the write landed is unknown | Neither success nor failure; establish what landed before deciding (C5.16). |
 
 The death-proof facts include machine reboot, process absence and process-id
@@ -990,10 +990,10 @@ C5.63. Combinations forbidden by the invariants are excluded: independent
 visibility relaxes neither C5.28's ordinary-path refusal on a discovered chain
 break nor C6.2's reopened-state limits.
 
-This composition rule does not require a complete combination table. Concrete
-Rust representation is left to 0.5.1 development, preserving the closed
-alternatives and every required distinction. The operation stage at which a
-foreign cursor is rejected and its relation to successful open remain unspecified.
+This composition rule does not require a complete combination table; the closed
+alternatives and every required distinction remain required. Successful artefact
+open does not make a cursor from another generation usable: its use remains
+rejected under C5.22.
 
 #### C6.9 — INVARIANT
 
