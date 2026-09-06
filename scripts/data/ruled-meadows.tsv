@@ -95,7 +95,7 @@
 72	9	D	pardosa-jn1.34	Sets the delay between decision and name acquisition, carrying the squatting risk to publish
 73	10	D	pardosa-jn1.33	Fixes the artefact topology of the repo: one workspace, crates under crates/, spec and ADR tree beside them
 74	5	B	pardosa-jn1.9	Standing dependency rule: caret plus lockstep, exact pins forbidden at publish so version unification holds
-75	5	B	pardosa-jn1.9	States the floor as a rule -- oldest stable compiling the frozen surface -- not as a number that would drift
+75	4	A	pardosa-jn1.9	Governs compiler-floor evolvability explicitly: a raise may land at any minor, with no promised support window; first-YES L4 precedes the floor rule
 76	4	A	pardosa-jn1.9	Splits what binds from what freezes, and when: the single statement governing every later regime assignment
 77	6	B	pardosa-jn1.32	Decides what the spec discloses about platforms: a positive list, no exclusion list, unverified recorded as unverified
 78	4	A	pardosa-abi	Buys the irreversible half now and omits the reversible half, fixing what may still be added at a minor
@@ -147,7 +147,7 @@
 124	6	B	pardosa-jn1.56	Records which document owns which half, so the seam most likely to be described twice is named once
 125	5	B	pardosa-jn1.57	Removes the option to ship a self-undescribing artefact, making the descriptor unconditional
 126	6	B	pardosa-jn1.57	Fixes what information the descriptor carries, and therefore what a non-Rust reader can decode
-127	6	B	pardosa-jn1.57	Chooses the vocabulary the description is expressed in: a closed constructor set, not a Rust parser
+127	4	A	pardosa-jn1.57	Freezes the closed constructor set at 1.0 and makes a later addition breaking; explicit structural evolvability selects L4 before vocabulary exposure
 128	8	C	pardosa-jn1.57	Defines the two-layer verification that damps descriptor drift -- mechanical completeness plus the clean-room rebuild
 129	6	B	pardosa-jn1.57	Decides where the descriptor lives and therefore where a reader must look, once per artefact on either adapter
 130	6	B	pardosa-jn1.57	Fixes which document each hash factor versions, so the composition is not misread as crossing the boundary
@@ -199,7 +199,7 @@
 176	5	B	pardosa-jn1.66	Fixes the rule's reach as already covering consumer configuration, correcting a premise that would have reserved a governed case
 177	5	B	pardosa-jn1.74	Sets the standing test for when supersession fires: the decision's direction, never the diff
 178	5	B	pardosa-jn1.74	Adds the tie-breaker that closes the one movement escaping both prior rules -- scope narrowing or widening supersedes
-179	5	B	pardosa-jn1.60	Restricts who may produce a descriptor at all, taking the reversible direction while it is free
+179	4	A	pardosa-jn1.60	Explicitly permits relaxing the fixed descriptor-producer restriction at a minor; first-YES L4 governs how the producer set may evolve
 180	8	C	pardosa-jn1.60	Fixes the actual reach of the verification: provenance is checked structurally, faithfulness is never a check that could fire
 181	6	B	pardosa-jn1.60	Makes the spec state the limit plainly, so a stranger can tell which guarantee they hold
 182	5	B	pardosa-jn1.60	Carves the named exception without which the derive-only rule is false on its face
