@@ -362,8 +362,9 @@ to cite a clause.
 A dragline admits one writer and any number of readers, on every adapter. During
 a migration the source dragline keeps its own writer and the migration manager
 reads it; the target dragline has the migration manager as its writer and is
-readable throughout; at cutover the writer role passes from the migration manager
-to the application. The migration manager takes exclusion by the mechanism the
+readable throughout; at cutover the target's writer role passes from the migration
+manager to the application, subject to C9.1's source-retirement condition. The
+migration manager takes exclusion by the mechanism the
 adapter offers, and the exclusion a caller relies on is the same one every
 pardosa writer relies on.
 
@@ -1259,6 +1260,17 @@ while the source continues to take them, and completes across a freeze window.
 The window opens when the untransferred remainder is small, spans the transfer of
 that remainder, and closes when the writer role passes to the application writing
 the target. The source takes no append for as long as the window stands open.
+
+Cutover is successful only when pardosa has permanently retired the source
+artefact's append authority. Retirement is a condition of declaring success,
+not subsequent cleanup: pardosa rejects every later source append, whether
+attempted through a writer held before cutover or a newly acquired source writer.
+The retired source remains available for historical reads under the ordinary
+schema and integrity checks and C6.15's generation reporting.
+
+This successful-cutover condition does not determine append authority after an
+interrupted or uncertain cutover. Absence of migration metadata does not establish
+source append authority; recovery and partial-target eligibility remain unspecified.
 
 ### Artefacts
 
