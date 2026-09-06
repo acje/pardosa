@@ -940,10 +940,10 @@ condition reached on a path that succeeded is carried by the third family and
 never by the first.
 
 The following register collects established conditions and their owning clauses.
-It does not yet define an exhaustive top-level variant inventory or the legal
-combinations of these facts; the completeness commitment in C4.6 remains to be
-fully supplied in this draft. A descriptive row without an identifier does not
-mint a variant spelling.
+It does not yet define an exhaustive top-level variant inventory; the completeness
+commitment in C4.6 remains to be fully supplied in this draft. Coexisting facts
+remain independently visible, subject to the constraints in C6.8. A descriptive
+row without an identifier does not mint a variant spelling.
 
 | Family | Established condition or members | Meaning and owning clause |
 | --- | --- | --- |
@@ -961,13 +961,13 @@ mint a variant spelling.
 | Closed liveness sub-domain | `ProvenDead { proof }`, `Indeterminate` | Proof of death or absence of proof, never a proof of liveness (C2.5). `DeathProof` carries the death proof. |
 | Closed migration-mode sub-domain | Steady, migrating | Whether an artefact is under migration; reopened-state limits remain C6.2. |
 | Qualified successful read | Generation known or unknown, superseded generation, either migration-disagreement direction; independently qualified history integrity, migration-result completeness and append authority | C6.8, C6.14, C6.15 and C5.15; not top-level failures. |
-| Cursor condition | Cursor from another generation | Rejected under C5.22; composition and staging with the open result remain unspecified here. |
+| Cursor condition | Cursor from another generation | Rejected under C5.22; the operation stage and relation to successful open remain unspecified here. |
 | Indeterminate write outcome | Whether the write landed is unknown | Neither success nor failure; establish what landed before deciding (C5.16). |
 
 The death-proof facts include machine reboot, process absence and process-id
 reuse. Clean release proves release under C5.14. This register does not assign
-unruled variant spellings or settle how these facts compose with migration and
-generation knowledge.
+unruled variant spellings. Independent visibility does not turn mutually exclusive
+alternatives within a closed sub-domain into coexisting facts.
 
 #### C6.8 — SURFACE
 
@@ -976,14 +976,24 @@ whether the artefact's generation is known, whether that generation is supersede
 which of the two migration disagreements holds, and whether a presented cursor
 belongs to another generation. For a migration target it also carries the
 independent integrity, migration-result completeness and append-authority
-knowledge C6.15 states. Its states are one complete enumeration, and a
-caller reads them from the value it already holds rather than by choosing which
-question to ask first.
+knowledge C6.15 states. These facts belong to one qualified-result family, with
+closed, exhaustive alternatives and explicit unknowns. Coexisting facts remain
+independently visible: a caller reads them from the value it already holds rather
+than by choosing which question to ask first.
 
-The facts named here do not yet determine every reachable combined state or the
-operation stage at which a foreign cursor is rejected. In particular, a
-superseded generation and a directional migration disagreement can coexist;
-their complete representation remains an outstanding definition in this draft.
+The facts compose subject to the existing invariants, not as an unrestricted
+product of alternatives. A superseded generation and a directional migration
+disagreement can coexist, and neither hides the other. Valid partial target
+history may be readable with migration-result completeness and append authority
+both unknown under C6.15; readability does not confer write permission under
+C5.63. Combinations forbidden by the invariants are excluded: independent
+visibility relaxes neither C5.28's ordinary-path refusal on a discovered chain
+break nor C6.2's reopened-state limits.
+
+This composition rule does not require a complete combination table. Concrete
+Rust representation is left to 0.5.1 development, preserving the closed
+alternatives and every required distinction. The operation stage at which a
+foreign cursor is rejected and its relation to successful open remain unspecified.
 
 #### C6.9 — INVARIANT
 
