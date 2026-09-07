@@ -3,7 +3,8 @@
 Status: **NONNORMATIVE; four definitions HUMAN-adopted on ha3s at
 2026-09-07 09:30; delivery under `pardosa-gudk.1` independently APPROVED in
 `pardosa-aovc`. Commander `pardosa-gudk.2`: decision-complete and READY for
-0.5.1 implementation planning; awaiting only gardener administrative closure.**
+0.5.1 implementation planning.** Current administrative closure status is recorded
+in bd (`pardosa-gudk.2` and `pardosa-jn1`), not in this report.
 Earlier documentary preparation was APPROVED in `pardosa-j8i7`. Earlier bounded-discovery
 delivery under `pardosa-15nq.1` was APPROVED in `pardosa-t5di`; `pardosa-7vrc`
 covers the preceding report, not this update.
@@ -198,7 +199,7 @@ not adopted. Its historical body and HUMAN postponement comments remain intact.
 
 | Checkpoint | Actual status and retained obligations |
 | --- | --- |
-| Decision-level planning / map closure | **Decision-complete; READY for 0.5.1 implementation planning.** HUMAN has disposed both the inventory planning gate and the noun adoption question. Independent semantic/live-use review APPROVE is recorded in `pardosa-aovc`; commander `pardosa-gudk.2` determines the map destination met. No further HUMAN semantic choice was identified in the bounded open-work assessment. S3 retains semantic completion and the full transfer register stays intact. Only gardener administrative closure remains. |
+| Decision-level planning / map closure | **Decision-complete; READY for 0.5.1 implementation planning.** HUMAN has disposed both the inventory planning gate and the noun adoption question. Independent semantic/live-use review APPROVE is recorded in `pardosa-aovc`; commander `pardosa-gudk.2` determines the map destination met. No further HUMAN semantic choice was identified in the bounded open-work assessment. S3 retains semantic completion and the full transfer register stays intact. Administrative closure status is recorded in bd (`pardosa-gudk.2` and `pardosa-jn1`). |
 | Publication starting at 0.5.1 | **Not established.** Every used constructor needs its complete defined meaning and supported-route preservation; portable structural completeness and applicable conformance remain owed (S:1193–1219,1427–1439). No knowingly unmet binding obligation ships (S:815–818). Discovery can precede completeness; publication cannot. |
 | 1.0 freeze | **Not established.** Final semantic inventory, widths, actual shipped producer names and retained implementation/release obligations remain owed. Noun adoption does not complete those duties. Surface evolution during 0.5.x is not permission to publish undefined semantics (S:161–178,355–366). |
 
@@ -268,15 +269,16 @@ APPROVE in `pardosa-j8i7`, not approval of the current normative diff or map.
 **Closure predicate satisfied at decision level:** explicit HUMAN noun disposition,
 source-faithful delivery independently APPROVED in `pardosa-aovc`, and the complete
 retained transfer register support the commander READY verdict in `pardosa-gudk.2`.
-Only gardener administrative closure remains. Current approval is not inherited
+Gardener records administrative closure in bd. Current approval is not inherited
 from a historical review; no additional semantic hold is created here.
 Publication and 1.0 freeze remain the separate checkpoints in section 5.
 
-**Actual open-work assessment (2026-09-07):** `bd list --status open --limit 0`
+**Historical open-work snapshot (2026-09-07, before gardener closure):**
+`bd list --status open --limit 0`
 returned 65 records before this mission was claimed; the in-progress query was
-empty. The map's only open child is .89. Its 25-unit disposition index identifies
-ha3s/3nn1 as the last semantic planning hold, now HUMAN-disposed. ha3s, historical
-3nn1/32qn, .89 and jn1 stay open only for gardener administrative closure, not
+empty. The map's only open child was .89. Its 25-unit disposition index identified
+ha3s/3nn1 as the last semantic planning hold, already HUMAN-disposed. At finalization,
+ha3s, historical 3nn1/32qn, .89 and jn1 were open only for administrative closure, not
 another noun ballot. ukwd is optional content-preserving partition, not a planning
 gate. Open historical evidence, tooling-review and fleet/tooling records are not
 new product choices merely because their status is open. This bounded inventory
