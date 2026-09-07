@@ -264,7 +264,7 @@ bump required when adding a tag belongs to the format specification under C3.11.
 #### C4.14 — INVARIANT
 
 From 0.5.1 each artefact's ownership record carries an identity structure:
-a shared logical dataset identity distinct from the artefact's physical locator,
+a shared logical dataset identity distinct from the artefact's locator,
 the structure's version, that artefact's own dragline identifier, and the rule
 partitioning fibers across the dataset's draglines. C6.37 states how a reader
 establishes membership without a roster in any one record.
@@ -421,6 +421,7 @@ no exclusion and stays available on every target.
 
 #### C5.7 — INVARIANT
 
+An epoch identifies one term in the succession of ownership of an artefact.
 A writer takes ownership by compare-and-set against the artefact's ownership
 record. The writer whose compare-and-set lands owns the epoch. A writer whose
 compare-and-set does not land stops. Every write to the artefact carries the
@@ -443,8 +444,9 @@ ordinary way.
 #### C5.10 — INVARIANT
 
 pardosa creates an artefact's ownership record first and its event data second.
-An ownership record present without its event data is an artefact under creation:
-pardosa opens it, and the claimant or a later owner completes it. Event data
+An ownership record present without the event data it governs marks incomplete
+creation of the event-data artefact: pardosa opens the ownership record, and the
+claimant or a later owner completes creation. Event data
 present without its ownership record is refused on every write path. Read-only
 open follows C6.14, subject to the ordinary schema and integrity checks.
 pardosa repairs neither state.
@@ -556,8 +558,10 @@ fiber spans neither two draglines nor two artefacts.
 
 #### C5.26 — INVARIANT
 
-An artefact's rolling commitment establishes that the sequence it covers is
-internally consistent and totally ordered, and pardosa holds that from 0.5.1.
+An anchor is evidence of an artefact's rolling commitment at an observation,
+held by an external observer. An artefact's rolling commitment establishes that
+the sequence it covers is internally consistent and totally ordered, and pardosa
+holds that from 0.5.1.
 Where an operator has wired an anchor destination, the artefact additionally
 establishes that it has not been rewritten since an anchor an external observer
 holds; that second establishment is a capability an operator elects. An artefact
@@ -826,8 +830,9 @@ carries a variant standing for the conditions the others do not name.
 
 #### C5.60 — INVARIANT
 
-An artefact holds exactly one dragline. A consumer relies on one rolling
-commitment covering the whole of that artefact.
+An artefact is a unit of typed-record history managed by pardosa through one
+dragline. A consumer relies on one rolling commitment covering the whole of that
+artefact.
 
 #### C5.61 — INVARIANT
 
@@ -933,13 +938,13 @@ offers without addressing one.
 
 #### C6.5 — SURFACE
 
-A dragline carries no identity a library consumer holds. The artefact's locator
-names the dragline from outside. A consumer compares that dragline's rolling
+A dragline carries no identity a library consumer holds. A locator is an external
+name for an artefact's dragline. A consumer compares that dragline's rolling
 commitment between two observations of it.
 
 #### C6.6 — SURFACE
 
-An artefact's ownership record identifies the dragline that artefact is, and the
+An artefact's ownership record identifies that artefact's dragline, and the
 read-only operator interface reports that identity. An identity a consumer could
 hold for a dragline enters no part of the surface a library consumer names. An
 operator names a dragline; a library consumer does not.
