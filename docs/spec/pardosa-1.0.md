@@ -1215,8 +1215,9 @@ application predicates merely because a custom type or constructor enforces them
 The settled constructor families are integers described by width and signedness,
 bounded vocabulary types carrying their maximum bound, enumerations carrying
 explicit discriminants, structures carrying ordered fields, and `Option`.
-This family list does not yet supply the complete constructor inventory or the
-specific widths; those definitions remain outstanding for this draft.
+For each published pardosa release, this specification defines the complete
+admitted constructor inventory, each constructor’s meaning and constraints, and
+the specific widths where applicable.
 
 #### C6.24 — SURFACE
 

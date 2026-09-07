@@ -1,10 +1,13 @@
-# Semantic reconciliation — decision preparation, not a specification
+# Semantic reconciliation — bounded discovery disposition
 
-Status: **NONNORMATIVE; scoped documentary approval in `pardosa-7vrc`.**
-Review corrections applied; approval establishes neither semantic completeness
-nor implementation, map or release readiness.
+Status: **NONNORMATIVE; HUMAN bounded discovery selected; documentary delivery
+under `pardosa-15nq.1` independently APPROVED in `pardosa-t5di`.** Prior scoped
+documentary approval in `pardosa-7vrc` covers the earlier report.
+Neither semantic completeness nor implementation, map or release readiness is
+established.
 Prepared 2026-09-07 under `pardosa-higv` / `pardosa-higv.1`, against spec
-HEAD `71d6a5e`. No constructor, definition, API or HUMAN option is adopted here.
+HEAD `71d6a5e`; disposition updated against `0ab7a2a` on 2026-09-07.
+No constructor, definition or API is adopted here.
 The [specification](../pardosa-1.0.md) alone carries normative commitments
 (C5.2). This report is planning evidence containing prototype observations; it
 is not a clean-room implementation input and does not cross that wall.
@@ -21,11 +24,13 @@ Earlier **Inventory observation** (`bd show pardosa-sdrh`) contributes candidate
 details only subject to that correction register; **Oracle summary**
 (`bd show pardosa-oqlf`) is not an independent correctness certificate.
 
-Current HUMAN `.91` (2026-09-06 22:01) selects a curated constrained vocabulary
+HUMAN `.91` (2026-09-06 22:01) selects a curated constrained vocabulary
 and derive guidance, with any-possible-type support an explicit non-goal.
-It selects neither a float ballot nor the prototype catalogue. Current
-**Descriptor semantics** (`bd show pardosa-jn1.91`) and **Remaining holds**
-(`bd show pardosa-jn1.89`) preserve the unfinished semantic inventory.
+It selects neither a float ballot nor the prototype catalogue. HUMAN `.91`
+(2026-09-07 08:06) selects bounded discovery, disposing the inventory planning
+gate. **Descriptor semantics** (`bd show pardosa-jn1.91`) records that acceptance;
+**Remaining holds** (`bd show pardosa-jn1.89`) points to downstream semantic
+completion in the existing map transfer register S3, not an unresolved ballot.
 
 ## 1. What is settled, and at what granularity
 
@@ -72,7 +77,8 @@ derives are alternate routes not certified by their checked constructors;
 `EventF` itself has no serde implementation in the inspected module. No fresh
 serde proof or exhaustive downstream-route census was executed here.
 
-Proposed envelope: finish a small set of domain-useful scalar meanings, bounded
+Candidate discovery envelope, not an adopted catalogue: investigate a small set
+of domain-useful scalar meanings, bounded
 text/bytes/item collections and supported composition, with exact constraints
 and portable descriptors. Escalate a materially new family or constraint meaning,
 or loss of required domain expressiveness; do not silently convert an application
@@ -137,7 +143,7 @@ clause location or locator disposition is selected here.
 
 | Checkpoint | Actual status and retained obligations |
 | --- | --- |
-| Map closure | **Not established.** Curated boundary is settled; remaining constructor membership/meanings/widths need resolution or explicit HUMAN disposition. The noun set remains postponed, not waived. Source-backed coverage and independent review are required; the existing transfer register remains intact. A strategy choice alone closes neither definitions nor map. |
+| Map closure | **Not established.** HUMAN has disposed the inventory planning gate through bounded discovery; exact semantic completion is retained downstream in existing transfer register S3. The noun set remains postponed, not waived, and is the remaining semantic planning hold. Source-backed coverage and independent review remain required; the full transfer register stays intact. This disposition alone closes neither definitions nor map. |
 | Publication starting at 0.5.1 | **Not established.** Every used constructor needs its complete defined meaning and supported-route preservation; portable structural completeness and applicable conformance remain owed (S:1193–1219,1427–1439). No knowingly unmet binding obligation ships (S:815–818). Discovery can precede completeness; publication cannot. |
 | 1.0 freeze | **Not established.** Final semantic inventory, widths, all postponed noun dispositions, actual shipped producer names and retained implementation/release obligations remain owed. Surface evolution during 0.5.x is not permission to publish undefined semantics (S:161–178,355–366). |
 
@@ -151,26 +157,40 @@ not a completed descriptor inventory. `.92/.93` remain bounded NO-WITNESS
 findings, not policy votes. Optional editorial partition is not a readiness gate.
 No downstream code, conformance, MSRV or public-surface-gate delivery is claimed.
 
-## 6. One HUMAN strategy question — both options unselected
+## 6. Selected HUMAN disposition and downstream owner
 
-**Where should authority to finish the remaining finite semantic baseline reside,
-and when should that baseline be disposed?**
+HUMAN selected **Bounded discovery (Recommended)** on 2026-09-07. Exact acceptance:
 
-| Option | Authority and timing | Tradeoff |
-| --- | --- | --- |
-| **A — Recommended, UNSELECTED: bounded implementation discovery** | HUMAN explicitly disposes finite baseline completion to 0.5.1 development within the settled curated boundary. Exact semantic definitions precede each release. Material new family/constraint meanings or loss of required domain expressiveness return for HUMAN disposition. | Enables discovery without width-by-width or float-by-float ballots; requires disciplined semantic completion and escalation. Does not adopt this catalogue or authorize undefined release constructors. |
-| **B — UNSELECTED: semantic inventory first** | Retain the residual `.91` membership/meaning inventory as an upfront strategic gate; prepare and dispose one coherent catalogue before implementation claims that baseline. | More upfront confidence in the intended domain envelope, at the cost of delaying implementation discovery. Still not a sequence of unrelated scalar polls. |
+> Complete the catalogue during 0.5.1 development; define every supported type before publication and escalate material semantic changes.
 
-These are mutually exclusive locations/timings of completion authority, not
-competing float types. Neither option decides the four nouns, closes their
-HUMAN holds, creates the transfer map, or weakens any release obligation.
+The inventory planning gate is disposed, not the catalogue implemented. The
+existing future transfer-map planning register in `pardosa-jn1`, **S3 Descriptor
+semantic completion and realization**, owns completion during 0.5.1 development:
+constructor membership, value domains, widths, bounds and units, emptiness,
+parameter admissibility, and preservation of assigned constraints through every
+supported construction and decoding route. This is semantic work, not merely
+encoding. Complete specification definitions precede publication of each pardosa
+release, starting at 0.5.1. Material new family or constraint meanings, or loss of
+required domain expressiveness, return for HUMAN disposition. The curated policy,
+closed sets, producer restrictions and C4.1 release regime remain unchanged.
+Implementation observations may inform definitions; they never substitute for
+normative specification text. No new transfer map is created and all existing
+20 base and 10 supplementary obligations remain carried.
+
+Next-session recommendation: revisit the HUMAN-postponed core noun boundary
+through the existing definition holders. Compare C5.60's one-dragline scope,
+C6.6's identification, C10.1's ownership-record artefact, and C5.8's terminating
+self-governance case. Keep individual managed line versus record/data pair open;
+neither self-governance nor shared format dictates physical layout. No second
+strategic question is asked or answered here, and no definition or host is selected.
 
 ## Verification scope
 
-This mission changes no normative spec text, RULED trace row or Meadows
-classification. The existing local `./scripts/check.sh` checks the unchanged
-spec/trace contract; it cannot certify this report's semantic judgement or
-implementation readiness. Meadows reclassification verification is not applicable
-without classification changes. Exact command exits and bead-navigation update
-evidence belong in `pardosa-higv.1`; scoped independent commander approval is
-recorded in `pardosa-7vrc`, with its citation and status corrections applied.
+This update replaces only C6.23's draft-status sentence with the per-published-
+library-release completeness obligation. It changes no clause identity, regime,
+RULED trace row or Meadows classification. The local `./scripts/check.sh` checks
+spec/trace consistency; it cannot certify semantic judgement or implementation
+readiness. Classification inputs remain unchanged, so no reclassification is
+claimed. Exact command exits and before/after bead-navigation evidence belong
+to `pardosa-15nq.1`. Independent documentary review APPROVE is recorded in
+`pardosa-t5di` before commit; it does not certify catalogue or release completeness.
