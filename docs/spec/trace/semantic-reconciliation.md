@@ -1,12 +1,13 @@
-# Semantic reconciliation — bounded discovery disposition
+# Semantic reconciliation — definition decision preparation
 
-Status: **NONNORMATIVE; HUMAN bounded discovery selected; documentary delivery
-under `pardosa-15nq.1` independently APPROVED in `pardosa-t5di`.** Prior scoped
-documentary approval in `pardosa-7vrc` covers the earlier report.
+Status: **NONNORMATIVE; four-definition decision prepared, HUMAN adoption OPEN;
+independent documentary preparation review APPROVED in `pardosa-j8i7`.** Earlier bounded-discovery
+delivery under `pardosa-15nq.1` was APPROVED in `pardosa-t5di`; `pardosa-7vrc`
+covers the preceding report, not this update.
 Neither semantic completeness nor implementation, map or release readiness is
 established.
-Prepared 2026-09-07 under `pardosa-higv` / `pardosa-higv.1`, against spec
-HEAD `71d6a5e`; disposition updated against `0ab7a2a` on 2026-09-07.
+Updated 2026-09-07 under `pardosa-n3li` / `pardosa-n3li.1`; the normative
+specification and RULED trace are unchanged by this mission.
 No constructor, definition or API is adopted here.
 The [specification](../pardosa-1.0.md) alone carries normative commitments
 (C5.2). This report is planning evidence containing prototype observations; it
@@ -110,34 +111,83 @@ application, not all value-domain decisions (S:1443–1448). It does not categor
 ban declarative refinement or all runtime validation. No historical Rust
 representation spelling is promoted into strategic membership here.
 
-## 4. Four nouns — recovered meaning, not adopted definitions
+## 4. One HUMAN decision — four unadopted definitions
 
-The **Definition follow-up** (`bd show pardosa-ha3s`) and **Definition proposal**
-(`bd show pardosa-3nn1`) remain HUMAN-postponed. Documentary investigation is
-authorized now; noun rulings are not. The old proposal is evidence to revise,
-not four pre-approved sentences awaiting insertion.
+The **Definition follow-up** (`bd show pardosa-ha3s`) is the single HUMAN decision
+owner. The **Historical definition proposal** (`bd show pardosa-3nn1`, under
+`pardosa-32qn`) preserves the original proposal and explicit postponement.
+Resumption authorizes preparation, not adoption. Source-tested orientation
+`pardosa-6vof` narrows the earlier individual-versus-pair ambiguity; oracle
+`pardosa-p285` supplies constraints, with its stale references and categorical
+identity/containment claims corrected by that orientation and current sources.
 
-| Noun | Source-backed explanatory recovery | Outstanding limit |
+| Noun | Exact draft — NOT ADOPTED | Existing carrier and boundary |
 | --- | --- | --- |
-| epoch | Names a term of ownership; later ownership supersedes earlier ownership for write admission. The ownership record supplies it. | S:410–428,1101–1103,1392–1399. Do not add a width, increment algorithm or public epoch API. Distinct from a migration generation. |
-| anchor | Evidence associated with the rolling commitment, held by an external observer, supporting the elected rewrite-detection claim for one artefact in one generation. | S:559–566,585–589,936–938. “Whole artefact state at one moment” overstates the recovered meaning. No proof carrier, publication or addressing API is selected. Unanchored remains distinct from invalid. |
-| locator | Names the dragline from outside, distinct from the operator's logical dataset identity. | S:266–270,936–945,795–797. No path/URL/key format, uniqueness law or consumer identity is implied. **Do-not-define was a recommendation, never adopted.** Formal disposition remains HUMAN-owned. |
-| artefact | One dragline and its rolling commitment are artefact-scoped; an ownership record is itself an artefact with a typed record line. | S:829–830,1461–1478. Individual managed line versus paired managed unit remains unresolved; this row is not a replacement definition. |
+| artefact | An artefact is a unit of typed-record history managed by pardosa through one dragline. | Candidate C5.60; S:36–42,829–830,1462–1465. Individual history/commitment scope is supported; making this the exclusive universal noun boundary is the proposed HUMAN adoption, not a recovered prior glossary ruling. |
+| epoch | An epoch identifies one term in the succession of ownership of an artefact. | Candidate C5.7; S:410–428. No width, clock duration, increment mechanism, global uniqueness or public epoch API. Ownership succession is distinct from migration generation. |
+| anchor | An anchor is evidence of an artefact's rolling commitment at an observation, held by an external observer. | Candidate C5.26; S:559–566,585–589,936–938. Not whole state or a required timestamp/receipt. Election, unanchored-not-invalid and per-generation scope remain stated once in their existing clauses. |
+| locator | A locator is an external name for an artefact's dragline. | Candidate C6.5, replacing its existing naming sentence rather than duplicating it; S:266–270,795–797,936–945. Distinct from logical dataset identity; no path/URL/key format, uniqueness, stability or consumer-held identity. Formal taught-vocabulary status is proposed, not previously adopted. |
 
-The precise artefact tension is between “holds” (C5.60), “is” (C6.6),
-ownership-record artefact status (C10.1), and paired creation/naming/movement
-(C5.10–11, C3.5). “Nothing governs that record from above” terminates ownership
-recursion (S:432–435); it does not establish spatial containment. “One container
-format” (S:1475–1478) is not “one physical container”. Neither universal nesting
-nor universal non-nesting follows.
+### Source model and counterexample
+
+Direct owning comments establish the boundary: ownership **R12–13 and R16**
+(`pardosa-jn1.30`) make the ownership record a managed store and terminate its
+self-claim recursion; **R15** specifies naming/pairing, not a universal dictionary
+definition. **R45, R47–49** (`pardosa-jn1.42`) retain self-governance, one record
+per data-store artefact, ordinary chained format, and co-movement without
+atomicity. **R97–99** (`pardosa-jn1.53`, read with its citation erratum) promise
+one dragline and whole-artefact commitment scope. These sources support individual
+managed histories, not a new choice between two integrity architectures.
+
+Take event history `E = [e1, e2]` and ownership history
+`O = [claim(a, epoch1), release(a), claim(b, epoch2)]`. Under C10.1 and C5.60,
+`cE` covers E and `cO` covers O. An additional ownership record changes O without
+becoming an event in E. O carries its own claim (C5.8); no O-of-O is required.
+This is a documentary scenario, not an executed protocol test: it specifies no
+transaction schedule, separate extra epoch, writer relationship or public cO API.
+
+A composite `P = (E, O)` with a self-governed O passes the recursion test but
+does not gain a whole-pair commitment: cE excludes O's history, cE plus cO is not
+one commitment, and inventing cPair adds unruled coverage. Calling the operational
+pair a collective leaves contextual language to reconcile, not a competing
+integrity guarantee. Ordered creation alone does not distinguish those usages.
+Shared format, shared naming and co-movement (S:108–112,445–456,1476–1479) imply
+neither one physical container nor universal nesting/non-nesting.
+
+**C6.6 provenance:** commit `4341029a` introduced “the dragline that artefact is”
+while compressing the roster wording; the directly read **R186** in
+`pardosa-jn1.61` rules own identification/no roster, not noun synonymy. R184–189
+are recorded as AUTONOMOUS, not individual HUMAN noun rulings. One-to-one scope
+alone does not prove two concepts synonymous. This is editorial provenance for
+minimal future reconciliation, not authority to edit C6.6 now.
 
 Deleting only “no artefact stands within another” does not repair the old
 proposal: **outermost** still selects a hierarchy, and **every establishment**
 overreaches the scoped rolling-commitment/order claims. Migration disagreement
 and dataset membership explicitly relate records (S:487–492,1344–1346).
-Source recovery therefore leaves this boundary unresolved. A new Stance clause
-would additionally need authority beyond partition-only RC-1. No spec wording,
-clause location or locator disposition is selected here.
+The remaining adoption question is precise terminology, not permission to invent
+pair-wide integrity. A new Stance clause would require separate authority beyond
+partition-only RC-1. The property/mechanism rule is R153 (current C5.53), not
+the old proposal's stale C5.55 reference. Positive drafts and existing carriers
+avoid a second glossary; operational consequences remain with their owners.
+
+### Exact question and two defensible dispositions
+
+**Question for HUMAN, owned by ha3s:** adopt these four exact definitions,
+including artefact as the individual-history term and locator as taught vocabulary,
+in the named existing carriers with minimal source-faithful reconciliation?
+
+1. **Recommended — adopt the four drafts and authorize that bounded normative
+   edit.** State each property once; reconcile collective lifecycle wording and
+   C6.6 identification without changing ownership, commitment or storage promises.
+   This resolves explicit terminology; history alone cannot supply that consent.
+2. **Retain the narrower source-backed explanations and request an exact semantic
+   amendment before adoption.** Name the draft or scope needing amendment on ha3s;
+   keep the existing promises and HUMAN hold. This is not a vote for a composite
+   integrity model, a default locator decline, or permission to publish ambiguity.
+
+Neither disposition is selected here. The original “outermost” and whole-state
+drafts and locator decline remain historical proposals, not fallback consent.
 
 ## 5. Current readiness — separate three checkpoints
 
@@ -177,20 +227,53 @@ Implementation observations may inform definitions; they never substitute for
 normative specification text. No new transfer map is created and all existing
 20 base and 10 supplementary obligations remain carried.
 
-Next-session recommendation: revisit the HUMAN-postponed core noun boundary
-through the existing definition holders. Compare C5.60's one-dragline scope,
-C6.6's identification, C10.1's ownership-record artefact, and C5.8's terminating
-self-governance case. Keep individual managed line versus record/data pair open;
-neither self-governance nor shared format dictates physical layout. No second
-strategic question is asked or answered here, and no definition or host is selected.
+## 7. Bounded closure-readiness audit
+
+Read-level audit of the current map's T1–T20/S1–S10 carrier index and .89, plus
+the actual review bodies, not a fresh whole-corpus source-fidelity certification:
+
+| Coverage | Existing carrier / surviving work |
+| --- | --- |
+| T1–T4 | Format/wire, unknown-tag and multi-region format tension, clean-room transfer/migration/wall, stronger derive seal; mixed normative outcomes remain in the spec. |
+| T5–T8 | File exclusion predicates and both-backend conformance; timestamp planning without a sixth envelope field; F2 explicitly LAPSED, no continuing prohibition. |
+| T9–T12 | Published-library missing-docs enforcement, strict create/open and legacy rescue, documentation citation process without new gate, ordering/chaining conformance. |
+| T13–T16 | Positive fence/walk/validation promises and explicit rescue election; redesign/block_on construction; publishing and production-based promotion judgement. |
+| T17–T20 | Test scaffolding with unstable-test-support exception, gh-report adoption, immutable foreign PGNs, and reader CLI deferral remain outside; read capability/migration tool are not deferred. |
+| S1–S3 | Qualified-result representation; established authority/prior-landing proof and recovery; descriptor semantic completion under the HUMAN-disposed .91 planning gate. S3 is not mere encoding. |
+| S4–S7 | Derive cycle compile-fail fixture (not facade suite), truthful seal documentation, dependency-graph MSRV proof, identifier rustdoc obligations. |
+| S8–S10 | Application-owned transforms; public-surface and semver gates with distinct timing; actual shipped producer names, not prototype names. |
+
+All 20 base and ten supplementary carriers remain in the existing map; none is a
+completed downstream deliverable by virtue of being indexed. Their full text is
+retained there rather than replaced by this grouped audit. S3 still requires exact
+constructor meanings and supported-route preservation before every publication
+from 0.5.1; bounded discovery disposes .91's planning gate, not that work.
+
+**Review accounting:** `pardosa-w15k` approves the earlier eight-clause
+source/trace reconciliation, explicitly not a fresh exhaustive 244-ruling audit.
+`pardosa-pssq` initially approved the answer/admission source diff while rejecting
+decision preparation; its final scoped re-review resolves M1/L1/L2 and approves
+that delivery. Its 162-clause census is bounded answer/admission evidence, not
+complete descriptor semantics or proof of zero unknown defects. `pardosa-t5di`
+approves the later bounded-discovery disposition and S3 expansion. These are
+read, attributed review records, not fresh execution of those historical reviews.
+The present four-definition report/navigation received independent documentary
+APPROVE in `pardosa-j8i7`, not definition adoption or map/publication approval.
+
+**Closure predicate:** obtain the explicit HUMAN noun disposition, deliver any
+authorized reconciliation with source-fidelity review, retain all transfer
+carriers, then have the commander assess map closure. No additional semantic hold
+is created here; no current review is silently inherited from an earlier diff.
+Publication and 1.0 freeze remain the separate checkpoints in section 5.
 
 ## Verification scope
 
-This update replaces only C6.23's draft-status sentence with the per-published-
-library-release completeness obligation. It changes no clause identity, regime,
-RULED trace row or Meadows classification. The local `./scripts/check.sh` checks
-spec/trace consistency; it cannot certify semantic judgement or implementation
-readiness. Classification inputs remain unchanged, so no reclassification is
-claimed. Exact command exits and before/after bead-navigation evidence belong
-to `pardosa-15nq.1`. Independent documentary review APPROVE is recorded in
-`pardosa-t5di` before commit; it does not certify catalogue or release completeness.
+This mission edits this report alone plus existing decision navigation in bd.
+No normative clause, regime, trace row or classification input changes. Inner
+verification is `git diff --check`; mid verification is `./scripts/check.sh`;
+boundary status is `git status --short`. The local gate checks spec/trace
+consistency, not this report's semantic judgement or implementation readiness.
+Exact exits, preserved navigation preimages and review handoff evidence belong
+to `pardosa-n3li.1`. No E2E implementation verify is specified. The commander
+accepted documentary APPROVE in `pardosa-j8i7` for the scoped commit;
+no push or sync is authorized.
