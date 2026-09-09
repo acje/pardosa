@@ -1,0 +1,88 @@
+{
+  "conformance_carrier": "Carrier 2: Conformance Suite",
+  "topic": "container_header_and_framing",
+  "specification_reference": "docs/spec/pardosa-1.0.md (C3.4, C3.11, C10.3)",
+  "vectors": [
+    {
+      "name": "valid_container_header",
+      "description": "Standard 12-byte container header with magic PARDOSA\\x01 and format version 1 (little-endian u32)",
+      "clause_citations": [
+        "C3.4",
+        "C3.11",
+        "C10.3"
+      ],
+      "bytes_hex": "504152444f53410101000000",
+      "expected_outcome": "Success",
+      "parsed_value": {
+        "magic": "PARDOSA\u0001",
+        "magic_hex": "504152444f534101",
+        "format_version": 1,
+        "endianness": "little-endian"
+      }
+    },
+    {
+      "name": "invalid_magic_header",
+      "description": "Container header with corrupted magic bytes, rejected before version or framing inspection",
+      "clause_citations": [
+        "C3.4",
+        "C3.11"
+      ],
+      "bytes_hex": "424144504152440101000000",
+      "expected_outcome": "DecodeError",
+      "error_kind": "InvalidMagic",
+      "error_detail": "First 8 bytes must match PARDOSA\\x01 (504152444f534101)"
+    },
+    {
+      "name": "unsupported_format_version",
+      "description": "Container header with valid magic but format version 2 (rejected by 1.0 reader)",
+      "clause_citations": [
+        "C3.11",
+        "C10.3"
+      ],
+      "bytes_hex": "504152444f53410102000000",
+      "expected_outcome": "DecodeError",
+      "error_kind": "UnsupportedFormatVersion",
+      "error_detail": "Format version 2 is unsupported by 1.0 reader; expected 1"
+    },
+    {
+      "name": "valid_framed_payload",
+      "description": "A valid framed chunk containing payload 'PARDOSA_FRAME' with 4-byte LE length and CRC32C",
+      "clause_citations": [
+        "C3.4",
+        "C3.11"
+      ],
+      "bytes_hex": "0d000000504152444f53415f4652414d45badb935f",
+      "expected_outcome": "Success",
+      "parsed_value": {
+        "payload_length": 13,
+        "payload_utf8": "PARDOSA_FRAME",
+        "payload_hex": "504152444f53415f4652414d45",
+        "crc32c_hex": "badb935f"
+      }
+    },
+    {
+      "name": "corrupted_crc32c_checksum",
+      "description": "Framed chunk where trailing CRC32C checksum does not match payload",
+      "clause_citations": [
+        "C3.4",
+        "C3.11"
+      ],
+      "bytes_hex": "0d000000504152444f53415f4652414d45efbeadde",
+      "expected_outcome": "DecodeError",
+      "error_kind": "ChecksumMismatch",
+      "error_detail": "Computed CRC32C does not match recorded 4-byte checksum"
+    },
+    {
+      "name": "truncated_framing_payload",
+      "description": "Framing length declares 20 bytes but only 5 payload bytes are present",
+      "clause_citations": [
+        "C3.4",
+        "C3.11"
+      ],
+      "bytes_hex": "1400000053484f5254",
+      "expected_outcome": "DecodeError",
+      "error_kind": "TruncatedPayload",
+      "error_detail": "Remaining container bytes fewer than declared framing length"
+    }
+  ]
+}

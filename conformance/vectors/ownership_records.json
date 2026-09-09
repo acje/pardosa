@@ -1,0 +1,129 @@
+{
+  "conformance_carrier": "Carrier 2: Conformance Suite",
+  "topic": "ownership_records_wire_layout",
+  "specification_reference": "docs/spec/pardosa-1.0.md (C4.13, C4.14, C6.43)",
+  "vectors": [
+    {
+      "name": "valid_ownership_claim_record",
+      "description": "Kind 0x01 claim record with 7 semantic fields (epoch, machine_id, boot_id, pid, start_time, claim_time, operator_label)",
+      "clause_citations": [
+        "C4.13",
+        "C6.43"
+      ],
+      "bytes_hex": "012a00000000000000aaaaaaaa111122223333444444444444bbbbbbbb555566667777888888888888d21e00000000000000206693cf97f31700126cbdd097f317130000007772697465722d6e6f64652d7072696d617279",
+      "expected_outcome": "Success",
+      "parsed_value": {
+        "kind_tag": "01",
+        "kind_name": "OwnershipClaim",
+        "epoch": 42,
+        "machine_id": "aaaaaaaa-1111-2222-3333-444444444444",
+        "boot_id": "bbbbbbbb-5555-6666-7777-888888888888",
+        "process_id": 7890,
+        "process_start_time_ns": 1725890000000000000,
+        "claim_time_ns": 1725890005000000000,
+        "operator_label": "writer-node-primary"
+      }
+    },
+    {
+      "name": "valid_clean_release_record",
+      "description": "Kind 0x02 clean release record carrying epoch and release timestamp",
+      "clause_citations": [
+        "C4.13"
+      ],
+      "bytes_hex": "022a00000000000000000472e7d197f317",
+      "expected_outcome": "Success",
+      "parsed_value": {
+        "kind_tag": "02",
+        "kind_name": "CleanRelease",
+        "epoch": 42,
+        "release_time_ns": 1725890010000000000
+      }
+    },
+    {
+      "name": "valid_migration_start_record",
+      "description": "Kind 0x03 migration start record with generations, timestamp, and rescue policy tag",
+      "clause_citations": [
+        "C4.13"
+      ],
+      "bytes_hex": "03010000000200000000e87d3bd497f31701",
+      "expected_outcome": "Success",
+      "parsed_value": {
+        "kind_tag": "03",
+        "kind_name": "MigrationStart",
+        "source_generation": 1,
+        "target_generation": 2,
+        "start_time_ns": 1725890020000000000,
+        "rescue_policy_tag": 1
+      }
+    },
+    {
+      "name": "valid_migration_end_record",
+      "description": "Kind 0x04 migration end record with generations, timestamp, and complete status",
+      "clause_citations": [
+        "C4.13"
+      ],
+      "bytes_hex": "04010000000200000000cc898fd697f31701",
+      "expected_outcome": "Success",
+      "parsed_value": {
+        "kind_tag": "04",
+        "kind_name": "MigrationEnd",
+        "source_generation": 1,
+        "target_generation": 2,
+        "end_time_ns": 1725890030000000000,
+        "status": "Complete"
+      }
+    },
+    {
+      "name": "valid_identity_structure_record",
+      "description": "Kind 0x08 identity structure with dataset UUID, structure version 1, dragline id, and StaticModulo rule",
+      "clause_citations": [
+        "C4.13",
+        "C4.14"
+      ],
+      "bytes_hex": "08cccccccc9999aaaabbbbcccccccccccc0100000003000000010400000008000000",
+      "expected_outcome": "Success",
+      "parsed_value": {
+        "kind_tag": "08",
+        "kind_name": "IdentityStructure",
+        "dataset_id": "cccccccc-9999-aaaa-bbbb-cccccccccccc",
+        "structure_version": 1,
+        "dragline_id": 3,
+        "partitioning_rule": "StaticModulo",
+        "total_draglines": 8
+      }
+    },
+    {
+      "name": "unknown_tag_0x00_rejection_witness",
+      "description": "Record tag 0x00 is rejected loudly with a typed decode error",
+      "clause_citations": [
+        "C4.13"
+      ],
+      "bytes_hex": "0001020304",
+      "expected_outcome": "DecodeError",
+      "error_kind": "UnknownRecordTag",
+      "error_detail": "Wire tag 0x00 is not in recognised range 0x01..=0x09"
+    },
+    {
+      "name": "unknown_tag_0x0a_rejection_witness",
+      "description": "Record tag 0x0A is rejected loudly with a typed decode error",
+      "clause_citations": [
+        "C4.13"
+      ],
+      "bytes_hex": "0a01020304",
+      "expected_outcome": "DecodeError",
+      "error_kind": "UnknownRecordTag",
+      "error_detail": "Wire tag 0x0A is not in recognised range 0x01..=0x09"
+    },
+    {
+      "name": "unknown_tag_0xff_rejection_witness",
+      "description": "Record tag 0xFF is rejected loudly with a typed decode error",
+      "clause_citations": [
+        "C4.13"
+      ],
+      "bytes_hex": "ff01020304",
+      "expected_outcome": "DecodeError",
+      "error_kind": "UnknownRecordTag",
+      "error_detail": "Wire tag 0xFF is not in recognised range 0x01..=0x09"
+    }
+  ]
+}

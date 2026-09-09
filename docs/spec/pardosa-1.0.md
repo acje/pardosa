@@ -103,6 +103,27 @@ This specification governs what pardosa's artefacts mean and what they promise.
 The byte-level encoding of a field and the wire shape of an artefact are fixed by
 the format specification an implementation is built to.
 
+An artefact container begins with an 8-byte file magic: `PARDOSA\x01` (bytes
+`0x50 0x41 0x52 0x44 0x4F 0x53 0x41 0x01`). The container format version
+immediately follows the magic as a 4-byte unsigned integer (u32 little-endian,
+value 1 per C10.3). Multi-byte integers across all container headers, frames,
+and payloads are encoded in little-endian byte order unless explicitly
+specified otherwise.
+
+Every entry (ownership record, event envelope, or chunk) written to a container
+is enclosed in standard framing:
+- A 4-byte framing length prefix (u32 little-endian), specifying the exact byte
+  length of the enclosed payload, excluding the length prefix and the trailing
+  checksum.
+- The enclosed payload bytes of the specified length.
+- A 4-byte integrity checksum (u32 little-endian), storing the CRC32C
+  (Castagnoli polynomial 0x1EDC6F41, reflected bit-order 0x82F63B78) calculated
+  over the enclosed payload bytes.
+
+Any checksum mismatch, truncated payload, or framing length exceeding the
+remaining container bytes produces an immediate loud typed decoding error,
+refusing the corrupted entry.
+
 #### C3.5 — INVARIANT
 
 An artefact's ownership record and its event data move, copy and restore
@@ -151,6 +172,19 @@ This specification governs the shape of the event envelope and what that shape
 promises. Whether a reader parses an artefact's bytes at all is governed by the
 format specification that artefact was written to. An artefact records both, and
 each answers its own question.
+
+Reading and decoding artefact bytes begins with container header validation.
+If the initial 8 bytes do not match the magic `PARDOSA\x01`, or if the format
+version is not recognised (differing from 1), the artefact is refused loudly as
+an invalid or unsupported container before reading any entries.
+
+Every framed record in the container must satisfy the framing protocol defined
+in C3.4. If a frame's length prefix extends past the remaining bytes in the
+artefact, or if the CRC32C checksum does not match the computed CRC32C of the
+framed payload bytes, reading halts immediately with a typed integrity decode
+error. An event envelope within a container frame must match the 5-field wire
+layout defined in C4.19; any unexpected frame length or malformed envelope header
+halts parsing with a typed decode error.
 
 ### Evolution and compatibility
 
@@ -261,6 +295,36 @@ An unknown wire tag produces a typed decode error. An older reader rejects
 an added tag loudly rather than preserving and skipping it. The format-version
 bump required when adding a tag belongs to the format specification under C3.11.
 
+Each ownership record is framed per C3.4. The first byte of the ownership
+record payload is an exact 1-byte wire tag (u8) identifying the record kind:
+- `0x01`: Ownership claim. Carries the seven claim fields defined in C6.43
+  (monotonic epoch [u64], machine ID [16B], boot ID [16B], process ID [u64],
+  process start time [u64], claim time [u64], operator label [u32 length prefix
+  + UTF-8 bytes]).
+- `0x02`: Clean release. Carries the released monotonic epoch (u64 little-endian)
+  and release timestamp (u64 little-endian nanoseconds since Unix epoch).
+- `0x03`: Migration start. Carries the source generation (u32 little-endian),
+  target generation (u32 little-endian), migration start timestamp (u64
+  little-endian), and rescue-policy tag (u8 matching kind 0x07).
+- `0x04`: Migration end. Carries the source generation (u32 little-endian),
+  target generation (u32 little-endian), migration end timestamp (u64
+  little-endian), and completion status (u8: 0x01 = complete, 0x02 = interrupted;
+  other values rejected).
+- `0x05`: Inbound pointer. Carries the prior generation locator identifier
+  (16 raw bytes) and prior generation epoch (u64 little-endian).
+- `0x06`: Outbound pointer. Carries the next generation locator identifier
+  (16 raw bytes) and cutover epoch (u64 little-endian).
+- `0x07`: Rescue-policy choice. Carries the policy tag (u8: 0x01 = Strict,
+  0x02 = DropCorrupted, 0x03 = HaltOnGap; other values rejected) followed by a
+  parameter byte length (u32 little-endian) and parameter payload bytes.
+- `0x08`: Identity structure. Carries the logical dataset ID, structure version,
+  dragline ID, and partitioning rule defined in C4.14.
+- `0x09`: Schema descriptor. Carries the schema version (u32 little-endian)
+  followed by the binary AST encoding of the schema descriptor defined in C6.23.
+
+Any wire tag outside 0x01..=0x09 (specifically 0x00 and 0x0A..=0xFF) produces
+an immediate, loud typed decode error (UnknownRecordTag).
+
 #### C4.14 — INVARIANT
 
 From 0.5.1 each artefact's ownership record carries an identity structure:
@@ -268,6 +332,23 @@ a shared logical dataset identity distinct from the artefact's locator,
 the structure's version, that artefact's own dragline identifier, and the rule
 partitioning fibers across the dataset's draglines. C6.37 states how a reader
 establishes membership without a roster in any one record.
+
+The identity structure (ownership record kind 0x08) is serialized on the wire
+with the following exact layout:
+1. `dataset_id`: 16 raw bytes representing the logical dataset UUID
+   (128-bit RFC 4122).
+2. `structure_version`: 4 bytes (u32 little-endian), defining the version of
+   the identity structure layout (value 1).
+3. `dragline_id`: 4 bytes (u32 little-endian), the unique index of this
+   dragline within the dataset.
+4. `partitioning_rule_tag`: 1 byte (u8) selecting the partitioning algorithm:
+   - `0x01`: StaticModulo. Parameters: total draglines in dataset (u32 little-endian).
+   - `0x02`: ConsistentHash. Parameters: hash seed (u64 little-endian) and virtual
+     node count per dragline (u32 little-endian).
+   - Any other partitioning rule tag (0x00, 0x03..=0xFF) produces an immediate
+     loud typed decode error.
+5. `rule_parameter_payload`: length prefix (u32 little-endian) followed by the
+   rule parameter bytes matching the partitioning rule tag.
 
 #### C4.15 — INVARIANT
 
@@ -309,6 +390,30 @@ The event envelope carries five fields this specification owns: `event_id`,
 1.0. C5.61, C6.38, C6.39 state the identifier and detachment promises. C5.40 states
 the within-generation link-integrity promise of the precursor and its commitment.
 The format admits a sixth field; this specification refuses to add one.
+
+The wire layout of an event envelope consists of a fixed 81-byte header,
+followed by a 4-byte payload length prefix and the payload bytes:
+1. `event_id`: 16 raw bytes (128-bit UUID identifying the event).
+2. `fiber_id`: 16 raw bytes (128-bit UUID identifying the fiber).
+3. `detached`: 1 byte (u8):
+   - `0x00`: attached event (precursor chain link active).
+   - `0x01`: detached event (precursor chain link broken or initial detached event).
+   - Any value in 0x02..=0xFF is rejected loudly as a typed decode error.
+4. `precursor`: 16 raw bytes (128-bit UUID of the immediately preceding event
+   on this fiber within the generation, or 16 zero bytes for the first event).
+5. `precursor_hash`: 32 raw bytes (SHA-256 digest of the precursor event
+   commitment, or 32 zero bytes for the first event).
+
+The fixed header occupies exactly 81 bytes (16 + 16 + 1 + 16 + 32). Immediately
+following the 81-byte header:
+6. `payload_length`: 4 bytes (u32 little-endian), specifying the byte length of
+   the event payload.
+7. `payload_bytes`: sequence of `payload_length` bytes containing the serialized
+   event payload.
+
+No sixth standard-owned envelope field is admitted. The total unpadded envelope
+byte length is 85 + payload_length bytes, enclosed within container framing per
+C3.4.
 
 #### C4.20 — SURFACE
 
@@ -1203,6 +1308,12 @@ carries; and the bound of every bounded value the type holds. It carries no
 rendering of those values into bytes. The structure a descriptor carries is
 finite, and the types reachable from it form no cycle.
 
+The descriptor represents an acyclic, finite directed graph of type constructors.
+Every type reachable from the root payload type must be fully defined within the
+descriptor. A descriptor that contains circular references, self-referential
+types, or undefined type references is malformed and must be rejected at
+decode time.
+
 #### C6.23 — SURFACE
 
 A schema descriptor is written in the type constructors this specification names,
@@ -1217,12 +1328,99 @@ preserve the constraints this specification assigns to those representations,
 including when they are composed. These constraints do not include arbitrary
 application predicates merely because a custom type or constructor enforces them.
 
-The settled constructor families are integers described by width and signedness,
-bounded vocabulary types carrying their maximum bound, enumerations carrying
-explicit discriminants, structures carrying ordered fields, and `Option`.
-For each published pardosa release, this specification defines the complete
-admitted constructor inventory, each constructor’s meaning and constraints, and
-the specific widths where applicable.
+The complete admitted constructor inventory, domains, widths, bounds, units,
+emptiness, composition, and wire representations are:
+
+1. Fixed-width integers:
+   - `u8`: Unsigned 8-bit integer, width 1 byte, range 0..=255 (0..=2^8-1).
+   - `u16`: Unsigned 16-bit integer, width 2 bytes little-endian, range 0..=65535 (0..=2^16-1).
+   - `u32`: Unsigned 32-bit integer, width 4 bytes little-endian, range 0..=4294967295 (0..=2^32-1).
+   - `u64`: Unsigned 64-bit integer, width 8 bytes little-endian, range 0..=18446744073709551615 (0..=2^64-1).
+   - `i8`: Signed 8-bit two's complement integer, width 1 byte, range -128..=127 (-2^7..=2^7-1).
+   - `i16`: Signed 16-bit two's complement integer, width 2 bytes little-endian, range -32768..=32767 (-2^15..=2^15-1).
+   - `i32`: Signed 32-bit two's complement integer, width 4 bytes little-endian, range -2147483648..=2147483647 (-2^31..=2^31-1).
+   - `i64`: Signed 64-bit two's complement integer, width 8 bytes little-endian, range -9223372036854775808..=9223372036854775807 (-2^63..=2^63-1).
+
+2. Two-valued truth:
+   - `bool`: Truth value encoded in 1 byte. Value 0x00 represents false; value
+     0x01 represents true. Any other byte value (0x02..=0xFF) is rejected
+     loudly as a typed decode error.
+
+3. Bounded text:
+   - `EventString<MAX>`: UTF-8 encoded text of byte length L where 0 <= L <= MAX.
+     Encoded as a 4-byte length prefix (u32 little-endian) followed by L UTF-8
+     bytes. A length L > MAX or an invalid UTF-8 byte sequence produces an
+     immediate typed decode error.
+   - `NonEmptyEventString<MAX>`: Non-empty UTF-8 encoded text of byte length L
+     where 1 <= L <= MAX. Encoded as a 4-byte length prefix (u32 little-endian)
+     followed by L UTF-8 bytes. A length of 0, a length L > MAX, or an invalid
+     UTF-8 sequence produces an immediate typed decode error.
+
+4. Bounded collections:
+   - `EventBytes<MAX>`: Opaque byte sequence of length L where 0 <= L <= MAX.
+     Encoded as a 4-byte length prefix (u32 little-endian) followed by L raw
+     bytes. A length L > MAX produces an immediate typed decode error.
+   - `EventVec<T, MAX>`: Sequence of items of admitted type T, with count C
+     where 0 <= C <= MAX. Encoded as a 4-byte count prefix (u32 little-endian)
+     followed by C sequentially encoded instances of T. A count C > MAX produces
+     an immediate typed decode error.
+
+5. Optionality:
+   - `Option<T>`: An optional value of admitted type T. Encoded with a 1-byte tag:
+     0x00 represents None (with no following payload); 0x01 represents Some,
+     followed immediately by the encoding of inner value T. Any tag in
+     0x02..=0xFF produces an immediate typed decode error.
+
+6. Composite types:
+   - Sum types (Enums): An enumeration of named variants, each carrying an
+     explicit discriminant. Encoded as a 1-byte (u8) or 2-byte (u16 little-endian)
+     discriminant tag, followed immediately by the variant's payload (if non-unit).
+     Encountering an unknown discriminant at decode time produces an immediate
+     loud typed decode error.
+   - Product types (Structs): A structure with ordered fields of admitted
+     types. Encoded by serializing each field in declaration order with no
+     padding or delimiter bytes.
+
+7. Temporal and Identifiers:
+   - `Timestamp`: Temporal point encoded as an 8-byte unsigned integer (u64
+     little-endian) representing nanoseconds since the Unix epoch
+     (1970-01-01T00:00:00Z UTC). The value 0 is a reserved invalid sentinel;
+     decoding or constructing a Timestamp with value 0 produces an immediate
+     typed decode error.
+   - `Uuid`: 128-bit universal identifier encoded as 16 raw bytes in RFC 4122
+     network byte order.
+
+8. Exclusions:
+   - Floating-point representations (f32, f64, or float wrapper types) are
+     unadopted and excluded from the admitted constructor vocabulary.
+   - Arbitrary application domain predicates are application-owned under C8.3
+     and are not guaranteed or verified by the descriptor or codec layer.
+
+9. Descriptor AST binary encoding:
+   When serialized inside a schema descriptor record (kind 0x09), each
+   constructor node in the descriptor AST begins with a 1-byte constructor tag:
+   - `0x01`: u8
+   - `0x02`: u16
+   - `0x03`: u32
+   - `0x04`: u64
+   - `0x05`: i8
+   - `0x06`: i16
+   - `0x07`: i32
+   - `0x08`: i64
+   - `0x09`: bool
+   - `0x0A`: EventString, followed by max_bytes (u32 little-endian)
+   - `0x0B`: NonEmptyEventString, followed by max_bytes (u32 little-endian)
+   - `0x0C`: EventBytes, followed by max_bytes (u32 little-endian)
+   - `0x0D`: EventVec, followed by inner type descriptor node, and max_items (u32 little-endian)
+   - `0x0E`: Option, followed by inner type descriptor node
+   - `0x0F`: Struct, followed by type name (u32 LE length + UTF-8 bytes), field count (u32 LE),
+     and for each field: field name (u32 LE length + UTF-8 bytes) and field type descriptor node
+   - `0x10`: Enum, followed by type name (u32 LE length + UTF-8 bytes), discriminant width (u8: 1 or 2),
+     variant count (u32 LE), and for each variant: discriminant value (u8 or u16 LE),
+     variant name (u32 LE length + UTF-8 bytes), and variant payload descriptor node (or 0x00 if unit)
+   - `0x11`: Timestamp
+   - `0x12`: Uuid
+   Any constructor tag outside 0x01..=0x12 produces an immediate loud typed decode error.
 
 #### C6.24 — SURFACE
 
@@ -1410,6 +1608,22 @@ default from the process. The field's encoding and wire shape belong to the
 format specification under C3.4; access to ownership-record fields remains
 governed by C4.12.
 
+In an ownership claim record (kind 0x01), the seven semantic fields are
+serialized on the wire in the following exact layout:
+1. `epoch`: 8 bytes (u64 little-endian), the monotonic ownership term.
+2. `machine_id`: 16 raw bytes (128-bit machine UUID).
+3. `boot_id`: 16 raw bytes (128-bit boot session UUID).
+4. `process_id`: 8 bytes (u64 little-endian), operating system process identifier.
+5. `process_start_time`: 8 bytes (u64 little-endian), process start time in
+   nanoseconds since Unix epoch.
+6. `claim_time`: 8 bytes (u64 little-endian), claim time in nanoseconds since
+   Unix epoch.
+7. `operator_label`: 4-byte length prefix (u32 little-endian) followed by the
+   UTF-8 encoded bytes of the operator label.
+
+The fixed claim prefix occupies exactly 64 bytes (8 + 16 + 16 + 8 + 8 + 8),
+followed by the 4-byte length prefix and the operator label bytes.
+
 #### Additional public obligations
 
 #### C6.44 — SURFACE
@@ -1482,6 +1696,11 @@ An artefact's ownership record and its event data use one container format. The
 ownership record's typed records are payloads of that format. On a filesystem,
 the two reside in one directory and share a stem. The stem is matched exactly,
 including case, on every platform.
+
+The container format version is 1, encoded as a 4-byte unsigned integer (u32
+little-endian, bytes `0x01 0x00 0x00 0x00`) immediately following the 8-byte
+magic `PARDOSA\x01` defined in C3.4. An artefact carrying any other format
+version is rejected loudly by a 1.0 reader.
 
 #### C10.4 — INVARIANT
 

@@ -1,0 +1,283 @@
+{
+  "conformance_carrier": "Carrier 2: Conformance Suite",
+  "topic": "s3_type_constructors_and_descriptor_ast",
+  "specification_reference": "docs/spec/pardosa-1.0.md (C6.22, C6.23)",
+  "vectors": [
+    {
+      "name": "primitive_integers_roundtrip",
+      "description": "Admitted integer primitives (u8..u64, i8..i64) with little-endian wire encoding",
+      "clause_citations": [
+        "C6.23"
+      ],
+      "cases": [
+        {
+          "type": "u8",
+          "ast_tag": "01",
+          "val": 255,
+          "bytes_hex": "ff",
+          "expected": "Success"
+        },
+        {
+          "type": "u16",
+          "ast_tag": "02",
+          "val": 1000,
+          "bytes_hex": "e803",
+          "expected": "Success"
+        },
+        {
+          "type": "u32",
+          "ast_tag": "03",
+          "val": 100000,
+          "bytes_hex": "a0860100",
+          "expected": "Success"
+        },
+        {
+          "type": "u64",
+          "ast_tag": "04",
+          "val": 10000000000,
+          "bytes_hex": "00e40b5402000000",
+          "expected": "Success"
+        },
+        {
+          "type": "i8",
+          "ast_tag": "05",
+          "val": -128,
+          "bytes_hex": "80",
+          "expected": "Success"
+        },
+        {
+          "type": "i16",
+          "ast_tag": "06",
+          "val": -1000,
+          "bytes_hex": "18fc",
+          "expected": "Success"
+        },
+        {
+          "type": "i32",
+          "ast_tag": "07",
+          "val": -100000,
+          "bytes_hex": "6079feff",
+          "expected": "Success"
+        },
+        {
+          "type": "i64",
+          "ast_tag": "08",
+          "val": -10000000000,
+          "bytes_hex": "001cf4abfdffffff",
+          "expected": "Success"
+        }
+      ]
+    },
+    {
+      "name": "boolean_truth_values_and_rejection",
+      "description": "Boolean values: 0x00=false, 0x01=true; 0x02..0xFF rejected loudly",
+      "clause_citations": [
+        "C6.23"
+      ],
+      "cases": [
+        {
+          "val": false,
+          "bytes_hex": "00",
+          "expected": "Success"
+        },
+        {
+          "val": true,
+          "bytes_hex": "01",
+          "expected": "Success"
+        },
+        {
+          "bytes_hex": "02",
+          "expected": "DecodeError",
+          "error_kind": "InvalidBoolean"
+        },
+        {
+          "bytes_hex": "ff",
+          "expected": "DecodeError",
+          "error_kind": "InvalidBoolean"
+        }
+      ]
+    },
+    {
+      "name": "bounded_event_string",
+      "description": "EventString<MAX>: length prefix u32 LE, UTF-8 bytes, length <= MAX",
+      "clause_citations": [
+        "C6.23"
+      ],
+      "cases": [
+        {
+          "max_bound": 64,
+          "val": "Hello Pardosa",
+          "bytes_hex": "0d00000048656c6c6f20506172646f7361",
+          "expected": "Success"
+        },
+        {
+          "max_bound": 10,
+          "val": "This string exceeds 10 bytes bound",
+          "bytes_hex": "220000005468697320737472696e67206578636565647320313020627974657320626f756e64",
+          "expected": "DecodeError",
+          "error_kind": "LengthExceeded"
+        },
+        {
+          "max_bound": 64,
+          "bytes_hex": "02000000fffe",
+          "expected": "DecodeError",
+          "error_kind": "InvalidUtf8"
+        }
+      ]
+    },
+    {
+      "name": "bounded_non_empty_event_string",
+      "description": "NonEmptyEventString<MAX>: length prefix u32 LE, length between 1 and MAX",
+      "clause_citations": [
+        "C6.23"
+      ],
+      "cases": [
+        {
+          "max_bound": 64,
+          "val": "NonEmpty",
+          "bytes_hex": "080000004e6f6e456d707479",
+          "expected": "Success"
+        },
+        {
+          "max_bound": 64,
+          "val": "",
+          "bytes_hex": "00000000",
+          "expected": "DecodeError",
+          "error_kind": "EmptyNonEmptyString"
+        }
+      ]
+    },
+    {
+      "name": "bounded_event_vec",
+      "description": "EventVec<T, MAX>: count prefix u32 LE, count <= MAX, items sequentially encoded",
+      "clause_citations": [
+        "C6.23"
+      ],
+      "cases": [
+        {
+          "item_type": "u32",
+          "max_items": 4,
+          "items": [
+            10,
+            20,
+            30
+          ],
+          "bytes_hex": "030000000a000000140000001e000000",
+          "expected": "Success"
+        },
+        {
+          "item_type": "u32",
+          "max_items": 2,
+          "items": [
+            1,
+            2,
+            3
+          ],
+          "bytes_hex": "03000000010000000200000003000000",
+          "expected": "DecodeError",
+          "error_kind": "ItemCountExceeded"
+        }
+      ]
+    },
+    {
+      "name": "optionality",
+      "description": "Option<T>: 0x00=None, 0x01=Some(T), 0x02..0xFF rejected",
+      "clause_citations": [
+        "C6.23"
+      ],
+      "cases": [
+        {
+          "inner_type": "u64",
+          "val": null,
+          "bytes_hex": "00",
+          "expected": "Success"
+        },
+        {
+          "inner_type": "u64",
+          "val": 42,
+          "bytes_hex": "012a00000000000000",
+          "expected": "Success"
+        },
+        {
+          "inner_type": "u64",
+          "bytes_hex": "02",
+          "expected": "DecodeError",
+          "error_kind": "InvalidOptionTag"
+        }
+      ]
+    },
+    {
+      "name": "composite_product_and_sum",
+      "description": "Product struct with ordered fields; Sum enum with explicit discriminants and unknown rejection",
+      "clause_citations": [
+        "C6.22",
+        "C6.23"
+      ],
+      "cases": [
+        {
+          "type": "Struct_Point2D",
+          "fields": [
+            {
+              "x": "i32",
+              "val": 100
+            },
+            {
+              "y": "i32",
+              "val": -200
+            }
+          ],
+          "bytes_hex": "6400000038ffffff",
+          "expected": "Success"
+        },
+        {
+          "type": "Enum_Status",
+          "variants": {
+            "0x01": "Active",
+            "0x02": "Suspended"
+          },
+          "selected": "Active",
+          "bytes_hex": "01",
+          "expected": "Success"
+        },
+        {
+          "type": "Enum_Status",
+          "variants": {
+            "0x01": "Active",
+            "0x02": "Suspended"
+          },
+          "bytes_hex": "99",
+          "expected": "DecodeError",
+          "error_kind": "UnknownVariantDiscriminant"
+        }
+      ]
+    },
+    {
+      "name": "temporal_and_uuid",
+      "description": "Timestamp (non-zero u64 nanoseconds, 0 rejected sentinel); Uuid (16 raw bytes)",
+      "clause_citations": [
+        "C6.23"
+      ],
+      "cases": [
+        {
+          "type": "Timestamp",
+          "val_ns": 1725890000000000000,
+          "bytes_hex": "00206693cf97f317",
+          "expected": "Success"
+        },
+        {
+          "type": "Timestamp",
+          "val_ns": 0,
+          "bytes_hex": "0000000000000000",
+          "expected": "DecodeError",
+          "error_kind": "InvalidTimestampSentinel"
+        },
+        {
+          "type": "Uuid",
+          "uuid_str": "12345678-1234-5678-1234-567812345678",
+          "bytes_hex": "12345678123456781234567812345678",
+          "expected": "Success"
+        }
+      ]
+    }
+  ]
+}

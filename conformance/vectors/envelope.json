@@ -1,0 +1,87 @@
+{
+  "conformance_carrier": "Carrier 2: Conformance Suite",
+  "topic": "envelope_wire_layout",
+  "specification_reference": "docs/spec/pardosa-1.0.md (C4.19)",
+  "vectors": [
+    {
+      "name": "valid_attached_event",
+      "description": "Valid 5-field attached event envelope with 81-byte header, u32 payload length, and payload bytes",
+      "clause_citations": [
+        "C4.19"
+      ],
+      "bytes_hex": "1111111122223333444455555555555566666666777788889999aaaaaaaaaaaa00bbbbbbbbccccddddeeeeffffffffffff0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20160000005041594c4f41445f444154415f42595445535f313233",
+      "expected_outcome": "Success",
+      "parsed_value": {
+        "event_id": "11111111-2222-3333-4444-555555555555",
+        "fiber_id": "66666666-7777-8888-9999-aaaaaaaaaaaa",
+        "detached": false,
+        "detached_byte": "00",
+        "precursor": "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
+        "precursor_hash_hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+        "header_length_bytes": 81,
+        "payload_length": 22,
+        "payload_utf8": "PAYLOAD_DATA_BYTES_123"
+      }
+    },
+    {
+      "name": "valid_detached_event",
+      "description": "Valid detached event envelope with detached=0x01 and zeroed precursor chain fields",
+      "clause_citations": [
+        "C4.19"
+      ],
+      "bytes_hex": "1111111122223333444455555555555566666666777788889999aaaaaaaaaaaa01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000160000005041594c4f41445f444154415f42595445535f313233",
+      "expected_outcome": "Success",
+      "parsed_value": {
+        "event_id": "11111111-2222-3333-4444-555555555555",
+        "fiber_id": "66666666-7777-8888-9999-aaaaaaaaaaaa",
+        "detached": true,
+        "detached_byte": "01",
+        "precursor": "00000000-0000-0000-0000-000000000000",
+        "precursor_hash_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+        "header_length_bytes": 81,
+        "payload_length": 22,
+        "payload_utf8": "PAYLOAD_DATA_BYTES_123"
+      }
+    },
+    {
+      "name": "invalid_boolean_discriminant_in_envelope",
+      "description": "Envelope with detached byte set to 0x02, rejected loudly as typed decode error",
+      "clause_citations": [
+        "C4.19",
+        "C6.23"
+      ],
+      "bytes_hex": "1111111122223333444455555555555566666666777788889999aaaaaaaaaaaa02bbbbbbbbccccddddeeeeffffffffffff0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20160000005041594c4f41445f444154415f42595445535f313233",
+      "expected_outcome": "DecodeError",
+      "error_kind": "InvalidBooleanDiscriminant",
+      "error_detail": "Detached byte must be 0x00 (attached) or 0x01 (detached); found 0x02"
+    },
+    {
+      "name": "valid_empty_payload_envelope",
+      "description": "Attached envelope carrying an empty payload (payload_length = 0)",
+      "clause_citations": [
+        "C4.19"
+      ],
+      "bytes_hex": "1111111122223333444455555555555566666666777788889999aaaaaaaaaaaa00bbbbbbbbccccddddeeeeffffffffffff0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2000000000",
+      "expected_outcome": "Success",
+      "parsed_value": {
+        "event_id": "11111111-2222-3333-4444-555555555555",
+        "fiber_id": "66666666-7777-8888-9999-aaaaaaaaaaaa",
+        "detached": false,
+        "header_length_bytes": 81,
+        "payload_length": 0,
+        "payload_hex": ""
+      }
+    },
+    {
+      "name": "truncated_envelope_header",
+      "description": "Envelope truncated before completing the mandatory 81-byte header",
+      "clause_citations": [
+        "C4.19"
+      ],
+      "bytes_hex": "1111111122223333444455555555555566666666777788889999aaaaaaaaaaaa00bbbbbbbbccccdd",
+      "expected_outcome": "DecodeError",
+      "error_kind": "TruncatedHeader",
+      "error_detail": "Expected 81-byte envelope header; found 40 bytes"
+    }
+  ]
+}
