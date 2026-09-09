@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "crates/pardosa",
+    "crates/pardosa-derive",
+    "scripts",
+]
+resolver = "2"

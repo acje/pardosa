@@ -54,7 +54,9 @@ impl Verdict {
             "MISMATCH" => Verdict::Mismatch,
             "UNPAIRED" => Verdict::Unpaired,
             "OUTOFRANGE" => Verdict::OutOfRange,
-            other => panic!("unknown verdict filter {other}; expected OK|MISMATCH|UNPAIRED|OUTOFRANGE"),
+            other => {
+                panic!("unknown verdict filter {other}; expected OK|MISMATCH|UNPAIRED|OUTOFRANGE")
+            }
         }
     }
 }
@@ -113,7 +115,11 @@ fn load_owners(path: &str) -> BTreeMap<u32, Vec<String>> {
         }
         let cols: Vec<&str> = line.split('\t').collect();
         if cols.len() != 3 {
-            panic!("owners table {path}:{} expected 3 tab-separated columns, got {}", lineno + 1, cols.len());
+            panic!(
+                "owners table {path}:{} expected 3 tab-separated columns, got {}",
+                lineno + 1,
+                cols.len()
+            );
         }
         let lo: u32 = cols[1]
             .parse()
@@ -122,7 +128,10 @@ fn load_owners(path: &str) -> BTreeMap<u32, Vec<String>> {
             .parse()
             .unwrap_or_else(|e| panic!("owners table {path}:{} bad hi: {e}", lineno + 1));
         if hi < lo {
-            panic!("owners table {path}:{} hi {hi} precedes lo {lo}", lineno + 1);
+            panic!(
+                "owners table {path}:{} hi {hi} precedes lo {lo}",
+                lineno + 1
+            );
         }
         for n in lo..=hi {
             owners.entry(n).or_default().push(cols[0].to_string());
@@ -145,13 +154,14 @@ fn bd_json(args: &[&str]) -> String {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    String::from_utf8(output.stdout).unwrap_or_else(|e| panic!("bd {args:?} produced non-utf8 stdout: {e}"))
+    String::from_utf8(output.stdout)
+        .unwrap_or_else(|e| panic!("bd {args:?} produced non-utf8 stdout: {e}"))
 }
 
 fn fetch_show(id: &str) -> ShowEntry {
     let raw = bd_json(&["show", id, "--json"]);
-    let mut arr: Vec<ShowEntry> =
-        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("bd show {id} --json parse failed: {e}; raw={raw}"));
+    let mut arr: Vec<ShowEntry> = serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("bd show {id} --json parse failed: {e}; raw={raw}"));
     if arr.is_empty() {
         panic!("bd show {id} --json returned empty array");
     }
@@ -225,7 +235,7 @@ fn context_60(text: &str, byte_pos: usize, match_len: usize) -> String {
         .map(|(i, _)| i)
         .unwrap_or(text.len());
     let slice = &text[start..end.min(text.len())];
-    slice.replace('\n', " ").replace('\t', " ")
+    slice.replace(['\n', '\t'], " ")
 }
 
 fn collapse_to_ranges(mut nums: Vec<u32>) -> String {
@@ -249,15 +259,17 @@ fn collapse_to_ranges(mut nums: Vec<u32>) -> String {
 }
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
-    args.iter()
-        .position(|a| a == flag)
-        .map(|i| args.get(i + 1).unwrap_or_else(|| panic!("{flag} requires a value")).clone())
+    args.iter().position(|a| a == flag).map(|i| {
+        args.get(i + 1)
+            .unwrap_or_else(|| panic!("{flag} requires a value"))
+            .clone()
+    })
 }
 
 fn fetch_corpus(parent_id: &str) -> Vec<Source> {
     let list_raw = bd_json(&["list", "--parent", parent_id, "--all", "--json"]);
-    let entries: Vec<ListEntry> =
-        serde_json::from_str(&list_raw).unwrap_or_else(|e| panic!("bd list --json parse failed: {e}; raw={list_raw}"));
+    let entries: Vec<ListEntry> = serde_json::from_str(&list_raw)
+        .unwrap_or_else(|e| panic!("bd list --json parse failed: {e}; raw={list_raw}"));
 
     let mut sources: Vec<Source> = Vec::new();
     let mut ids: Vec<String> = entries.into_iter().map(|e| e.id).collect();
@@ -290,7 +302,8 @@ fn main() {
         .iter()
         .position(|a| a == "--verdict")
         .map(|i| Verdict::parse(args.get(i + 1).expect("--verdict requires a value")));
-    let owners_path = arg_value(&args, "--owners").unwrap_or_else(|| "scripts/data/ruled-owners.tsv".to_string());
+    let owners_path =
+        arg_value(&args, "--owners").unwrap_or_else(|| "scripts/data/ruled-owners.tsv".to_string());
     let cache_path = arg_value(&args, "--cache");
 
     let parent_id = "pardosa-jn1";
@@ -298,9 +311,10 @@ fn main() {
 
     let sources: Vec<Source> = match &cache_path {
         Some(path) if std::path::Path::new(path).exists() => {
-            let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("failed to read cache {path}: {e}"));
-            let cached: Vec<CachedSource> =
-                serde_json::from_str(&raw).unwrap_or_else(|e| panic!("cache {path} parse failed: {e}"));
+            let raw = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("failed to read cache {path}: {e}"));
+            let cached: Vec<CachedSource> = serde_json::from_str(&raw)
+                .unwrap_or_else(|e| panic!("cache {path} parse failed: {e}"));
             cached
                 .into_iter()
                 .map(|c| Source {
@@ -330,7 +344,8 @@ fn main() {
                 })
                 .collect();
             let encoded = serde_json::to_string(&cached).expect("cache must serialize");
-            std::fs::write(path, encoded).unwrap_or_else(|e| panic!("failed to write cache {path}: {e}"));
+            std::fs::write(path, encoded)
+                .unwrap_or_else(|e| panic!("failed to write cache {path}: {e}"));
             fetched
         }
         None => fetch_corpus(parent_id),
@@ -388,7 +403,11 @@ fn main() {
                 let lo: u32 = cap[1].parse().expect("RULED number must parse as u32");
                 let hi: u32 = cap
                     .get(2)
-                    .map(|m| m.as_str().parse().expect("RULED range end must parse as u32"))
+                    .map(|m| {
+                        m.as_str()
+                            .parse()
+                            .expect("RULED range end must parse as u32")
+                    })
                     .unwrap_or(lo);
                 let paired = last_ticket_ref_before(text, whole.start());
                 let ctx = context_60(text, whole.start(), whole.len());

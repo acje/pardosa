@@ -1,0 +1,23 @@
+[package]
+name = "pardosa"
+version = "0.1.0"
+edition = "2021"
+description = "Constrained foundation, schema descriptors, codecs, and derive for Pardosa"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+pardosa-derive = { path = "../pardosa-derive" }
+crc32c = "0.6"
+blake3 = "1.5"
+uuid = { version = "1.10", optional = true }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+
+[features]
+default = ["uuid"]
+uuid = ["dep:uuid"]
+nats = []
+unstable-test-support = []

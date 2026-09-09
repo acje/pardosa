@@ -6,9 +6,18 @@ struct Reassignment {
 }
 
 const REASSIGNMENTS: &[Reassignment] = &[
-    Reassignment { ruled_n: "68", new_ids: "C4.10;C4.11" },
-    Reassignment { ruled_n: "238", new_ids: "C4.12" },
-    Reassignment { ruled_n: "239", new_ids: "C4.12" },
+    Reassignment {
+        ruled_n: "68",
+        new_ids: "C4.10;C4.11",
+    },
+    Reassignment {
+        ruled_n: "238",
+        new_ids: "C4.12",
+    },
+    Reassignment {
+        ruled_n: "239",
+        new_ids: "C4.12",
+    },
 ];
 
 const SHIFT_LOW: u32 = 11;
@@ -67,10 +76,11 @@ fn write_file(path: &Path, contents: &str) {
 }
 
 fn check_idempotence(spec_src: &str, trace_src: &str) {
-    if find_clause_ids(spec_src).iter().any(|n| *n == 23 || *n == 24) {
-        panic!(
-            "idempotence guard: spec already contains C4.23 or C4.24; refusing to double-shift"
-        );
+    if find_clause_ids(spec_src)
+        .iter()
+        .any(|n| *n == 23 || *n == 24)
+    {
+        panic!("idempotence guard: spec already contains C4.23 or C4.24; refusing to double-shift");
     }
     let still_pending = REASSIGNMENTS.iter().any(|r| {
         trace_src.lines().any(|line| {
@@ -165,8 +175,8 @@ fn replace_token_exact(src: &str, from: &str, to: &str) -> (String, usize) {
     let mut i = 0;
     while i < bytes.len() {
         if i + fbytes.len() <= bytes.len() && &bytes[i..i + fbytes.len()] == fbytes {
-            let right_ok = i + fbytes.len() == bytes.len()
-                || !bytes[i + fbytes.len()].is_ascii_digit();
+            let right_ok =
+                i + fbytes.len() == bytes.len() || !bytes[i + fbytes.len()].is_ascii_digit();
             if right_ok {
                 out.extend_from_slice(tbytes);
                 count += 1;

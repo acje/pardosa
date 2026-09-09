@@ -78,9 +78,8 @@ fn check(name: &'static str, pass: bool, detail: impl Into<String>) -> CheckResu
 }
 
 fn parse_clauses(doc: &str) -> Vec<Clause> {
-    let heading_re =
-        regex::Regex::new(r"^####\s+C(\d+)\.(\d+)\s+—\s+(INVARIANT|SURFACE)\s*$")
-            .expect("clause heading regex must compile");
+    let heading_re = regex::Regex::new(r"^####\s+C(\d+)\.(\d+)\s+—\s+(INVARIANT|SURFACE)\s*$")
+        .expect("clause heading regex must compile");
     let lines: Vec<&str> = doc.lines().collect();
     let mut clauses = Vec::new();
     let mut i = 0;
@@ -134,13 +133,19 @@ fn parse_trace(text: &str) -> (Vec<TraceRow>, Vec<String>) {
         }
         let fields: Vec<&str> = line.split('\t').collect();
         if fields.len() != 4 {
-            malformed.push(format!("line {lineno}: expected 4 fields, found {}", fields.len()));
+            malformed.push(format!(
+                "line {lineno}: expected 4 fields, found {}",
+                fields.len()
+            ));
             continue;
         }
         let ruled_n: u32 = match fields[0].parse() {
             Ok(n) => n,
             Err(_) => {
-                malformed.push(format!("line {lineno}: ruled_n not a number: {}", fields[0]));
+                malformed.push(format!(
+                    "line {lineno}: ruled_n not a number: {}",
+                    fields[0]
+                ));
                 continue;
             }
         };
@@ -194,7 +199,10 @@ fn check_trace_complete(
         .filter(|n| *n >= range.0 && *n <= range.1)
         .collect();
     let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
-    for row in trace.iter().filter(|r| r.ruled_n >= range.0 && r.ruled_n <= range.1) {
+    for row in trace
+        .iter()
+        .filter(|r| r.ruled_n >= range.0 && r.ruled_n <= range.1)
+    {
         *counts.entry(row.ruled_n).or_insert(0) += 1;
     }
     let present: BTreeSet<u32> = counts.keys().copied().collect();
@@ -229,7 +237,10 @@ fn check_trace_complete(
         ));
     }
     if pass {
-        detail = format!("expected {} rows in range, all present exactly once", expected_in_range.len());
+        detail = format!(
+            "expected {} rows in range, all present exactly once",
+            expected_in_range.len()
+        );
     }
     check("trace_complete", pass, detail)
 }
@@ -326,7 +337,10 @@ fn check_regime_marker_unique(clauses: &[Clause], allow_regime_prose: &[String])
     let detail = if pass {
         "no clause body restates a regime marker".to_string()
     } else {
-        format!("clause bodies with duplicate regime marker: {}", offenders.join(", "))
+        format!(
+            "clause bodies with duplicate regime marker: {}",
+            offenders.join(", ")
+        )
     };
     check("regime_marker_unique", pass, detail)
 }
@@ -338,14 +352,14 @@ fn check_status_block(doc: &str, clauses: &[Clause]) -> CheckResult {
     };
     let ref_re = regex::Regex::new(r"C\d+\.\d+").expect("status ref regex must compile");
     let known: BTreeSet<&str> = clauses.iter().map(|c| c.id.as_str()).collect();
-    let resolves = ref_re
-        .find_iter(&block)
-        .any(|m| known.contains(m.as_str()));
+    let resolves = ref_re.find_iter(&block).any(|m| known.contains(m.as_str()));
     let token_re = regex::Regex::new(r"\b(INVARIANT|SURFACE)\b").expect("token regex must compile");
     let restates = token_re.is_match(&block);
     let pass = resolves && !restates;
     let detail = match (resolves, restates) {
-        (true, false) => "STATUS block present, references a real clause, no regime restatement".to_string(),
+        (true, false) => {
+            "STATUS block present, references a real clause, no regime restatement".to_string()
+        }
         (false, _) => "STATUS block has no reference resolving to a real clause".to_string(),
         (true, true) => "STATUS block restates a regime marker token".to_string(),
     };
@@ -369,7 +383,8 @@ fn check_no_pgn_normative(clauses: &[Clause]) -> CheckResult {
 }
 
 fn check_layer_sections_ordered(clauses: &[Clause]) -> CheckResult {
-    let layer_index = |layer: u32| -> Option<usize> { LAYER_ORDER.iter().position(|l| *l == layer) };
+    let layer_index =
+        |layer: u32| -> Option<usize> { LAYER_ORDER.iter().position(|l| *l == layer) };
     let mut last_layer_idx: Option<usize> = None;
     let mut last_n_in_layer: BTreeMap<u32, u32> = BTreeMap::new();
     let mut offenders: Vec<String> = Vec::new();
@@ -394,7 +409,10 @@ fn check_layer_sections_ordered(clauses: &[Clause]) -> CheckResult {
                 c.id, c.layer, c.n
             ));
         }
-        last_n_in_layer.insert(c.layer, c.n.max(last_n_in_layer.get(&c.layer).copied().unwrap_or(0)));
+        last_n_in_layer.insert(
+            c.layer,
+            c.n.max(last_n_in_layer.get(&c.layer).copied().unwrap_or(0)),
+        );
     }
     let pass = offenders.is_empty();
     let detail = if pass {
@@ -446,8 +464,14 @@ fn run(
         .iter()
         .filter(|r| r.disposition == Disposition::MapGovernance)
         .count();
-    let invariant_count = clauses.iter().filter(|c| c.regime == Regime::Invariant).count();
-    let surface_count = clauses.iter().filter(|c| c.regime == Regime::Surface).count();
+    let invariant_count = clauses
+        .iter()
+        .filter(|c| c.regime == Regime::Invariant)
+        .count();
+    let surface_count = clauses
+        .iter()
+        .filter(|c| c.regime == Regime::Surface)
+        .count();
 
     RunOutcome {
         ruled_total: trace_rows.len(),
@@ -461,16 +485,22 @@ fn run(
 }
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
-    args.iter()
-        .position(|a| a == flag)
-        .map(|i| args.get(i + 1).unwrap_or_else(|| panic!("{flag} requires a value")).clone())
+    args.iter().position(|a| a == flag).map(|i| {
+        args.get(i + 1)
+            .unwrap_or_else(|| panic!("{flag} requires a value"))
+            .clone()
+    })
 }
 
 fn arg_values(args: &[String], flag: &str) -> Vec<String> {
     args.iter()
         .enumerate()
         .filter(|(_, a)| *a == flag)
-        .map(|(i, _)| args.get(i + 1).unwrap_or_else(|| panic!("{flag} requires a value")).clone())
+        .map(|(i, _)| {
+            args.get(i + 1)
+                .unwrap_or_else(|| panic!("{flag} requires a value"))
+                .clone()
+        })
         .collect()
 }
 
@@ -479,18 +509,21 @@ fn parse_range(s: &str) -> (u32, u32) {
         .split_once("..")
         .unwrap_or_else(|| panic!("--range must be of the form <lo>..<hi>, got {s}"));
     (
-        lo.parse().unwrap_or_else(|e| panic!("--range lo must be a number: {e}")),
-        hi.parse().unwrap_or_else(|e| panic!("--range hi must be a number: {e}")),
+        lo.parse()
+            .unwrap_or_else(|e| panic!("--range lo must be a number: {e}")),
+        hi.parse()
+            .unwrap_or_else(|e| panic!("--range hi must be a number: {e}")),
     )
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let spec_path = arg_value(&args, "--spec").unwrap_or_else(|| "docs/spec/pardosa-1.0.md".to_string());
-    let trace_path =
-        arg_value(&args, "--trace").unwrap_or_else(|| "docs/spec/trace/ruled-trace.tsv".to_string());
-    let meadows_path =
-        arg_value(&args, "--meadows").unwrap_or_else(|| "scripts/data/ruled-meadows.tsv".to_string());
+    let spec_path =
+        arg_value(&args, "--spec").unwrap_or_else(|| "docs/spec/pardosa-1.0.md".to_string());
+    let trace_path = arg_value(&args, "--trace")
+        .unwrap_or_else(|| "docs/spec/trace/ruled-trace.tsv".to_string());
+    let meadows_path = arg_value(&args, "--meadows")
+        .unwrap_or_else(|| "scripts/data/ruled-meadows.tsv".to_string());
     let range = arg_value(&args, "--range")
         .map(|s| parse_range(&s))
         .unwrap_or((1, 244));
@@ -522,7 +555,10 @@ fn main() {
     println!("SUMMARY\tclauses\t{}", outcome.clause_count);
     println!("SUMMARY\tinvariant\t{}", outcome.invariant_count);
     println!("SUMMARY\tsurface\t{}", outcome.surface_count);
-    println!("SUMMARY\tverdict\t{}", if any_fail { "FAIL" } else { "PASS" });
+    println!(
+        "SUMMARY\tverdict\t{}",
+        if any_fail { "FAIL" } else { "PASS" }
+    );
 
     std::process::exit(if any_fail { 1 } else { 0 });
 }
@@ -531,7 +567,8 @@ fn main() {
 mod tests {
     use super::*;
 
-    const MEADOWS_SMALL: &str = "1\t2\tS\tpardosa-x\tsome justification\n2\t3\tS\tpardosa-x\tsome justification\n";
+    const MEADOWS_SMALL: &str =
+        "1\t2\tS\tpardosa-x\tsome justification\n2\t3\tS\tpardosa-x\tsome justification\n";
 
     fn valid_doc() -> String {
         [
@@ -585,7 +622,8 @@ mod tests {
 
     #[test]
     fn absent_document_fails_status_block() {
-        let missing_doc = std::fs::read_to_string("/nonexistent/spec/pardosa-1.0.md").unwrap_or_default();
+        let missing_doc =
+            std::fs::read_to_string("/nonexistent/spec/pardosa-1.0.md").unwrap_or_default();
         assert_eq!(missing_doc, "");
         let outcome = run_default(&missing_doc, &valid_trace());
         assert!(!find(&outcome, "status_block").pass);
@@ -616,7 +654,9 @@ mod tests {
         .join("\n");
         let outcome = run_default(&valid_doc(), &trace);
         assert!(!find(&outcome, "trace_complete").pass);
-        assert!(find(&outcome, "trace_complete").detail.contains("duplicate"));
+        assert!(find(&outcome, "trace_complete")
+            .detail
+            .contains("duplicate"));
     }
 
     #[test]
@@ -744,7 +784,13 @@ mod tests {
             "Body text for clause two.",
         ]
         .join("\n");
-        let outcome = run(&doc, &valid_trace(), MEADOWS_SMALL, (1, 244), &["C2.1".to_string()]);
+        let outcome = run(
+            &doc,
+            &valid_trace(),
+            MEADOWS_SMALL,
+            (1, 244),
+            &["C2.1".to_string()],
+        );
         assert!(find(&outcome, "regime_marker_unique").pass);
     }
 
