@@ -124,6 +124,15 @@ Any checksum mismatch, truncated payload, or framing length exceeding the
 remaining container bytes produces an immediate loud typed decoding error,
 refusing the corrupted entry.
 
+Integrity is structured in two orthogonal tiers:
+1. Physical dragline tier: sequential container frames are protected by frame-level
+   CRC32C checksums and update an artefact-level rolling BLAKE3 commitment digest,
+   guaranteeing physical tamper-evidence and total-order anchoring per C5.26.
+2. Logical fiber tier: each event envelope carries a fiber-scoped precursor link
+   and BLAKE3 predecessor commitment hash per C4.19 and C5.40, guaranteeing
+   independent entity-level causal integrity and migration resilience when sibling
+   fibers are purged or pruned.
+
 #### C3.5 — INVARIANT
 
 An artefact's ownership record and its event data move, copy and restore
@@ -666,6 +675,10 @@ An anchor is evidence of an artefact's rolling commitment at an observation,
 held by an external observer. An artefact's rolling commitment establishes that
 the sequence it covers is internally consistent and totally ordered, and pardosa
 holds that from 0.5.1.
+The rolling commitment is computed sequentially over the physical container frames
+of the artefact. It operates orthogonally to the fiber-scoped precursor chain (C5.40):
+the rolling commitment authenticates the physical dragline log, while the fiber-scoped
+precursor chain authenticates the logical entity causality across migrations.
 Where an operator has wired an anchor destination, the artefact additionally
 establishes that it has not been rewritten since an anchor an external observer
 holds; that second establishment is a capability an operator elects. An artefact

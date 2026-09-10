@@ -150,6 +150,53 @@ impl ContainerFrame {
     }
 }
 
+/// Running physical rolling commitment over sequential frames written to an artefact container per C5.26.
+///
+/// Computes a continuous BLAKE3 digest over all framed entries written to the container,
+/// establishing physical dragline integrity and enabling external observer anchoring.
+#[derive(Debug, Clone)]
+pub struct RollingCommitment {
+    hasher: blake3::Hasher,
+    frame_count: u64,
+}
+
+impl Default for RollingCommitment {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RollingCommitment {
+    /// Creates a new empty rolling commitment tracker.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            hasher: blake3::Hasher::new(),
+            frame_count: 0,
+        }
+    }
+
+    /// Incorporates a container frame into the running dragline commitment.
+    ///
+    /// Updates the rolling BLAKE3 digest with the framed entry bytes.
+    pub fn update_frame(&mut self, frame_bytes: &[u8]) {
+        self.hasher.update(frame_bytes);
+        self.frame_count = self.frame_count.saturating_add(1);
+    }
+
+    /// Returns the number of frames incorporated into this rolling commitment.
+    #[must_use]
+    pub fn frame_count(&self) -> u64 {
+        self.frame_count
+    }
+
+    /// Returns the current 32-byte BLAKE3 commitment digest without finalizing the hasher.
+    #[must_use]
+    pub fn current_commitment(&self) -> [u8; 32] {
+        *self.hasher.finalize().as_bytes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +229,36 @@ mod tests {
         buf[last_idx] ^= 0xFF;
         let err = ContainerFrame::decode(&buf).unwrap_err();
         assert_eq!(err.error_kind(), "ChecksumMismatch");
+    }
+
+    #[test]
+    fn test_rolling_commitment_frame_progression_and_tamper_detection() {
+        let mut commitment = RollingCommitment::new();
+        assert_eq!(commitment.frame_count(), 0);
+        let initial_digest = commitment.current_commitment();
+
+        let mut frame1 = Vec::new();
+        ContainerFrame::encode_payload(b"event-1", &mut frame1);
+        commitment.update_frame(&frame1);
+        assert_eq!(commitment.frame_count(), 1);
+        let digest1 = commitment.current_commitment();
+        assert_ne!(initial_digest, digest1);
+
+        let mut frame2 = Vec::new();
+        ContainerFrame::encode_payload(b"event-2", &mut frame2);
+        commitment.update_frame(&frame2);
+        assert_eq!(commitment.frame_count(), 2);
+        let digest2 = commitment.current_commitment();
+        assert_ne!(digest1, digest2);
+
+        let mut tampered_commitment = RollingCommitment::new();
+        let mut tampered_frame1 = frame1.clone();
+        tampered_frame1[4] ^= 0x01;
+        tampered_commitment.update_frame(&tampered_frame1);
+        tampered_commitment.update_frame(&frame2);
+        assert_ne!(
+            commitment.current_commitment(),
+            tampered_commitment.current_commitment()
+        );
     }
 }
