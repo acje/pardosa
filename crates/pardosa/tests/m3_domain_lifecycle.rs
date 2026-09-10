@@ -714,11 +714,14 @@ fn run_rustc(code: &str) -> (bool, String) {
             deps_dir.display()
         ),
         1 => rlibs.remove(0),
-        count => panic!(
-            "ambiguous libpardosa artifact discovery: expected exactly 1 matching rlib in {}, found {count}: {:?}",
-            deps_dir.display(),
-            rlibs
-        ),
+        _ => {
+            rlibs.sort_by_key(|p| {
+                std::fs::metadata(p)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+            });
+            rlibs.pop().unwrap()
+        }
     };
 
     let rustc_cmd = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
