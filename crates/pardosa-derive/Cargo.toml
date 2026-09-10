@@ -1,9 +1,14 @@
 [package]
 name = "pardosa-derive"
-version = "0.1.0"
+version = "0.5.1"
 edition = "2021"
-description = "PardosaSchema derive proc-macro"
+description = "Procedural macro deriving PardosaSchema AST descriptors and codecs for Pardosa"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/acje/pardosa"
+documentation = "https://docs.rs/pardosa-derive"
+rust-version = "1.89.0"
+keywords = ["pardosa", "derive", "schema", "proc-macro"]
+categories = ["development-tools::procedural-macro-helpers"]
 
 [lib]
 proc-macro = true

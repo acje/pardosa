@@ -1,12 +1,17 @@
 [package]
 name = "pardosa-nats"
-version = "0.1.0"
+version = "0.5.1"
 edition = "2021"
 description = "NATS JetStream storage adapter for Pardosa"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/acje/pardosa"
+documentation = "https://docs.rs/pardosa-nats"
+rust-version = "1.89.0"
+keywords = ["pardosa", "nats", "jetstream", "storage", "event-store"]
+categories = ["database-implementations", "asynchronous"]
 
 [dependencies]
-pardosa = { path = "../pardosa" }
+pardosa = { version = "0.5.1", path = "../pardosa" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "net"] }
 async-nats = "0.49"
 bytes = "1"

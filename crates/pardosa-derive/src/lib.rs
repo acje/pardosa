@@ -1,4 +1,43 @@
-//! Procedural macro for deriving PardosaSchema per C4.24, C5.48, C5.49, C6.22, and C6.23.
+//! Procedural macro crate for deriving PardosaSchema AST descriptors and codecs.
+//!
+//! # Positive Definitions
+//!
+//! Provides the `#[derive(PardosaSchema)]` procedural macro to generate compile-time
+//! schema descriptors and binary wire codecs:
+//! - Declared schema versions via `#[pardosa(version = N)]` attributes.
+//! - Strongly-typed AST descriptors capturing enum variants and fields.
+//! - Canonical 32-byte BLAKE3 schema identity hashes.
+//! - Binary wire encoding and decoding routines adhering to Pardosa format rules.
+//!
+//! # Supported Construction and Derive Diagnostics
+//!
+//! Input payload types are validated at compile time, rejecting unsupported shapes with actionable diagnostics:
+//! - **Struct or Union Root**: Only enum roots are supported per C5.48 and C4.24. Remedy: Wrap struct data in an enum.
+//! - **Missing Explicit Discriminants**: Every enum variant must declare an explicit integer discriminant (`Variant = 0`) per C5.48. Remedy: Add explicit discriminants.
+//! - **Missing Tombstone**: Payload enums must designate a tombstone variant with `#[pardosa(tombstone)]` for migration markers. Remedy: Annotate an empty tombstone variant.
+//! - **Cyclic Types (S4)**: Recursive type definitions without indirection are detected and rejected. Remedy: Break recursive definitions.
+//! - **Unbounded Types**: Raw `String`, unbounded `Vec`, and floating-point types are rejected. Remedy: Use `EventString<MAX>`, `EventVec<T, MAX>`, and fixed-width integers.
+//!
+//! # Truthful Seal Limits (S5)
+//!
+//! Per C4.24 and C6.35, `PardosaSchema` derive guarantees that generated descriptors accurately reflect the compiled
+//! Rust type definition. However, whether the declared types faithfully represent the domain events written by an
+//! application remains outside what Pardosa establishes.
+//!
+//! # Shipped Producer Inventory (S10)
+//!
+//! Per C4.24, this procedural macro is the primary recognized producer of schema descriptors for Pardosa. Shipped
+//! foundation crates contain zero hand-written descriptor implementations.
+//!
+//! # Security and Maintenance Disclosure
+//!
+//! - **Single Maintainer (C6.32)**: Pardosa has one maintainer. Issue triage and support are provided on a best-effort basis without an SLA.
+//! - **Security Reporting (C5.38)**: Disclose vulnerabilities privately via GitHub Security Advisories at
+//!   `https://github.com/acje/pardosa/security/advisories` or contact `security@pardosa.dev`.
+//! - **Non-Rust Dependencies (C5.38)**: Advisories for non-Rust dependency edges are monitored directly.
+//! - **Withdrawal Posture (C5.38)**: Published releases are withdrawn (yanked) strictly for correctness or safety defects.
+
+#![deny(missing_docs)]
 
 use proc_macro::TokenStream;
 use quote::quote;
