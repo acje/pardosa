@@ -642,7 +642,7 @@ pub struct EnvelopeHeader {
     pub detached: bool,
     /// Precursor event identifier (16 bytes).
     pub precursor: [u8; 16],
-    /// SHA-256 hash digest of precursor commitment (32 bytes).
+    /// BLAKE3 hash digest of precursor commitment (32 bytes).
     pub precursor_hash: [u8; 32],
 }
 
@@ -742,6 +742,26 @@ impl EventEnvelope {
         let payload = buf[header_consumed + 4..total_consumed].to_vec();
         Ok((Self { header, payload }, total_consumed))
     }
+
+    /// Computes the 32-byte BLAKE3 commitment of this envelope per C4.19.
+    #[must_use]
+    pub fn commitment(&self) -> [u8; 32] {
+        compute_envelope_commitment(&self.header, &self.payload)
+    }
+}
+
+/// Computes the 32-byte BLAKE3 commitment of an event envelope from its canonical
+/// 81-byte header followed by its payload bytes per C4.19.
+#[must_use]
+pub fn compute_envelope_commitment(header: &EnvelopeHeader, payload: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&header.event_id);
+    hasher.update(&header.fiber_id);
+    hasher.update(&[if header.detached { 0x01 } else { 0x00 }]);
+    hasher.update(&header.precursor);
+    hasher.update(&header.precursor_hash);
+    hasher.update(payload);
+    *hasher.finalize().as_bytes()
 }
 
 /// Partitioning rule algorithms for identity structure per C4.14.

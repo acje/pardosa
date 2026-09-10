@@ -401,8 +401,7 @@ followed by a 4-byte payload length prefix and the payload bytes:
    - Any value in 0x02..=0xFF is rejected loudly as a typed decode error.
 4. `precursor`: 16 raw bytes (128-bit UUID of the immediately preceding event
    on this fiber within the generation, or 16 zero bytes for the first event).
-5. `precursor_hash`: 32 raw bytes (SHA-256 digest of the precursor event
-   commitment, or 32 zero bytes for the first event).
+5. `precursor_hash`: 32 raw bytes (BLAKE3 digest of the precursor event commitment [canonical 81-byte header followed by payload], or 32 zero bytes for the first event).
 
 The fixed header occupies exactly 81 bytes (16 + 16 + 1 + 16 + 32). Immediately
 following the 81-byte header:
