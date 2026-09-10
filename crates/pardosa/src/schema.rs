@@ -2,8 +2,9 @@
 
 use crate::encoding::{
     DecodeError, EncodeError, EventBytes, EventString, EventVec, NonEmptyEventString, Timestamp,
-    Uuid,
+    Uuid, ValueConstraint,
 };
+use crate::store::{FailureCondition, OperationFailure};
 
 /// Maximum recursion depth allowed during descriptor AST decoding to prevent cycles.
 pub const MAX_DESCRIPTOR_DEPTH: usize = 64;
@@ -529,6 +530,123 @@ impl SchemaDescriptor {
     #[must_use]
     pub fn identity(&self) -> SchemaIdentity {
         SchemaIdentity::from_descriptor(self.version, &self.root)
+    }
+
+    /// Asserts that this schema descriptor is structurally complete per C8.2.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::MissingSchemaDescriptor`]
+    /// if version is zero.
+    /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`]
+    /// if any variant, field, or bound is invalid.
+    pub fn validate_structural_completeness(&self) -> Result<(), OperationFailure> {
+        if self.version == 0 {
+            return Err(OperationFailure::new(
+                FailureCondition::MissingSchemaDescriptor,
+                "schema descriptor declared version must be non-zero per C8.2",
+            ));
+        }
+        self.root.validate_structural_completeness()
+    }
+}
+
+impl DescriptorNode {
+    /// Asserts that this descriptor AST node is structurally complete per C8.2.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`]
+    /// if any variant, field, or bound is invalid.
+    pub fn validate_structural_completeness(&self) -> Result<(), OperationFailure> {
+        match self {
+            Self::U8
+            | Self::U16
+            | Self::U32
+            | Self::U64
+            | Self::I8
+            | Self::I16
+            | Self::I32
+            | Self::I64
+            | Self::Bool
+            | Self::Timestamp
+            | Self::Uuid => Ok(()),
+            Self::EventString { max_bytes }
+            | Self::NonEmptyEventString { max_bytes }
+            | Self::EventBytes { max_bytes } => {
+                if *max_bytes == 0 {
+                    Err(OperationFailure::new(
+                        FailureCondition::ValueConstraintViolated {
+                            constraint: ValueConstraint::Empty,
+                        },
+                        "bounded type must carry non-zero bound per C8.2",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Self::EventVec { inner, max_items } => {
+                if *max_items == 0 {
+                    Err(OperationFailure::new(
+                        FailureCondition::ValueConstraintViolated {
+                            constraint: ValueConstraint::Empty,
+                        },
+                        "collection must carry non-zero max_items per C8.2",
+                    ))
+                } else {
+                    inner.validate_structural_completeness()
+                }
+            }
+            Self::Option { inner } => inner.validate_structural_completeness(),
+            Self::Struct { fields, .. } => {
+                for f in fields {
+                    if f.name.is_empty() {
+                        return Err(OperationFailure::new(
+                            FailureCondition::ValueConstraintViolated {
+                                constraint: ValueConstraint::Empty,
+                            },
+                            "struct field name must be non-empty per C8.2",
+                        ));
+                    }
+                    f.node.validate_structural_completeness()?;
+                }
+                Ok(())
+            }
+            Self::Enum {
+                variants,
+                discriminant_width,
+                ..
+            } => {
+                if variants.is_empty() {
+                    return Err(OperationFailure::new(
+                        FailureCondition::ValueConstraintViolated {
+                            constraint: ValueConstraint::Empty,
+                        },
+                        "enumeration must carry at least one variant per C8.2",
+                    ));
+                }
+                if *discriminant_width != 1 && *discriminant_width != 2 {
+                    return Err(OperationFailure::new(
+                        FailureCondition::ValueConstraintViolated {
+                            constraint: ValueConstraint::NotReal,
+                        },
+                        "enumeration discriminant width must be 1 or 2 bytes per C8.2",
+                    ));
+                }
+                for v in variants {
+                    if v.name.is_empty() {
+                        return Err(OperationFailure::new(
+                            FailureCondition::ValueConstraintViolated {
+                                constraint: ValueConstraint::Empty,
+                            },
+                            "enum variant name must be non-empty per C8.2",
+                        ));
+                    }
+                    if let Some(payload) = &v.payload {
+                        payload.validate_structural_completeness()?;
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 }
 

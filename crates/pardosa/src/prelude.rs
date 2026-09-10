@@ -7,7 +7,10 @@ pub use crate::encoding::{
     NonEmptyEventString, OutboundPointerRecord, OwnershipClaimRecord, OwnershipRecord,
     PartitioningRule, RescuePolicy, RescuePolicyChoiceRecord, Timestamp, Uuid, ValueConstraint,
 };
-pub use crate::file::{ContainerFrame, ContainerHeader, RollingCommitment};
+pub use crate::file::{
+    ContainerFrame, ContainerHeader, FileExclusionPolicy, FileReaderSession, FileStorageAdapter,
+    FileWriterSession, RollingCommitment,
+};
 pub use crate::schema::{
     DescriptorNode, FieldDescriptor, PardosaSchema, PardosaType, SchemaDescriptor, SchemaIdentity,
     VariantDescriptor,
