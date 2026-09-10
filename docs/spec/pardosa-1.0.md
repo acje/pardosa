@@ -1402,13 +1402,18 @@ emptiness, composition, and wire representations are:
    - `Uuid`: 128-bit universal identifier encoded as 16 raw bytes in RFC 4122
      network byte order.
 
-8. Exclusions:
-   - Floating-point representations (f32, f64, or float wrapper types) are
-     unadopted and excluded from the admitted constructor vocabulary.
+8. Deterministic float wrappers:
+   - `OrderedF32`: Canonical finite IEEE-754 binary32 real. Rejects NaN, ±∞, and subnormal floats; normalizes -0.0 to +0.0. Encoded as 4 raw bytes little-endian.
+   - `OrderedF64`: Canonical finite IEEE-754 binary64 real. Rejects NaN, ±∞, and subnormal floats; normalizes -0.0 to +0.0. Encoded as 8 raw bytes little-endian.
+   - `EventF32`: Canonical composite `Enum` descriptor (tag 0x10) with type name `"EventF32"`, discriminant width 1 (1 byte), and 4 variants in listed order: `NaN = 0` (unit, 0 payload bytes), `NegInf = 1` (unit, 0 payload bytes), `Finite(OrderedF32) = 2` (payload: OrderedF32 descriptor 0x13, 4 bytes LE), `PosInf = 3` (unit, 0 payload bytes). Total ordering: `NaN < NegInf < Finite < PosInf`.
+   - `EventF64`: Canonical composite `Enum` descriptor (tag 0x10) with type name `"EventF64"`, discriminant width 1 (1 byte), and 4 variants in listed order: `NaN = 0` (unit, 0 payload bytes), `NegInf = 1` (unit, 0 payload bytes), `Finite(OrderedF64) = 2` (payload: OrderedF64 descriptor 0x14, 8 bytes LE), `PosInf = 3` (unit, 0 payload bytes). Total ordering: `NaN < NegInf < Finite < PosInf`.
+
+9. Exclusions:
+   - Raw unrestricted floats (`f32`, `f64`) permitting non-deterministic NaN representations or -0.0/+0.0 hash divergence are excluded from the admitted constructor vocabulary.
    - Arbitrary application domain predicates are application-owned under C8.3
      and are not guaranteed or verified by the descriptor or codec layer.
 
-9. Descriptor AST binary encoding:
+10. Descriptor AST binary encoding:
    When serialized inside a schema descriptor record (kind 0x09), each
    constructor node in the descriptor AST begins with a 1-byte constructor tag:
    - `0x01`: u8
@@ -1432,7 +1437,9 @@ emptiness, composition, and wire representations are:
      variant name (u32 LE length + UTF-8 bytes), and variant payload descriptor node (or 0x00 if unit)
    - `0x11`: Timestamp
    - `0x12`: Uuid
-   Any constructor tag outside 0x01..=0x12 produces an immediate loud typed decode error.
+   - `0x13`: OrderedF32
+   - `0x14`: OrderedF64
+   Any constructor tag outside 0x01..=0x14 produces an immediate loud typed decode error.
 
 #### C6.24 — SURFACE
 

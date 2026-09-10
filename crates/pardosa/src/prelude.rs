@@ -16,8 +16,8 @@ pub use crate::migration::{
     MigrationTarget,
 };
 pub use crate::schema::{
-    DescriptorNode, FieldDescriptor, PardosaSchema, PardosaType, SchemaDescriptor, SchemaIdentity,
-    VariantDescriptor,
+    derive_fiber_id, DescriptorNode, EventF32, EventF64, FieldDescriptor, OrderedF32, OrderedF64,
+    PardosaSchema, PardosaType, SchemaDescriptor, SchemaIdentity, VariantDescriptor,
 };
 pub use crate::store::{
     admit_create, admit_event, admit_open, admit_precursor_link, evaluate_claim_cas,

@@ -92,3 +92,231 @@ fn test_user_event_truncated_rejection() {
     let err = UserEvent::decode_payload(&[]).unwrap_err();
     assert_eq!(err.error_kind(), "TruncatedPayload");
 }
+
+mod f64_ordered_module {
+    use pardosa::prelude::*;
+
+    #[derive(Debug, PartialEq, Eq, PardosaSchema)]
+    #[repr(u8)]
+    #[pardosa(version = 1)]
+    pub enum FloatPayloadEvent {
+        #[pardosa(tombstone)]
+        Tombstone = 0,
+        Measurement {
+            sensor_id: u32,
+            value: OrderedF64,
+            label: EventString<32>,
+        } = 1,
+    }
+}
+
+mod f64_event_module {
+    use pardosa::prelude::*;
+
+    #[derive(Debug, PartialEq, Eq, PardosaSchema)]
+    #[repr(u8)]
+    #[pardosa(version = 1)]
+    pub enum FloatPayloadEvent {
+        #[pardosa(tombstone)]
+        Tombstone = 0,
+        Measurement {
+            sensor_id: u32,
+            value: EventF64,
+            label: EventString<32>,
+        } = 1,
+    }
+}
+
+mod f32_ordered_module {
+    use pardosa::prelude::*;
+
+    #[derive(Debug, PartialEq, Eq, PardosaSchema)]
+    #[repr(u8)]
+    #[pardosa(version = 1)]
+    pub enum FloatPayloadEvent {
+        #[pardosa(tombstone)]
+        Tombstone = 0,
+        Measurement {
+            sensor_id: u32,
+            value: OrderedF32,
+            label: EventString<32>,
+        } = 1,
+    }
+}
+
+mod f32_event_module {
+    use pardosa::prelude::*;
+
+    #[derive(Debug, PartialEq, Eq, PardosaSchema)]
+    #[repr(u8)]
+    #[pardosa(version = 1)]
+    pub enum FloatPayloadEvent {
+        #[pardosa(tombstone)]
+        Tombstone = 0,
+        Measurement {
+            sensor_id: u32,
+            value: EventF32,
+            label: EventString<32>,
+        } = 1,
+    }
+}
+
+#[test]
+fn test_f64_derived_payload_schema_identity_and_admission_mismatch() {
+    let desc_a = f64_ordered_module::FloatPayloadEvent::schema_descriptor();
+    let desc_b = f64_event_module::FloatPayloadEvent::schema_descriptor();
+    assert_ne!(desc_a, desc_b);
+
+    let id_a = f64_ordered_module::FloatPayloadEvent::schema_identity();
+    let id_b = f64_event_module::FloatPayloadEvent::schema_identity();
+    assert_ne!(id_a, id_b);
+
+    let schema_desc_a = SchemaDescriptor::new(1, desc_a);
+    let schema_desc_b = SchemaDescriptor::new(1, desc_b);
+    assert!(schema_desc_a.validate_structural_completeness().is_ok());
+    assert!(schema_desc_b.validate_structural_completeness().is_ok());
+    assert_eq!(schema_desc_a.identity(), id_a);
+    assert_eq!(schema_desc_b.identity(), id_b);
+
+    let mut enc_a = Vec::new();
+    schema_desc_a.encode(&mut enc_a);
+    let (dec_desc_a, len_a) = SchemaDescriptor::decode(&enc_a).unwrap();
+    assert_eq!(len_a, enc_a.len());
+    assert_eq!(dec_desc_a, schema_desc_a);
+
+    let mut enc_b = Vec::new();
+    schema_desc_b.encode(&mut enc_b);
+    let (dec_desc_b, len_b) = SchemaDescriptor::decode(&enc_b).unwrap();
+    assert_eq!(len_b, enc_b.len());
+    assert_eq!(dec_desc_b, schema_desc_b);
+
+    let event_a = f64_ordered_module::FloatPayloadEvent::Measurement {
+        sensor_id: 101,
+        value: OrderedF64::try_from(42.5f64).unwrap(),
+        label: EventString::new("pressure").unwrap(),
+    };
+    let mut payload_a = Vec::new();
+    event_a.encode_payload(&mut payload_a).unwrap();
+    let decoded_a = f64_ordered_module::FloatPayloadEvent::decode_payload(&payload_a).unwrap();
+    assert_eq!(decoded_a, event_a);
+
+    let event_b = f64_event_module::FloatPayloadEvent::Measurement {
+        sensor_id: 101,
+        value: EventF64::Finite(OrderedF64::try_from(42.5f64).unwrap()),
+        label: EventString::new("pressure").unwrap(),
+    };
+    let mut payload_b = Vec::new();
+    event_b.encode_payload(&mut payload_b).unwrap();
+    let decoded_b = f64_event_module::FloatPayloadEvent::decode_payload(&payload_b).unwrap();
+    assert_eq!(decoded_b, event_b);
+
+    let env_id = EnvelopeIdentity::from_raw([0x55; 32]);
+
+    let admission_ok_a = EventAdmission::Event {
+        descriptor: Some(&schema_desc_a),
+        expected_schema: &id_a,
+        actual_schema: &id_a,
+        expected_envelope: &env_id,
+        actual_envelope: &env_id,
+    };
+    assert!(admit_event(&admission_ok_a).is_ok());
+
+    let admission_ok_b = EventAdmission::Event {
+        descriptor: Some(&schema_desc_b),
+        expected_schema: &id_b,
+        actual_schema: &id_b,
+        expected_envelope: &env_id,
+        actual_envelope: &env_id,
+    };
+    assert!(admit_event(&admission_ok_b).is_ok());
+
+    let admission_mismatch = EventAdmission::Event {
+        descriptor: Some(&schema_desc_a),
+        expected_schema: &id_b,
+        actual_schema: &id_a,
+        expected_envelope: &env_id,
+        actual_envelope: &env_id,
+    };
+    let err = admit_event(&admission_mismatch).unwrap_err();
+    assert_eq!(err.condition(), &FailureCondition::SchemaMismatch);
+}
+
+#[test]
+fn test_f32_derived_payload_schema_identity_and_admission_mismatch() {
+    let desc_a = f32_ordered_module::FloatPayloadEvent::schema_descriptor();
+    let desc_b = f32_event_module::FloatPayloadEvent::schema_descriptor();
+    assert_ne!(desc_a, desc_b);
+
+    let id_a = f32_ordered_module::FloatPayloadEvent::schema_identity();
+    let id_b = f32_event_module::FloatPayloadEvent::schema_identity();
+    assert_ne!(id_a, id_b);
+
+    let schema_desc_a = SchemaDescriptor::new(1, desc_a);
+    let schema_desc_b = SchemaDescriptor::new(1, desc_b);
+    assert!(schema_desc_a.validate_structural_completeness().is_ok());
+    assert!(schema_desc_b.validate_structural_completeness().is_ok());
+    assert_eq!(schema_desc_a.identity(), id_a);
+    assert_eq!(schema_desc_b.identity(), id_b);
+
+    let mut enc_a = Vec::new();
+    schema_desc_a.encode(&mut enc_a);
+    let (dec_desc_a, len_a) = SchemaDescriptor::decode(&enc_a).unwrap();
+    assert_eq!(len_a, enc_a.len());
+    assert_eq!(dec_desc_a, schema_desc_a);
+
+    let mut enc_b = Vec::new();
+    schema_desc_b.encode(&mut enc_b);
+    let (dec_desc_b, len_b) = SchemaDescriptor::decode(&enc_b).unwrap();
+    assert_eq!(len_b, enc_b.len());
+    assert_eq!(dec_desc_b, schema_desc_b);
+
+    let event_a = f32_ordered_module::FloatPayloadEvent::Measurement {
+        sensor_id: 202,
+        value: OrderedF32::try_from(19.25f32).unwrap(),
+        label: EventString::new("temperature").unwrap(),
+    };
+    let mut payload_a = Vec::new();
+    event_a.encode_payload(&mut payload_a).unwrap();
+    let decoded_a = f32_ordered_module::FloatPayloadEvent::decode_payload(&payload_a).unwrap();
+    assert_eq!(decoded_a, event_a);
+
+    let event_b = f32_event_module::FloatPayloadEvent::Measurement {
+        sensor_id: 202,
+        value: EventF32::Finite(OrderedF32::try_from(19.25f32).unwrap()),
+        label: EventString::new("temperature").unwrap(),
+    };
+    let mut payload_b = Vec::new();
+    event_b.encode_payload(&mut payload_b).unwrap();
+    let decoded_b = f32_event_module::FloatPayloadEvent::decode_payload(&payload_b).unwrap();
+    assert_eq!(decoded_b, event_b);
+
+    let env_id = EnvelopeIdentity::from_raw([0x66; 32]);
+
+    let admission_ok_a = EventAdmission::Event {
+        descriptor: Some(&schema_desc_a),
+        expected_schema: &id_a,
+        actual_schema: &id_a,
+        expected_envelope: &env_id,
+        actual_envelope: &env_id,
+    };
+    assert!(admit_event(&admission_ok_a).is_ok());
+
+    let admission_ok_b = EventAdmission::Event {
+        descriptor: Some(&schema_desc_b),
+        expected_schema: &id_b,
+        actual_schema: &id_b,
+        expected_envelope: &env_id,
+        actual_envelope: &env_id,
+    };
+    assert!(admit_event(&admission_ok_b).is_ok());
+
+    let admission_mismatch = EventAdmission::Event {
+        descriptor: Some(&schema_desc_a),
+        expected_schema: &id_b,
+        actual_schema: &id_a,
+        expected_envelope: &env_id,
+        actual_envelope: &env_id,
+    };
+    let err = admit_event(&admission_mismatch).unwrap_err();
+    assert_eq!(err.condition(), &FailureCondition::SchemaMismatch);
+}

@@ -278,6 +278,125 @@
           "expected": "Success"
         }
       ]
+    },
+    {
+      "name": "deterministic_floats",
+      "description": "Deterministic float wrappers (OrderedF32, OrderedF64) and classification enums (EventF32, EventF64)",
+      "clause_citations": [
+        "C6.23"
+      ],
+      "cases": [
+        {
+          "type": "OrderedF32",
+          "ast_tag": "13",
+          "val": 1.0,
+          "bytes_hex": "0000803f",
+          "expected": "Success"
+        },
+        {
+          "type": "OrderedF64",
+          "ast_tag": "14",
+          "val": 1.0,
+          "bytes_hex": "000000000000f03f",
+          "expected": "Success"
+        },
+        {
+          "type": "OrderedF32",
+          "ast_tag": "13",
+          "description": "negative zero normalizes to +0.0",
+          "val": -0.0,
+          "bytes_hex": "00000080",
+          "expected_reencode_hex": "00000000",
+          "expected": "Success"
+        },
+        {
+          "type": "OrderedF64",
+          "ast_tag": "14",
+          "description": "negative zero normalizes to +0.0",
+          "val": -0.0,
+          "bytes_hex": "0000000000000080",
+          "expected_reencode_hex": "0000000000000000",
+          "expected": "Success"
+        },
+        {
+          "type": "OrderedF32",
+          "ast_tag": "13",
+          "description": "subnormal float rejected",
+          "bytes_hex": "01000000",
+          "expected": "DecodeError",
+          "error_kind": "NotReal"
+        },
+        {
+          "type": "OrderedF64",
+          "ast_tag": "14",
+          "description": "subnormal float rejected",
+          "bytes_hex": "0100000000000000",
+          "expected": "DecodeError",
+          "error_kind": "NotReal"
+        },
+        {
+          "type": "EventF32",
+          "variant": "NaN",
+          "bytes_hex": "00",
+          "expected": "Success"
+        },
+        {
+          "type": "EventF32",
+          "variant": "NegInf",
+          "bytes_hex": "01",
+          "expected": "Success"
+        },
+        {
+          "type": "EventF32",
+          "variant": "Finite",
+          "val": 1.0,
+          "bytes_hex": "020000803f",
+          "expected": "Success"
+        },
+        {
+          "type": "EventF32",
+          "variant": "PosInf",
+          "bytes_hex": "03",
+          "expected": "Success"
+        },
+        {
+          "type": "EventF64",
+          "variant": "NaN",
+          "bytes_hex": "00",
+          "expected": "Success"
+        },
+        {
+          "type": "EventF64",
+          "variant": "NegInf",
+          "bytes_hex": "01",
+          "expected": "Success"
+        },
+        {
+          "type": "EventF64",
+          "variant": "Finite",
+          "val": 1.0,
+          "bytes_hex": "02000000000000f03f",
+          "expected": "Success"
+        },
+        {
+          "type": "EventF64",
+          "variant": "PosInf",
+          "bytes_hex": "03",
+          "expected": "Success"
+        },
+        {
+          "type": "EventF32_descriptor",
+          "description": "full serialized composite enum descriptor bytes",
+          "bytes_hex": "10080000004576656e74463332010400000000030000004e614e0001060000004e6567496e6600020600000046696e697465130306000000506f73496e6600",
+          "expected": "Success"
+        },
+        {
+          "type": "EventF64_descriptor",
+          "description": "full serialized composite enum descriptor bytes",
+          "bytes_hex": "10080000004576656e74463634010400000000030000004e614e0001060000004e6567496e6600020600000046696e697465140306000000506f73496e6600",
+          "expected": "Success"
+        }
+      ]
     }
   ]
 }

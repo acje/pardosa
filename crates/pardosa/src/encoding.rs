@@ -94,7 +94,7 @@ pub enum DecodeError {
         /// Tag value encountered.
         tag: u8,
     },
-    /// Schema descriptor AST constructor tag is outside recognized range 0x01..=0x12.
+    /// Schema descriptor AST constructor tag is outside recognized range 0x01..=0x14.
     UnknownConstructorTag {
         /// Tag value encountered.
         tag: u8,
@@ -747,6 +747,87 @@ impl EventEnvelope {
     #[must_use]
     pub fn commitment(&self) -> [u8; 32] {
         compute_envelope_commitment(&self.header, &self.payload)
+    }
+
+    /// Constructs a genesis event envelope with precursor link zeroed per C4.19.
+    ///
+    /// # Errors
+    /// Returns [`DecodeError::ValueConstraintViolated`] with [`ValueConstraint::Empty`]
+    /// if `event_id` is all zeroes.
+    pub fn genesis(
+        event_id: [u8; 16],
+        fiber_id: [u8; 16],
+        payload: impl Into<Vec<u8>>,
+    ) -> Result<Self, DecodeError> {
+        if event_id == [0u8; 16] {
+            return Err(DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::Empty,
+            });
+        }
+        Ok(Self {
+            header: EnvelopeHeader {
+                event_id,
+                fiber_id,
+                detached: false,
+                precursor: [0u8; 16],
+                precursor_hash: [0u8; 32],
+            },
+            payload: payload.into(),
+        })
+    }
+
+    /// Chains a child event envelope to an existing predecessor in the same fiber.
+    ///
+    /// # Errors
+    /// Returns [`DecodeError::ValueConstraintViolated`] with [`ValueConstraint::Empty`]
+    /// if `event_id` or `predecessor.header.event_id` is all zeroes.
+    pub fn chain(
+        predecessor: &EventEnvelope,
+        event_id: [u8; 16],
+        payload: impl Into<Vec<u8>>,
+    ) -> Result<Self, DecodeError> {
+        if event_id == [0u8; 16] || predecessor.header.event_id == [0u8; 16] {
+            return Err(DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::Empty,
+            });
+        }
+        Ok(Self {
+            header: EnvelopeHeader {
+                event_id,
+                fiber_id: predecessor.header.fiber_id,
+                detached: false,
+                precursor: predecessor.header.event_id,
+                precursor_hash: predecessor.commitment(),
+            },
+            payload: payload.into(),
+        })
+    }
+
+    /// Chains a detached child event envelope to an existing predecessor in the same fiber.
+    ///
+    /// # Errors
+    /// Returns [`DecodeError::ValueConstraintViolated`] with [`ValueConstraint::Empty`]
+    /// if `event_id` or `predecessor.header.event_id` is all zeroes.
+    pub fn chain_detached(
+        predecessor: &EventEnvelope,
+        event_id: [u8; 16],
+        payload: impl Into<Vec<u8>>,
+    ) -> Result<Self, DecodeError> {
+        if event_id == [0u8; 16] || predecessor.header.event_id == [0u8; 16] {
+            return Err(DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::Empty,
+            });
+        }
+        Ok(Self {
+            header: EnvelopeHeader {
+                event_id,
+                fiber_id: predecessor.header.fiber_id,
+                detached: true,
+                precursor: predecessor.header.event_id,
+                precursor_hash: predecessor.commitment(),
+            },
+            payload: payload.into(),
+        })
     }
 }
 
@@ -1505,5 +1586,161 @@ mod tests {
             assert_eq!(consumed, buf.len());
             assert_eq!(decoded, rec);
         }
+    }
+
+    #[test]
+    fn test_envelope_genesis_chain_and_chain_detached() {
+        let event_id_1 = [1u8; 16];
+        let event_id_2 = [2u8; 16];
+        let event_id_3 = [3u8; 16];
+        let fiber_id = [9u8; 16];
+
+        let genesis =
+            EventEnvelope::genesis(event_id_1, fiber_id, b"genesis payload".to_vec()).unwrap();
+        assert_eq!(genesis.header.event_id, event_id_1);
+        assert_eq!(genesis.header.fiber_id, fiber_id);
+        assert!(!genesis.header.detached);
+        assert_eq!(genesis.header.precursor, [0u8; 16]);
+        assert_eq!(genesis.header.precursor_hash, [0u8; 32]);
+        assert_eq!(genesis.payload, b"genesis payload");
+
+        let chained =
+            EventEnvelope::chain(&genesis, event_id_2, b"chained payload".to_vec()).unwrap();
+        assert_eq!(chained.header.event_id, event_id_2);
+        assert_eq!(chained.header.fiber_id, fiber_id);
+        assert!(!chained.header.detached);
+        assert_eq!(chained.header.precursor, event_id_1);
+        assert_eq!(chained.header.precursor_hash, genesis.commitment());
+        assert_eq!(chained.payload, b"chained payload");
+
+        let detached =
+            EventEnvelope::chain_detached(&chained, event_id_3, b"detached payload".to_vec())
+                .unwrap();
+        assert_eq!(detached.header.event_id, event_id_3);
+        assert_eq!(detached.header.fiber_id, fiber_id);
+        assert!(detached.header.detached);
+        assert_eq!(detached.header.precursor, event_id_2);
+        assert_eq!(detached.header.precursor_hash, chained.commitment());
+        assert_eq!(detached.payload, b"detached payload");
+
+        let genesis_link =
+            crate::store::PrecursorLink::classify(&genesis).expect("genesis link classify");
+        assert!(genesis_link.is_genesis());
+        assert!(crate::store::admit_precursor_link(&fiber_id, &genesis_link, |_| None).is_ok());
+
+        let chained_link =
+            crate::store::PrecursorLink::classify(&chained).expect("chained link classify");
+        assert!(!chained_link.is_genesis());
+        assert!(
+            crate::store::admit_precursor_link(&fiber_id, &chained_link, |id| {
+                if *id == event_id_1 {
+                    Some(&genesis)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+        );
+
+        let detached_link =
+            crate::store::PrecursorLink::classify(&detached).expect("detached link classify");
+        assert!(!detached_link.is_genesis());
+        assert!(
+            crate::store::admit_precursor_link(&fiber_id, &detached_link, |id| {
+                if *id == event_id_2 {
+                    Some(&chained)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_envelope_zero_id_rejections() {
+        let zero_id = [0u8; 16];
+        let valid_id_1 = [1u8; 16];
+        let valid_id_2 = [2u8; 16];
+        let valid_id_3 = [3u8; 16];
+        let fiber_id = [9u8; 16];
+
+        let err_genesis =
+            EventEnvelope::genesis(zero_id, fiber_id, b"payload".to_vec()).unwrap_err();
+        assert_eq!(
+            err_genesis,
+            DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::Empty,
+            }
+        );
+
+        let valid_genesis =
+            EventEnvelope::genesis(valid_id_1, fiber_id, b"genesis payload".to_vec()).unwrap();
+
+        let err_chain_zero =
+            EventEnvelope::chain(&valid_genesis, zero_id, b"payload".to_vec()).unwrap_err();
+        assert_eq!(
+            err_chain_zero,
+            DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::Empty,
+            }
+        );
+
+        let err_chain_detached_zero =
+            EventEnvelope::chain_detached(&valid_genesis, zero_id, b"payload".to_vec())
+                .unwrap_err();
+        assert_eq!(
+            err_chain_detached_zero,
+            DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::Empty,
+            }
+        );
+
+        let zero_pred = EventEnvelope {
+            header: EnvelopeHeader {
+                event_id: zero_id,
+                fiber_id,
+                detached: false,
+                precursor: [0u8; 16],
+                precursor_hash: [0u8; 32],
+            },
+            payload: b"zero predecessor".to_vec(),
+        };
+
+        let err_chain_pred_zero =
+            EventEnvelope::chain(&zero_pred, valid_id_2, b"payload".to_vec()).unwrap_err();
+        assert_eq!(
+            err_chain_pred_zero,
+            DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::Empty,
+            }
+        );
+
+        let err_chain_detached_pred_zero =
+            EventEnvelope::chain_detached(&zero_pred, valid_id_2, b"payload".to_vec()).unwrap_err();
+        assert_eq!(
+            err_chain_detached_pred_zero,
+            DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::Empty,
+            }
+        );
+
+        let chained =
+            EventEnvelope::chain(&valid_genesis, valid_id_2, b"chained payload".to_vec()).unwrap();
+        let detached =
+            EventEnvelope::chain_detached(&chained, valid_id_3, b"detached payload".to_vec())
+                .unwrap();
+
+        let gen_link = crate::store::PrecursorLink::classify(&valid_genesis)
+            .expect("valid genesis must classify");
+        assert!(gen_link.is_genesis());
+
+        let chained_link =
+            crate::store::PrecursorLink::classify(&chained).expect("valid chained must classify");
+        assert!(!chained_link.is_genesis());
+
+        let detached_link =
+            crate::store::PrecursorLink::classify(&detached).expect("valid detached must classify");
+        assert!(!detached_link.is_genesis());
     }
 }

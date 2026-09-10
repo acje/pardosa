@@ -493,6 +493,150 @@ fn test_descriptors_conformance_vectors() {
                     }
                 }
             }
+            "deterministic_floats" => {
+                for c in cases {
+                    let ty = c["type"].as_str().unwrap();
+                    let bytes = hex::decode(c["bytes_hex"].as_str().unwrap()).unwrap();
+                    let expected = c["expected"].as_str().unwrap();
+
+                    if let Some(ast_tag_str) = c.get("ast_tag").and_then(|v| v.as_str()) {
+                        let tag = u8::from_str_radix(ast_tag_str, 16).unwrap();
+                        let desc_node = match ty {
+                            "OrderedF32" => DescriptorNode::OrderedF32,
+                            "OrderedF64" => DescriptorNode::OrderedF64,
+                            other => panic!("unexpected ast_tag for type {}", other),
+                        };
+                        assert_eq!(desc_node.constructor_tag(), tag);
+                        let (decoded, consumed) = DescriptorNode::decode(&[tag]).unwrap();
+                        assert_eq!(consumed, 1);
+                        assert_eq!(decoded, desc_node);
+                    }
+
+                    match ty {
+                        "OrderedF32" => {
+                            if expected == "Success" {
+                                let (val, consumed) = OrderedF32::decode_type(&bytes).unwrap();
+                                assert_eq!(consumed, 4);
+                                if let Some(reencode_hex) =
+                                    c.get("expected_reencode_hex").and_then(|v| v.as_str())
+                                {
+                                    let mut enc = Vec::new();
+                                    val.encode_type(&mut enc).unwrap();
+                                    assert_eq!(hex::encode(&enc), reencode_hex);
+                                    assert_eq!(val.get().to_bits(), 0.0f32.to_bits());
+                                } else {
+                                    assert_eq!(val.get(), c["val"].as_f64().unwrap() as f32);
+                                    let mut enc = Vec::new();
+                                    val.encode_type(&mut enc).unwrap();
+                                    assert_eq!(enc, bytes);
+                                }
+                            } else {
+                                let err = OrderedF32::decode_type(&bytes).unwrap_err();
+                                assert_eq!(err.error_kind(), c["error_kind"].as_str().unwrap());
+                            }
+                        }
+                        "OrderedF64" => {
+                            if expected == "Success" {
+                                let (val, consumed) = OrderedF64::decode_type(&bytes).unwrap();
+                                assert_eq!(consumed, 8);
+                                if let Some(reencode_hex) =
+                                    c.get("expected_reencode_hex").and_then(|v| v.as_str())
+                                {
+                                    let mut enc = Vec::new();
+                                    val.encode_type(&mut enc).unwrap();
+                                    assert_eq!(hex::encode(&enc), reencode_hex);
+                                    assert_eq!(val.get().to_bits(), 0.0f64.to_bits());
+                                } else {
+                                    assert_eq!(val.get(), c["val"].as_f64().unwrap());
+                                    let mut enc = Vec::new();
+                                    val.encode_type(&mut enc).unwrap();
+                                    assert_eq!(enc, bytes);
+                                }
+                            } else {
+                                let err = OrderedF64::decode_type(&bytes).unwrap_err();
+                                assert_eq!(err.error_kind(), c["error_kind"].as_str().unwrap());
+                            }
+                        }
+                        "EventF32" => {
+                            if expected == "Success" {
+                                let (val, consumed) = EventF32::decode_type(&bytes).unwrap();
+                                assert_eq!(consumed, bytes.len());
+                                let variant = c["variant"].as_str().unwrap();
+                                match variant {
+                                    "NaN" => assert_eq!(val, EventF32::NaN),
+                                    "NegInf" => assert_eq!(val, EventF32::NegInf),
+                                    "Finite" => {
+                                        let expected_num = c["val"].as_f64().unwrap() as f32;
+                                        let expected_ordered =
+                                            OrderedF32::try_from(expected_num).unwrap();
+                                        assert_eq!(val, EventF32::Finite(expected_ordered));
+                                    }
+                                    "PosInf" => assert_eq!(val, EventF32::PosInf),
+                                    other => panic!("unexpected EventF32 variant: {}", other),
+                                }
+                                let mut enc = Vec::new();
+                                val.encode_type(&mut enc).unwrap();
+                                assert_eq!(enc, bytes);
+                            } else {
+                                let err = EventF32::decode_type(&bytes).unwrap_err();
+                                assert_eq!(err.error_kind(), c["error_kind"].as_str().unwrap());
+                            }
+                        }
+                        "EventF64" => {
+                            if expected == "Success" {
+                                let (val, consumed) = EventF64::decode_type(&bytes).unwrap();
+                                assert_eq!(consumed, bytes.len());
+                                let variant = c["variant"].as_str().unwrap();
+                                match variant {
+                                    "NaN" => assert_eq!(val, EventF64::NaN),
+                                    "NegInf" => assert_eq!(val, EventF64::NegInf),
+                                    "Finite" => {
+                                        let expected_num = c["val"].as_f64().unwrap();
+                                        let expected_ordered =
+                                            OrderedF64::try_from(expected_num).unwrap();
+                                        assert_eq!(val, EventF64::Finite(expected_ordered));
+                                    }
+                                    "PosInf" => assert_eq!(val, EventF64::PosInf),
+                                    other => panic!("unexpected EventF64 variant: {}", other),
+                                }
+                                let mut enc = Vec::new();
+                                val.encode_type(&mut enc).unwrap();
+                                assert_eq!(enc, bytes);
+                            } else {
+                                let err = EventF64::decode_type(&bytes).unwrap_err();
+                                assert_eq!(err.error_kind(), c["error_kind"].as_str().unwrap());
+                            }
+                        }
+                        "EventF32_descriptor" => {
+                            if expected == "Success" {
+                                let (node, consumed) = DescriptorNode::decode(&bytes).unwrap();
+                                assert_eq!(consumed, bytes.len());
+                                assert_eq!(node, EventF32::descriptor_node());
+                                let mut enc = Vec::new();
+                                node.encode(&mut enc);
+                                assert_eq!(enc, bytes);
+                            } else {
+                                let err = DescriptorNode::decode(&bytes).unwrap_err();
+                                assert_eq!(err.error_kind(), c["error_kind"].as_str().unwrap());
+                            }
+                        }
+                        "EventF64_descriptor" => {
+                            if expected == "Success" {
+                                let (node, consumed) = DescriptorNode::decode(&bytes).unwrap();
+                                assert_eq!(consumed, bytes.len());
+                                assert_eq!(node, EventF64::descriptor_node());
+                                let mut enc = Vec::new();
+                                node.encode(&mut enc);
+                                assert_eq!(enc, bytes);
+                            } else {
+                                let err = DescriptorNode::decode(&bytes).unwrap_err();
+                                assert_eq!(err.error_kind(), c["error_kind"].as_str().unwrap());
+                            }
+                        }
+                        other => panic!("unknown float type: {}", other),
+                    }
+                }
+            }
             other => panic!("unknown vector topic: {}", other),
         }
     }

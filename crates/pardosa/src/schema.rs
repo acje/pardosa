@@ -6,6 +6,9 @@ use crate::encoding::{
 };
 use crate::store::{FailureCondition, OperationFailure};
 
+mod floats;
+pub use floats::{EventF32, EventF64, OrderedF32, OrderedF64};
+
 /// Maximum recursion depth allowed during descriptor AST decoding to prevent cycles.
 pub const MAX_DESCRIPTOR_DEPTH: usize = 64;
 
@@ -30,6 +33,11 @@ pub struct VariantDescriptor {
 }
 
 /// Complete S3 admitted constructor vocabulary AST per C6.23.
+///
+/// In Pardosa 0.5.2, deterministic float scalar leaves `OrderedF32` (tag `0x13`) and `OrderedF64` (tag `0x14`)
+/// are admitted, representing normalized non-subnormal finite numbers and positive zero. The classification
+/// enums `EventF32` and `EventF64` are represented as composite `Enum` descriptors (tag `0x10`) with a 1-byte
+/// discriminant and four variants: `NaN` (0), `NegInf` (1), `Finite` (2, payload `OrderedF32`/`OrderedF64`), and `PosInf` (3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DescriptorNode {
     /// 0x01: Unsigned 8-bit integer.
@@ -97,6 +105,10 @@ pub enum DescriptorNode {
     Timestamp,
     /// 0x12: 128-bit UUID.
     Uuid,
+    /// 0x13: Deterministic IEEE-754 32-bit floating point value (normalized, non-subnormal finite or +0.0).
+    OrderedF32,
+    /// 0x14: Deterministic IEEE-754 64-bit floating point value (normalized, non-subnormal finite or +0.0).
+    OrderedF64,
 }
 
 impl DescriptorNode {
@@ -122,6 +134,8 @@ impl DescriptorNode {
             Self::Enum { .. } => 0x10,
             Self::Timestamp => 0x11,
             Self::Uuid => 0x12,
+            Self::OrderedF32 => 0x13,
+            Self::OrderedF64 => 0x14,
         }
     }
 
@@ -139,7 +153,9 @@ impl DescriptorNode {
             | Self::I64
             | Self::Bool
             | Self::Timestamp
-            | Self::Uuid => {}
+            | Self::Uuid
+            | Self::OrderedF32
+            | Self::OrderedF64 => {}
             Self::EventString { max_bytes }
             | Self::NonEmptyEventString { max_bytes }
             | Self::EventBytes { max_bytes } => {
@@ -196,7 +212,7 @@ impl DescriptorNode {
     ///
     /// # Errors
     /// Returns `DecodeError::TruncatedPayload` if bytes are truncated.
-    /// Returns `DecodeError::UnknownConstructorTag` if tag is outside 0x01..=0x12.
+    /// Returns `DecodeError::UnknownConstructorTag` if tag is outside 0x01..=0x14.
     /// Returns `DecodeError::CycleDetected` if depth exceeds `MAX_DESCRIPTOR_DEPTH`.
     pub fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
         Self::decode_recursive(buf, 0)
@@ -482,6 +498,8 @@ impl DescriptorNode {
             }
             0x11 => Ok((Self::Timestamp, 1)),
             0x12 => Ok((Self::Uuid, 1)),
+            0x13 => Ok((Self::OrderedF32, 1)),
+            0x14 => Ok((Self::OrderedF64, 1)),
             other => Err(DecodeError::UnknownConstructorTag { tag: other }),
         }
     }
@@ -568,7 +586,9 @@ impl DescriptorNode {
             | Self::I64
             | Self::Bool
             | Self::Timestamp
-            | Self::Uuid => Ok(()),
+            | Self::Uuid
+            | Self::OrderedF32
+            | Self::OrderedF64 => Ok(()),
             Self::EventString { max_bytes }
             | Self::NonEmptyEventString { max_bytes }
             | Self::EventBytes { max_bytes } => {
@@ -681,12 +701,22 @@ impl SchemaIdentity {
     #[must_use]
     pub fn to_hex(&self) -> String {
         let mut s = String::with_capacity(64);
-        for b in &self.0 {
-            use std::fmt::Write;
-            let _ = write!(s, "{:02x}", b);
+        const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+        for &b in &self.0 {
+            s.push(HEX_CHARS[(b >> 4) as usize] as char);
+            s.push(HEX_CHARS[(b & 0x0F) as usize] as char);
         }
         s
     }
+}
+
+/// Derives a 16-byte fiber identifier from a domain key string using canonical domain separation.
+#[must_use]
+pub fn derive_fiber_id(domain_key: &str) -> [u8; 16] {
+    let key_material = blake3::derive_key("pardosa.fiber_id.v1", domain_key.as_bytes());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&key_material[..16]);
+    out
 }
 
 /// Trait implemented by payload types declaring schema descriptor and codecs.
@@ -1083,6 +1113,8 @@ mod tests {
             DescriptorNode::Bool,
             DescriptorNode::Timestamp,
             DescriptorNode::Uuid,
+            DescriptorNode::OrderedF32,
+            DescriptorNode::OrderedF64,
             DescriptorNode::EventString { max_bytes: 128 },
             DescriptorNode::NonEmptyEventString { max_bytes: 64 },
             DescriptorNode::EventBytes { max_bytes: 256 },
@@ -1177,11 +1209,28 @@ mod tests {
         let err0 = DescriptorNode::decode(&[0x00]).unwrap_err();
         assert_eq!(err0, DecodeError::UnknownConstructorTag { tag: 0x00 });
 
-        let err13 = DescriptorNode::decode(&[0x13]).unwrap_err();
-        assert_eq!(err13, DecodeError::UnknownConstructorTag { tag: 0x13 });
+        let err15 = DescriptorNode::decode(&[0x15]).unwrap_err();
+        assert_eq!(err15, DecodeError::UnknownConstructorTag { tag: 0x15 });
 
         let err_ff = DescriptorNode::decode(&[0xFF]).unwrap_err();
         assert_eq!(err_ff, DecodeError::UnknownConstructorTag { tag: 0xFF });
+    }
+
+    #[test]
+    fn test_ordered_float_descriptor_roundtrip() {
+        let mut buf = Vec::new();
+        DescriptorNode::OrderedF32.encode(&mut buf);
+        assert_eq!(buf, vec![0x13]);
+        let (node32, consumed32) = DescriptorNode::decode(&buf).unwrap();
+        assert_eq!(consumed32, 1);
+        assert_eq!(node32, DescriptorNode::OrderedF32);
+
+        let mut buf64 = Vec::new();
+        DescriptorNode::OrderedF64.encode(&mut buf64);
+        assert_eq!(buf64, vec![0x14]);
+        let (node64, consumed64) = DescriptorNode::decode(&buf64).unwrap();
+        assert_eq!(consumed64, 1);
+        assert_eq!(node64, DescriptorNode::OrderedF64);
     }
 
     #[test]
@@ -1209,5 +1258,21 @@ mod tests {
 
         let err = DescriptorNode::decode(&buf).unwrap_err();
         assert_eq!(err.error_kind(), "CycleDetected");
+    }
+
+    #[test]
+    fn test_derive_fiber_id() {
+        let key1 = "account.us-east.98765";
+        let fiber_id_1 = derive_fiber_id(key1);
+        let fiber_id_1_again = derive_fiber_id(key1);
+        assert_eq!(fiber_id_1, fiber_id_1_again);
+        assert_ne!(fiber_id_1, [0u8; 16]);
+
+        let key2 = "account.us-west.98765";
+        let fiber_id_2 = derive_fiber_id(key2);
+        assert_ne!(fiber_id_1, fiber_id_2);
+
+        let expected_key = blake3::derive_key("pardosa.fiber_id.v1", key1.as_bytes());
+        assert_eq!(fiber_id_1, expected_key[..16]);
     }
 }
