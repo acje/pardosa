@@ -9,7 +9,11 @@ pub use crate::encoding::{
 };
 pub use crate::file::{
     ContainerFrame, ContainerHeader, FileExclusionPolicy, FileReaderSession, FileStorageAdapter,
-    FileWriterSession, RollingCommitment,
+    FileWriterSession, MetaRecords, RollingCommitment,
+};
+pub use crate::migration::{
+    BrokenChainElection, CutoverSummary, MigrationManager, MigrationPhase, MigrationSource,
+    MigrationTarget,
 };
 pub use crate::schema::{
     DescriptorNode, FieldDescriptor, PardosaSchema, PardosaType, SchemaDescriptor, SchemaIdentity,

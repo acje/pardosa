@@ -411,3 +411,56 @@ fn test_nats_format_vectors_roundtrip() {
 
     adapter.delete_streams().expect("cleanup");
 }
+
+#[test]
+fn test_nats_adapter_retirement_and_generation_records() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("retired_nats");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
+    let claim = sample_claim(1);
+
+    let mut writer = adapter.create(&claim).expect("create writer");
+    let env = EventEnvelope {
+        header: EnvelopeHeader {
+            event_id: [0x01; 16],
+            fiber_id: [0xaa; 16],
+            detached: false,
+            precursor: [0u8; 16],
+            precursor_hash: [0u8; 32],
+        },
+        payload: b"sample nats payload".to_vec(),
+    };
+    writer.append_envelope(&env).expect("append envelope");
+
+    let outbound = OutboundPointerRecord {
+        next_generation_locator_id: [99u8; 16],
+        cutover_epoch: 1,
+    };
+    adapter
+        .record_outbound_pointer(&outbound)
+        .expect("record outbound pointer");
+
+    let err_new_writer = adapter
+        .open_write(1)
+        .expect_err("new writer must be rejected");
+    assert_eq!(
+        *err_new_writer.condition(),
+        FailureCondition::RetiredMigrationSource
+    );
+
+    let err_append = writer
+        .append_envelope(&env)
+        .expect_err("existing writer append must be rejected");
+    assert_eq!(
+        *err_append.condition(),
+        FailureCondition::RetiredMigrationSource
+    );
+
+    let mut reader = adapter.open_read().expect("historical read must succeed");
+    assert!(reader.is_retired_source());
+    assert_eq!(reader.outbound_pointer(), Some(&outbound));
+    let frames = reader.read_all_envelopes().expect("read frames");
+    assert_eq!(frames.len(), 1);
+
+    adapter.delete_streams().expect("cleanup");
+}

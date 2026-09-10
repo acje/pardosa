@@ -4,6 +4,7 @@
 
 pub mod encoding;
 pub mod file;
+pub mod migration;
 pub mod prelude;
 pub mod schema;
 pub mod store;

@@ -43,6 +43,9 @@ fn is_wrong_last_sequence(err: &async_nats::jetstream::context::PublishError) ->
     msg.contains("wrong last sequence") || msg.contains("10071") || msg.contains("10164")
 }
 
+/// All decoded ownership records found in an artefact's meta stream.
+pub type NatsMetaRecords = MetaRecords;
+
 async fn stream_exists(js: &async_nats::jetstream::Context, stream_name: &str) -> bool {
     js.get_stream(stream_name).await.is_ok()
 }
@@ -50,10 +53,10 @@ async fn stream_exists(js: &async_nats::jetstream::Context, stream_name: &str) -
 async fn read_meta_records_async(
     js: &async_nats::jetstream::Context,
     meta_stream_name: &str,
-) -> Result<(Option<OwnershipClaimRecord>, Option<SchemaDescriptor>), OperationFailure> {
+) -> Result<NatsMetaRecords, OperationFailure> {
     let mut stream = match js.get_stream(meta_stream_name).await {
         Ok(s) => s,
-        Err(_) => return Ok((None, None)),
+        Err(_) => return Ok(NatsMetaRecords::default()),
     };
     let info = match stream.info().await {
         Ok(info) => info,
@@ -65,12 +68,11 @@ async fn read_meta_records_async(
         }
     };
     if info.state.messages == 0 {
-        return Ok((None, None));
+        return Ok(NatsMetaRecords::default());
     }
     let first = info.state.first_sequence;
     let last = info.state.last_sequence;
-    let mut latest_claim = None;
-    let mut schema_descriptor = None;
+    let mut records = NatsMetaRecords::default();
     for seq in first..=last {
         let raw = match stream.get_raw_message(seq).await {
             Ok(msg) => msg,
@@ -92,21 +94,37 @@ async fn read_meta_records_async(
         if let Ok((record, _)) = OwnershipRecord::decode(&payload) {
             match record {
                 OwnershipRecord::OwnershipClaim(claim) => {
-                    latest_claim = Some(claim);
+                    records.latest_claim = Some(claim);
                 }
                 OwnershipRecord::SchemaDescriptor {
                     schema_version,
                     descriptor_bytes,
                 } => {
                     if let Ok((root, _)) = DescriptorNode::decode(&descriptor_bytes) {
-                        schema_descriptor = Some(SchemaDescriptor::new(schema_version, root));
+                        records.schema_descriptor =
+                            Some(SchemaDescriptor::new(schema_version, root));
                     }
+                }
+                OwnershipRecord::OutboundPointer(p) => {
+                    records.outbound_pointer = Some(p);
+                }
+                OwnershipRecord::InboundPointer(p) => {
+                    records.inbound_pointer = Some(p);
+                }
+                OwnershipRecord::MigrationStart(m) => {
+                    records.migration_start = Some(m);
+                }
+                OwnershipRecord::MigrationEnd(m) => {
+                    records.migration_end = Some(m);
+                }
+                OwnershipRecord::RescuePolicyChoice(r) => {
+                    records.rescue_policy_choice = Some(r);
                 }
                 _ => {}
             }
         }
     }
-    Ok((latest_claim, schema_descriptor))
+    Ok(records)
 }
 
 async fn read_data_frames_async(
@@ -273,6 +291,24 @@ impl NatsStorageAdapter {
     #[must_use]
     pub fn stem(&self) -> &str {
         &self.stem
+    }
+
+    /// Returns the 16-byte locator identifier derived from the stem.
+    #[must_use]
+    pub fn locator_id(&self) -> [u8; 16] {
+        let hash = blake3::hash(self.stem.as_bytes());
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&hash.as_bytes()[0..16]);
+        id
+    }
+
+    /// Returns the current monotonic epoch for this artefact from the meta stream.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if reading fails.
+    pub fn current_epoch(&self) -> Result<u64, OperationFailure> {
+        let meta = self.read_meta_records()?;
+        Ok(meta.latest_claim.map_or(0, |c| c.epoch))
     }
 
     /// Returns the ownership record stream name (`{stem}_meta`).
@@ -734,10 +770,16 @@ impl NatsStorageAdapter {
             ArtefactPresence::OwnershipRecordOnly => {
                 let js_meta = self.js.clone();
                 let meta_name = self.meta_stream_name.clone();
-                let (claim_opt, _) = run_future(&handle, async move {
+                let meta = run_future(&handle, async move {
                     read_meta_records_async(&js_meta, &meta_name).await
                 })?;
-                let claim = claim_opt.ok_or_else(|| {
+                if meta.outbound_pointer.is_some() {
+                    return Err(OperationFailure::new(
+                        FailureCondition::RetiredMigrationSource,
+                        "artefact append authority permanently retired via outbound pointer per C5.63",
+                    ));
+                }
+                let claim = meta.latest_claim.ok_or_else(|| {
                     OperationFailure::new(
                         FailureCondition::OwnershipUnestablished,
                         "ownership record unseeded; cannot open writer session without established claim per C5.10",
@@ -756,10 +798,16 @@ impl NatsStorageAdapter {
 
         let js_meta = self.js.clone();
         let meta_name = self.meta_stream_name.clone();
-        let (claim_opt, _) = run_future(&handle, async move {
+        let meta = run_future(&handle, async move {
             read_meta_records_async(&js_meta, &meta_name).await
         })?;
-        let claim = claim_opt.ok_or_else(|| {
+        if meta.outbound_pointer.is_some() {
+            return Err(OperationFailure::new(
+                FailureCondition::RetiredMigrationSource,
+                "artefact append authority permanently retired via outbound pointer per C5.63",
+            ));
+        }
+        let claim = meta.latest_claim.ok_or_else(|| {
             OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
                 "no ownership claim found in meta stream per C5.12",
@@ -830,22 +878,73 @@ impl NatsStorageAdapter {
         let js = self.js.clone();
         let meta_name = self.meta_stream_name.clone();
         let handle = self.runtime.handle().clone();
-        let (claim_opt, schema_opt) = run_future(&handle, async move {
+        let meta_records = run_future(&handle, async move {
             read_meta_records_async(&js, &meta_name).await
         })?;
 
-        let admission = admit_open(presence, claim_opt.clone(), false)?;
+        let admission = admit_open(presence, meta_records.latest_claim.clone(), false)?;
 
         Ok(NatsReaderSession {
             stem: self.stem.clone(),
             meta_stream_name: self.meta_stream_name.clone(),
             data_stream_name: self.data_stream_name.clone(),
             admission,
-            claim: claim_opt,
-            schema_descriptor: schema_opt,
+            meta_records,
             rolling_commitment: RollingCommitment::new(),
             js: self.js.clone(),
             runtime: self.runtime.clone(),
+        })
+    }
+
+    /// Reads all ownership records from the meta stream.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if reading fails.
+    pub fn read_meta_records(&self) -> Result<NatsMetaRecords, OperationFailure> {
+        let js = self.js.clone();
+        let meta_name = self.meta_stream_name.clone();
+        let handle = self.runtime.handle().clone();
+        run_future(&handle, async move {
+            read_meta_records_async(&js, &meta_name).await
+        })
+    }
+
+    /// Appends an arbitrary ownership record to the meta stream.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_ownership_record(
+        &self,
+        record: &OwnershipRecord,
+    ) -> Result<(), OperationFailure> {
+        let js = self.js.clone();
+        let meta_name = self.meta_stream_name.clone();
+        let record_clone = record.clone();
+        let handle = self.runtime.handle().clone();
+
+        run_future(&handle, async move {
+            let mut record_bytes = Vec::new();
+            record_clone.encode(&mut record_bytes);
+            let mut record_frame = Vec::new();
+            ContainerFrame::encode_payload(&record_bytes, &mut record_frame);
+
+            js.publish(meta_name.clone(), record_frame.into())
+                .await
+                .map_err(|err| {
+                    OperationFailure::new(
+                        FailureCondition::OwnershipRecordUnreadable,
+                        format!("failed to publish meta frame: {err}"),
+                    )
+                })?
+                .await
+                .map_err(|err| {
+                    OperationFailure::new(
+                        FailureCondition::OwnershipRecordUnreadable,
+                        format!("failed to ack meta frame: {err}"),
+                    )
+                })?;
+
+            Ok(())
         })
     }
 
@@ -857,35 +956,86 @@ impl NatsStorageAdapter {
         &self,
         claim: &OwnershipClaimRecord,
     ) -> Result<(), OperationFailure> {
-        let js = self.js.clone();
-        let meta_name = self.meta_stream_name.clone();
-        let claim_clone = claim.clone();
-        let handle = self.runtime.handle().clone();
+        self.record_ownership_record(&OwnershipRecord::OwnershipClaim(claim.clone()))
+    }
 
-        run_future(&handle, async move {
-            let mut claim_bytes = Vec::new();
-            OwnershipRecord::OwnershipClaim(claim_clone).encode(&mut claim_bytes);
-            let mut claim_frame = Vec::new();
-            ContainerFrame::encode_payload(&claim_bytes, &mut claim_frame);
+    /// Appends an outbound generation pointer record to the meta stream per C6.17 and C5.63.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_outbound_pointer(
+        &self,
+        pointer: &OutboundPointerRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_ownership_record(&OwnershipRecord::OutboundPointer(pointer.clone()))
+    }
 
-            js.publish(meta_name.clone(), claim_frame.into())
-                .await
-                .map_err(|err| {
-                    OperationFailure::new(
-                        FailureCondition::OwnershipRecordUnreadable,
-                        format!("failed to publish claim frame: {err}"),
-                    )
-                })?
-                .await
-                .map_err(|err| {
-                    OperationFailure::new(
-                        FailureCondition::OwnershipRecordUnreadable,
-                        format!("failed to ack claim frame: {err}"),
-                    )
-                })?;
+    /// Appends an inbound generation pointer record to the meta stream per C6.16.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_inbound_pointer(
+        &self,
+        pointer: &InboundPointerRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_ownership_record(&OwnershipRecord::InboundPointer(pointer.clone()))
+    }
 
-            Ok(())
-        })
+    /// Appends a migration start record to the meta stream per C4.13.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_migration_start(
+        &self,
+        start: &MigrationStartRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_ownership_record(&OwnershipRecord::MigrationStart(start.clone()))
+    }
+
+    /// Appends a migration end record to the meta stream per C4.13.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_migration_end(&self, end: &MigrationEndRecord) -> Result<(), OperationFailure> {
+        self.record_ownership_record(&OwnershipRecord::MigrationEnd(end.clone()))
+    }
+
+    /// Appends a rescue policy choice record to the meta stream per C4.13.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_rescue_policy_choice(
+        &self,
+        choice: &RescuePolicyChoiceRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_ownership_record(&OwnershipRecord::RescuePolicyChoice(choice.clone()))
+    }
+
+    /// Queries the outbound generation pointer if present.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if reading fails.
+    pub fn outbound_pointer(&self) -> Result<Option<OutboundPointerRecord>, OperationFailure> {
+        let meta = self.read_meta_records()?;
+        Ok(meta.outbound_pointer)
+    }
+
+    /// Queries the inbound generation pointer if present.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if reading fails.
+    pub fn inbound_pointer(&self) -> Result<Option<InboundPointerRecord>, OperationFailure> {
+        let meta = self.read_meta_records()?;
+        Ok(meta.inbound_pointer)
+    }
+
+    /// Returns true if this artefact is a retired migration source per C5.63.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if reading fails.
+    pub fn is_retired_source(&self) -> Result<bool, OperationFailure> {
+        let meta = self.read_meta_records()?;
+        Ok(meta.outbound_pointer.is_some())
     }
 
     /// Deletes both artefact streams from JetStream.
@@ -1020,10 +1170,16 @@ impl NatsWriterSession {
         let meta_name = self.meta_stream_name.clone();
         let handle = self.runtime.handle().clone();
 
-        let (claim_opt, _) = run_future(&handle, async move {
+        let meta = run_future(&handle, async move {
             read_meta_records_async(&js_meta, &meta_name).await
         })?;
-        let latest_claim = claim_opt.ok_or_else(|| {
+        if meta.outbound_pointer.is_some() {
+            return Err(OperationFailure::new(
+                FailureCondition::RetiredMigrationSource,
+                "artefact append authority permanently retired via outbound pointer per C5.63",
+            ));
+        }
+        let latest_claim = meta.latest_claim.ok_or_else(|| {
             OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
                 "no ownership claim found in meta stream during per-landing check per C5.12",
@@ -1189,6 +1345,100 @@ impl NatsWriterSession {
             })
         })
     }
+
+    /// Appends an arbitrary ownership record to the meta stream.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_ownership_record(
+        &mut self,
+        record: &OwnershipRecord,
+    ) -> Result<(), OperationFailure> {
+        let js = self.js.clone();
+        let meta_name = self.meta_stream_name.clone();
+        let record_clone = record.clone();
+        let handle = self.runtime.handle().clone();
+
+        run_future(&handle, async move {
+            let mut record_bytes = Vec::new();
+            record_clone.encode(&mut record_bytes);
+            let mut record_frame = Vec::new();
+            ContainerFrame::encode_payload(&record_bytes, &mut record_frame);
+
+            js.publish(meta_name.clone(), record_frame.into())
+                .await
+                .map_err(|err| {
+                    OperationFailure::new(
+                        FailureCondition::OwnershipRecordUnreadable,
+                        format!("failed to publish meta frame: {err}"),
+                    )
+                })?
+                .await
+                .map_err(|err| {
+                    OperationFailure::new(
+                        FailureCondition::OwnershipRecordUnreadable,
+                        format!("failed to ack meta frame: {err}"),
+                    )
+                })?;
+
+            Ok(())
+        })
+    }
+
+    /// Appends an outbound generation pointer record to the meta stream per C6.17 and C5.63.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_outbound_pointer(
+        &mut self,
+        pointer: &OutboundPointerRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_ownership_record(&OwnershipRecord::OutboundPointer(pointer.clone()))
+    }
+
+    /// Appends an inbound generation pointer record to the meta stream per C6.16.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_inbound_pointer(
+        &mut self,
+        pointer: &InboundPointerRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_ownership_record(&OwnershipRecord::InboundPointer(pointer.clone()))
+    }
+
+    /// Appends a migration start record to the meta stream per C4.13.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_migration_start(
+        &mut self,
+        start: &MigrationStartRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_ownership_record(&OwnershipRecord::MigrationStart(start.clone()))
+    }
+
+    /// Appends a migration end record to the meta stream per C4.13.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_migration_end(
+        &mut self,
+        end: &MigrationEndRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_ownership_record(&OwnershipRecord::MigrationEnd(end.clone()))
+    }
+
+    /// Appends a rescue policy choice record to the meta stream per C4.13.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_rescue_policy_choice(
+        &mut self,
+        choice: &RescuePolicyChoiceRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_ownership_record(&OwnershipRecord::RescuePolicyChoice(choice.clone()))
+    }
 }
 
 /// Reader session providing non-exclusive read-only access to an artefact container in JetStream per C5.6, C5.11, and C6.14.
@@ -1197,8 +1447,7 @@ pub struct NatsReaderSession {
     meta_stream_name: String,
     data_stream_name: String,
     admission: OpenAdmission,
-    claim: Option<OwnershipClaimRecord>,
-    schema_descriptor: Option<SchemaDescriptor>,
+    meta_records: NatsMetaRecords,
     rolling_commitment: RollingCommitment,
     js: async_nats::jetstream::Context,
     runtime: Arc<tokio::runtime::Runtime>,
@@ -1211,8 +1460,7 @@ impl fmt::Debug for NatsReaderSession {
             .field("meta_stream_name", &self.meta_stream_name)
             .field("data_stream_name", &self.data_stream_name)
             .field("admission", &self.admission)
-            .field("claim", &self.claim)
-            .field("schema_descriptor", &self.schema_descriptor)
+            .field("meta_records", &self.meta_records)
             .finish()
     }
 }
@@ -1242,16 +1490,58 @@ impl NatsReaderSession {
         &self.admission
     }
 
+    /// Returns all meta records decoded from the meta stream.
+    #[must_use]
+    pub fn meta_records(&self) -> &NatsMetaRecords {
+        &self.meta_records
+    }
+
     /// Returns the recorded ownership claim if present.
     #[must_use]
     pub fn claim(&self) -> Option<&OwnershipClaimRecord> {
-        self.claim.as_ref()
+        self.meta_records.latest_claim.as_ref()
     }
 
     /// Returns the recorded schema descriptor if present.
     #[must_use]
     pub fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
-        self.schema_descriptor.as_ref()
+        self.meta_records.schema_descriptor.as_ref()
+    }
+
+    /// Returns the outbound generation pointer if present.
+    #[must_use]
+    pub fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
+        self.meta_records.outbound_pointer.as_ref()
+    }
+
+    /// Returns the inbound generation pointer if present.
+    #[must_use]
+    pub fn inbound_pointer(&self) -> Option<&InboundPointerRecord> {
+        self.meta_records.inbound_pointer.as_ref()
+    }
+
+    /// Returns the migration start record if present.
+    #[must_use]
+    pub fn migration_start(&self) -> Option<&MigrationStartRecord> {
+        self.meta_records.migration_start.as_ref()
+    }
+
+    /// Returns the migration end record if present.
+    #[must_use]
+    pub fn migration_end(&self) -> Option<&MigrationEndRecord> {
+        self.meta_records.migration_end.as_ref()
+    }
+
+    /// Returns the rescue policy choice record if present.
+    #[must_use]
+    pub fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
+        self.meta_records.rescue_policy_choice.as_ref()
+    }
+
+    /// Returns true if this artefact is a retired migration source per C5.63.
+    #[must_use]
+    pub fn is_retired_source(&self) -> bool {
+        self.meta_records.outbound_pointer.is_some()
     }
 
     /// Returns the running physical rolling commitment computed across read frames.
@@ -1300,12 +1590,83 @@ impl NatsReaderSession {
     /// Returns [`OperationFailure`] with [`FailureCondition::MissingSchemaDescriptor`] if descriptor is absent.
     /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] if descriptor is invalid.
     pub fn validate_schema_completeness(&self) -> Result<(), OperationFailure> {
-        match &self.schema_descriptor {
+        match self.schema_descriptor() {
             Some(descriptor) => descriptor.validate_structural_completeness(),
             None => Err(OperationFailure::new(
                 FailureCondition::MissingSchemaDescriptor,
                 "artefact schema descriptor is absent per C8.2",
             )),
         }
+    }
+}
+
+impl MigrationSource for NatsStorageAdapter {
+    fn locator_id(&self) -> [u8; 16] {
+        self.locator_id()
+    }
+
+    fn current_epoch(&self) -> Result<u64, OperationFailure> {
+        let meta = self.read_meta_records()?;
+        Ok(meta.latest_claim.map_or(0, |c| c.epoch))
+    }
+
+    fn read_envelopes(&self) -> Result<Vec<EventEnvelope>, OperationFailure> {
+        let mut reader = self.open_read()?;
+        reader.read_all_envelopes()
+    }
+
+    fn record_outbound_pointer(
+        &self,
+        pointer: &OutboundPointerRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_outbound_pointer(pointer)
+    }
+
+    fn record_meta(&self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
+        self.record_ownership_record(record)
+    }
+
+    fn read_meta(&self) -> Result<MetaRecords, OperationFailure> {
+        self.read_meta_records()
+    }
+}
+
+impl MigrationTarget for NatsStorageAdapter {
+    fn locator_id(&self) -> [u8; 16] {
+        self.locator_id()
+    }
+
+    fn current_epoch(&self) -> Result<u64, OperationFailure> {
+        let meta = self.read_meta_records()?;
+        Ok(meta.latest_claim.map_or(0, |c| c.epoch))
+    }
+
+    fn append_envelopes(&mut self, envelopes: &[EventEnvelope]) -> Result<(), OperationFailure> {
+        let epoch = self.current_epoch()?;
+        let mut writer = self.open_write(epoch)?;
+        for env in envelopes {
+            writer.append_envelope(env)?;
+        }
+        writer.sync()
+    }
+
+    fn record_inbound_pointer(
+        &self,
+        pointer: &InboundPointerRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_inbound_pointer(pointer)
+    }
+
+    fn record_meta(&self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
+        self.record_ownership_record(record)
+    }
+
+    fn set_schema_descriptor(
+        &mut self,
+        descriptor: &SchemaDescriptor,
+    ) -> Result<(), OperationFailure> {
+        let epoch = self.current_epoch()?;
+        let mut writer = self.open_write(epoch)?;
+        writer.set_schema_descriptor(descriptor)
     }
 }

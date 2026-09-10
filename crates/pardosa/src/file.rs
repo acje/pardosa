@@ -1,6 +1,9 @@
 //! Container format and framing for Pardosa artefacts.
 
-use crate::encoding::{DecodeError, EventEnvelope, OwnershipClaimRecord, OwnershipRecord};
+use crate::encoding::{
+    DecodeError, EventEnvelope, InboundPointerRecord, MigrationEndRecord, MigrationStartRecord,
+    OutboundPointerRecord, OwnershipClaimRecord, OwnershipRecord, RescuePolicyChoiceRecord,
+};
 use crate::schema::{DescriptorNode, SchemaDescriptor};
 use crate::store::{
     admit_create, admit_open, ArtefactPresence, FailureCondition, OpenAdmission, OperationFailure,
@@ -282,11 +285,32 @@ fn read_container_frames(
     Ok((header, frames, rolling))
 }
 
-fn read_meta_records(
-    meta_path: &Path,
-) -> Result<(Option<OwnershipClaimRecord>, Option<SchemaDescriptor>), OperationFailure> {
+/// All decoded ownership records found in an artefact's .meta file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetaRecords {
+    /// Latest ownership claim record.
+    pub latest_claim: Option<OwnershipClaimRecord>,
+    /// Attached schema descriptor.
+    pub schema_descriptor: Option<SchemaDescriptor>,
+    /// Outbound generation pointer indicating cutover and permanent retirement per C6.17 and C5.63.
+    pub outbound_pointer: Option<OutboundPointerRecord>,
+    /// Inbound generation pointer indicating predecessor generation per C6.16.
+    pub inbound_pointer: Option<InboundPointerRecord>,
+    /// Migration start record per C4.13.
+    pub migration_start: Option<MigrationStartRecord>,
+    /// Migration end record per C4.13.
+    pub migration_end: Option<MigrationEndRecord>,
+    /// Rescue policy choice record per C4.13.
+    pub rescue_policy_choice: Option<RescuePolicyChoiceRecord>,
+}
+
+/// Reads all ownership records from a .meta file per C4.13 and C5.63.
+///
+/// # Errors
+/// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if file exists but cannot be read or decoded.
+pub fn read_meta_records(meta_path: &Path) -> Result<MetaRecords, OperationFailure> {
     if !meta_path.exists() {
-        return Ok((None, None));
+        return Ok(MetaRecords::default());
     }
     let mut file = File::open(meta_path).map_err(|err| {
         OperationFailure::new(
@@ -300,8 +324,7 @@ fn read_meta_records(
             format!("failed to read frames from .meta file: {err}"),
         )
     })?;
-    let mut latest_claim = None;
-    let mut schema_descriptor = None;
+    let mut records = MetaRecords::default();
     for frame in frames {
         let (record, _) = OwnershipRecord::decode(&frame).map_err(|err| {
             OperationFailure::new(
@@ -311,7 +334,7 @@ fn read_meta_records(
         })?;
         match record {
             OwnershipRecord::OwnershipClaim(claim) => {
-                latest_claim = Some(claim);
+                records.latest_claim = Some(claim);
             }
             OwnershipRecord::SchemaDescriptor {
                 schema_version,
@@ -323,12 +346,27 @@ fn read_meta_records(
                         format!("failed to decode schema descriptor in .meta: {err}"),
                     )
                 })?;
-                schema_descriptor = Some(SchemaDescriptor::new(schema_version, root));
+                records.schema_descriptor = Some(SchemaDescriptor::new(schema_version, root));
+            }
+            OwnershipRecord::OutboundPointer(p) => {
+                records.outbound_pointer = Some(p);
+            }
+            OwnershipRecord::InboundPointer(p) => {
+                records.inbound_pointer = Some(p);
+            }
+            OwnershipRecord::MigrationStart(m) => {
+                records.migration_start = Some(m);
+            }
+            OwnershipRecord::MigrationEnd(m) => {
+                records.migration_end = Some(m);
+            }
+            OwnershipRecord::RescuePolicyChoice(r) => {
+                records.rescue_policy_choice = Some(r);
             }
             _ => {}
         }
     }
-    Ok((latest_claim, schema_descriptor))
+    Ok(records)
 }
 
 fn append_meta_record(meta_path: &Path, record: &OwnershipRecord) -> Result<(), OperationFailure> {
@@ -422,6 +460,24 @@ impl FileStorageAdapter {
     #[must_use]
     pub fn stem(&self) -> &str {
         &self.stem
+    }
+
+    /// Returns the 16-byte locator identifier derived from the stem.
+    #[must_use]
+    pub fn locator_id(&self) -> [u8; 16] {
+        let hash = blake3::hash(self.stem.as_bytes());
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&hash.as_bytes()[0..16]);
+        id
+    }
+
+    /// Returns the current monotonic epoch for this artefact from .meta.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if reading fails.
+    pub fn current_epoch(&self) -> Result<u64, OperationFailure> {
+        let meta = self.read_meta_records()?;
+        Ok(meta.latest_claim.map_or(0, |c| c.epoch))
     }
 
     /// Returns the configured exclusion policy.
@@ -667,8 +723,14 @@ impl FileStorageAdapter {
                 ));
             }
             ArtefactPresence::OwnershipRecordOnly => {
-                let (claim_opt, _) = read_meta_records(&self.meta_path)?;
-                let claim = claim_opt.ok_or_else(|| {
+                let meta = read_meta_records(&self.meta_path)?;
+                if meta.outbound_pointer.is_some() {
+                    return Err(OperationFailure::new(
+                        FailureCondition::RetiredMigrationSource,
+                        "artefact append authority permanently retired via outbound pointer per C5.63",
+                    ));
+                }
+                let claim = meta.latest_claim.ok_or_else(|| {
                     OperationFailure::new(
                         FailureCondition::OwnershipUnestablished,
                         "ownership record unseeded; cannot open writer session without established claim per C5.10",
@@ -685,8 +747,14 @@ impl FileStorageAdapter {
             ArtefactPresence::Both => {}
         }
 
-        let (claim_opt, _) = read_meta_records(&self.meta_path)?;
-        let claim = claim_opt.ok_or_else(|| {
+        let meta = read_meta_records(&self.meta_path)?;
+        if meta.outbound_pointer.is_some() {
+            return Err(OperationFailure::new(
+                FailureCondition::RetiredMigrationSource,
+                "artefact append authority permanently retired via outbound pointer per C5.63",
+            ));
+        }
+        let claim = meta.latest_claim.ok_or_else(|| {
             OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
                 "no ownership claim found in .meta per C5.12",
@@ -747,13 +815,13 @@ impl FileStorageAdapter {
             ));
         }
 
-        let (claim_opt, schema_opt) = if self.meta_path.exists() {
+        let meta_records = if self.meta_path.exists() {
             read_meta_records(&self.meta_path)?
         } else {
-            (None, None)
+            MetaRecords::default()
         };
 
-        let admission = admit_open(presence, claim_opt.clone(), false)?;
+        let admission = admit_open(presence, meta_records.latest_claim.clone(), false)?;
 
         let file = if self.pgno_path.exists() {
             let mut f = OpenOptions::new()
@@ -776,10 +844,25 @@ impl FileStorageAdapter {
             meta_path: self.meta_path.clone(),
             pgno_path: self.pgno_path.clone(),
             admission,
-            claim: claim_opt,
-            schema_descriptor: schema_opt,
+            meta_records,
             rolling_commitment: RollingCommitment::new(),
         })
+    }
+
+    /// Reads all ownership records from the .meta file.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if reading fails.
+    pub fn read_meta_records(&self) -> Result<MetaRecords, OperationFailure> {
+        read_meta_records(&self.meta_path)
+    }
+
+    /// Appends an arbitrary ownership record to the .meta file.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_meta_record(&self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
+        append_meta_record(&self.meta_path, record)
     }
 
     /// Appends an updated ownership claim record to the .meta file.
@@ -790,10 +873,86 @@ impl FileStorageAdapter {
         &self,
         claim: &OwnershipClaimRecord,
     ) -> Result<(), OperationFailure> {
-        append_meta_record(
-            &self.meta_path,
-            &OwnershipRecord::OwnershipClaim(claim.clone()),
-        )
+        self.record_meta_record(&OwnershipRecord::OwnershipClaim(claim.clone()))
+    }
+
+    /// Appends an outbound generation pointer record to the .meta file per C6.17 and C5.63.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_outbound_pointer(
+        &self,
+        pointer: &OutboundPointerRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_meta_record(&OwnershipRecord::OutboundPointer(pointer.clone()))
+    }
+
+    /// Appends an inbound generation pointer record to the .meta file per C6.16.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_inbound_pointer(
+        &self,
+        pointer: &InboundPointerRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_meta_record(&OwnershipRecord::InboundPointer(pointer.clone()))
+    }
+
+    /// Appends a migration start record to the .meta file per C4.13.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_migration_start(
+        &self,
+        start: &MigrationStartRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_meta_record(&OwnershipRecord::MigrationStart(start.clone()))
+    }
+
+    /// Appends a migration end record to the .meta file per C4.13.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_migration_end(&self, end: &MigrationEndRecord) -> Result<(), OperationFailure> {
+        self.record_meta_record(&OwnershipRecord::MigrationEnd(end.clone()))
+    }
+
+    /// Appends a rescue policy choice record to the .meta file per C4.13.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_rescue_policy_choice(
+        &self,
+        choice: &RescuePolicyChoiceRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_meta_record(&OwnershipRecord::RescuePolicyChoice(choice.clone()))
+    }
+
+    /// Queries the outbound generation pointer if present.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if reading fails.
+    pub fn outbound_pointer(&self) -> Result<Option<OutboundPointerRecord>, OperationFailure> {
+        let meta = self.read_meta_records()?;
+        Ok(meta.outbound_pointer)
+    }
+
+    /// Queries the inbound generation pointer if present.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if reading fails.
+    pub fn inbound_pointer(&self) -> Result<Option<InboundPointerRecord>, OperationFailure> {
+        let meta = self.read_meta_records()?;
+        Ok(meta.inbound_pointer)
+    }
+
+    /// Returns true if this artefact is a retired migration source per C5.63.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if reading fails.
+    pub fn is_retired_source(&self) -> Result<bool, OperationFailure> {
+        let meta = self.read_meta_records()?;
+        Ok(meta.outbound_pointer.is_some())
     }
 }
 
@@ -846,8 +1005,14 @@ impl FileWriterSession {
     /// Returns [`OperationFailure`] with [`FailureCondition::StaleEpoch`] if epoch is superseded.
     /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if .meta cannot be read.
     pub fn append_frame(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
-        let (claim_opt, _) = read_meta_records(&self.meta_path)?;
-        let latest_claim = claim_opt.ok_or_else(|| {
+        let meta = read_meta_records(&self.meta_path)?;
+        if meta.outbound_pointer.is_some() {
+            return Err(OperationFailure::new(
+                FailureCondition::RetiredMigrationSource,
+                "artefact append authority permanently retired via outbound pointer per C5.63",
+            ));
+        }
+        let latest_claim = meta.latest_claim.ok_or_else(|| {
             OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
                 "no ownership claim found in .meta during per-landing check per C5.12",
@@ -918,6 +1083,69 @@ impl FileWriterSession {
             )
         })
     }
+
+    /// Appends an arbitrary ownership record to the .meta file.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_meta_record(&mut self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
+        append_meta_record(&self.meta_path, record)
+    }
+
+    /// Appends an outbound generation pointer record to the .meta file per C6.17 and C5.63.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_outbound_pointer(
+        &mut self,
+        pointer: &OutboundPointerRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_meta_record(&OwnershipRecord::OutboundPointer(pointer.clone()))
+    }
+
+    /// Appends an inbound generation pointer record to the .meta file per C6.16.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_inbound_pointer(
+        &mut self,
+        pointer: &InboundPointerRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_meta_record(&OwnershipRecord::InboundPointer(pointer.clone()))
+    }
+
+    /// Appends a migration start record to the .meta file per C4.13.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_migration_start(
+        &mut self,
+        start: &MigrationStartRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_meta_record(&OwnershipRecord::MigrationStart(start.clone()))
+    }
+
+    /// Appends a migration end record to the .meta file per C4.13.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_migration_end(
+        &mut self,
+        end: &MigrationEndRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_meta_record(&OwnershipRecord::MigrationEnd(end.clone()))
+    }
+
+    /// Appends a rescue policy choice record to the .meta file per C4.13.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    pub fn record_rescue_policy_choice(
+        &mut self,
+        choice: &RescuePolicyChoiceRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_meta_record(&OwnershipRecord::RescuePolicyChoice(choice.clone()))
+    }
 }
 
 impl fmt::Debug for FileWriterSession {
@@ -947,8 +1175,7 @@ pub struct FileReaderSession {
     meta_path: PathBuf,
     pgno_path: PathBuf,
     admission: OpenAdmission,
-    claim: Option<OwnershipClaimRecord>,
-    schema_descriptor: Option<SchemaDescriptor>,
+    meta_records: MetaRecords,
     rolling_commitment: RollingCommitment,
 }
 
@@ -958,8 +1185,7 @@ impl fmt::Debug for FileReaderSession {
             .field("meta_path", &self.meta_path)
             .field("pgno_path", &self.pgno_path)
             .field("admission", &self.admission)
-            .field("claim", &self.claim)
-            .field("schema_descriptor", &self.schema_descriptor)
+            .field("meta_records", &self.meta_records)
             .finish()
     }
 }
@@ -983,16 +1209,58 @@ impl FileReaderSession {
         &self.admission
     }
 
+    /// Returns all meta records decoded from .meta.
+    #[must_use]
+    pub fn meta_records(&self) -> &MetaRecords {
+        &self.meta_records
+    }
+
     /// Returns the recorded ownership claim if present.
     #[must_use]
     pub fn claim(&self) -> Option<&OwnershipClaimRecord> {
-        self.claim.as_ref()
+        self.meta_records.latest_claim.as_ref()
     }
 
     /// Returns the recorded schema descriptor if present.
     #[must_use]
     pub fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
-        self.schema_descriptor.as_ref()
+        self.meta_records.schema_descriptor.as_ref()
+    }
+
+    /// Returns the outbound generation pointer if present.
+    #[must_use]
+    pub fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
+        self.meta_records.outbound_pointer.as_ref()
+    }
+
+    /// Returns the inbound generation pointer if present.
+    #[must_use]
+    pub fn inbound_pointer(&self) -> Option<&InboundPointerRecord> {
+        self.meta_records.inbound_pointer.as_ref()
+    }
+
+    /// Returns the migration start record if present.
+    #[must_use]
+    pub fn migration_start(&self) -> Option<&MigrationStartRecord> {
+        self.meta_records.migration_start.as_ref()
+    }
+
+    /// Returns the migration end record if present.
+    #[must_use]
+    pub fn migration_end(&self) -> Option<&MigrationEndRecord> {
+        self.meta_records.migration_end.as_ref()
+    }
+
+    /// Returns the rescue policy choice record if present.
+    #[must_use]
+    pub fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
+        self.meta_records.rescue_policy_choice.as_ref()
+    }
+
+    /// Returns true if this artefact is a retired migration source per C5.63.
+    #[must_use]
+    pub fn is_retired_source(&self) -> bool {
+        self.meta_records.outbound_pointer.is_some()
     }
 
     /// Returns the running physical rolling commitment computed across read frames.
@@ -1039,7 +1307,7 @@ impl FileReaderSession {
     /// Returns [`OperationFailure`] with [`FailureCondition::MissingSchemaDescriptor`] if descriptor is absent.
     /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] if descriptor is invalid.
     pub fn validate_schema_completeness(&self) -> Result<(), OperationFailure> {
-        match &self.schema_descriptor {
+        match self.schema_descriptor() {
             Some(descriptor) => descriptor.validate_structural_completeness(),
             None => Err(OperationFailure::new(
                 FailureCondition::MissingSchemaDescriptor,

@@ -454,3 +454,55 @@ fn test_m4_format_vectors_roundtrip_on_filesystem_adapter() {
         assert_eq!(read.payload, exp.payload);
     }
 }
+
+#[test]
+fn test_m4_adapter_retirement_and_generation_records() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let base_path = dir.path().join("retired_source");
+    let adapter = FileStorageAdapter::new(&base_path);
+    let claim = sample_claim(1);
+    adapter.create(&claim).expect("create");
+
+    let mut writer = adapter.open_write(1).expect("open write");
+    let env = EventEnvelope {
+        header: EnvelopeHeader {
+            event_id: [0x01; 16],
+            fiber_id: [0xaa; 16],
+            detached: false,
+            precursor: [0u8; 16],
+            precursor_hash: [0u8; 32],
+        },
+        payload: b"sample payload".to_vec(),
+    };
+    writer.append_envelope(&env).expect("append envelope");
+
+    let outbound = OutboundPointerRecord {
+        next_generation_locator_id: [42u8; 16],
+        cutover_epoch: 1,
+    };
+    adapter
+        .record_outbound_pointer(&outbound)
+        .expect("record outbound pointer");
+
+    let err_new_writer = adapter
+        .open_write(1)
+        .expect_err("new writer must be rejected");
+    assert_eq!(
+        *err_new_writer.condition(),
+        FailureCondition::RetiredMigrationSource
+    );
+
+    let err_append = writer
+        .append_envelope(&env)
+        .expect_err("existing writer append must be rejected");
+    assert_eq!(
+        *err_append.condition(),
+        FailureCondition::RetiredMigrationSource
+    );
+
+    let mut reader = adapter.open_read().expect("historical read must succeed");
+    assert!(reader.is_retired_source());
+    assert_eq!(reader.outbound_pointer(), Some(&outbound));
+    let frames = reader.read_all_envelopes().expect("read frames");
+    assert_eq!(frames.len(), 1);
+}
