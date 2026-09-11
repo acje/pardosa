@@ -192,6 +192,8 @@ pub struct NatsStorageAdapter {
     stem: String,
     meta_stream_name: String,
     data_stream_name: String,
+    meta_subject: String,
+    data_subject: String,
     client: async_nats::Client,
     js: async_nats::jetstream::Context,
     runtime: Arc<tokio::runtime::Runtime>,
@@ -204,6 +206,8 @@ impl fmt::Debug for NatsStorageAdapter {
             .field("stem", &self.stem)
             .field("meta_stream_name", &self.meta_stream_name)
             .field("data_stream_name", &self.data_stream_name)
+            .field("meta_subject", &self.meta_subject)
+            .field("data_subject", &self.data_subject)
             .finish()
     }
 }
@@ -269,16 +273,32 @@ impl NatsStorageAdapter {
     ) -> Self {
         let meta_stream_name = format!("{stem}_meta");
         let data_stream_name = format!("{stem}_data");
+        let meta_subject = format!("{stem}_meta");
+        let data_subject = format!("{stem}_data");
         let js = runtime.block_on(async { async_nats::jetstream::new(client.clone()) });
         Self {
             url,
             stem,
             meta_stream_name,
             data_stream_name,
+            meta_subject,
+            data_subject,
             client,
             js,
             runtime,
         }
+    }
+
+    /// Overrides the subjects used for publishing and stream routing.
+    #[must_use]
+    pub fn with_subjects(
+        mut self,
+        meta_subject: impl Into<String>,
+        data_subject: impl Into<String>,
+    ) -> Self {
+        self.meta_subject = meta_subject.into();
+        self.data_subject = data_subject.into();
+        self
     }
 
     /// Returns the NATS connection URL.
@@ -358,6 +378,8 @@ impl NatsStorageAdapter {
         let stem = self.stem.clone();
         let meta_name = self.meta_stream_name.clone();
         let data_name = self.data_stream_name.clone();
+        let meta_subject = self.meta_subject.clone();
+        let data_subject = self.data_subject.clone();
         let claim = initial_claim.clone();
         let handle = self.runtime.handle().clone();
         let runtime = self.runtime.clone();
@@ -365,7 +387,7 @@ impl NatsStorageAdapter {
         run_future(&handle, async move {
             js.create_stream(async_nats::jetstream::stream::Config {
                 name: meta_name.clone(),
-                subjects: vec![meta_name.clone()],
+                subjects: vec![meta_subject.clone()],
                 storage: async_nats::jetstream::stream::StorageType::File,
                 ..Default::default()
             })
@@ -384,7 +406,7 @@ impl NatsStorageAdapter {
                 async_nats::HeaderValue::from(0),
             );
             js.publish_with_headers(
-                meta_name.clone(),
+                meta_subject.clone(),
                 init_meta_headers,
                 header_bytes.to_vec().into(),
             )
@@ -427,7 +449,7 @@ impl NatsStorageAdapter {
                 async_nats::header::NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
                 async_nats::HeaderValue::from(1),
             );
-            js.publish_with_headers(meta_name.clone(), claim_meta_headers, claim_frame.into())
+            js.publish_with_headers(meta_subject.clone(), claim_meta_headers, claim_frame.into())
                 .await
                 .map_err(|err| {
                     if is_wrong_last_sequence(&err) {
@@ -459,7 +481,7 @@ impl NatsStorageAdapter {
 
             js.create_stream(async_nats::jetstream::stream::Config {
                 name: data_name.clone(),
-                subjects: vec![data_name.clone()],
+                subjects: vec![data_subject.clone()],
                 storage: async_nats::jetstream::stream::StorageType::File,
                 ..Default::default()
             })
@@ -478,7 +500,7 @@ impl NatsStorageAdapter {
             );
             let data_ack = js
                 .publish_with_headers(
-                    data_name.clone(),
+                    data_subject.clone(),
                     init_data_headers,
                     header_bytes.to_vec().into(),
                 )
@@ -522,6 +544,8 @@ impl NatsStorageAdapter {
                 stem,
                 meta_stream_name: meta_name,
                 data_stream_name: data_name,
+                meta_subject,
+                data_subject,
                 carried_epoch: claim.epoch,
                 claim: Some(claim),
                 meta_records,
@@ -556,13 +580,14 @@ impl NatsStorageAdapter {
 
         let js = self.js.clone();
         let meta_name = self.meta_stream_name.clone();
+        let meta_subject = self.meta_subject.clone();
         let claim_clone = claim.clone();
         let handle = self.runtime.handle().clone();
 
         run_future(&handle, async move {
             js.create_stream(async_nats::jetstream::stream::Config {
                 name: meta_name.clone(),
-                subjects: vec![meta_name.clone()],
+                subjects: vec![meta_subject.clone()],
                 storage: async_nats::jetstream::stream::StorageType::File,
                 ..Default::default()
             })
@@ -581,7 +606,7 @@ impl NatsStorageAdapter {
                 async_nats::HeaderValue::from(0),
             );
             js.publish_with_headers(
-                meta_name.clone(),
+                meta_subject.clone(),
                 init_meta_headers,
                 header_bytes.to_vec().into(),
             )
@@ -624,7 +649,7 @@ impl NatsStorageAdapter {
                 async_nats::header::NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
                 async_nats::HeaderValue::from(1),
             );
-            js.publish_with_headers(meta_name.clone(), claim_meta_headers, claim_frame.into())
+            js.publish_with_headers(meta_subject, claim_meta_headers, claim_frame.into())
                 .await
                 .map_err(|err| {
                     if is_wrong_last_sequence(&err) {
@@ -679,6 +704,8 @@ impl NatsStorageAdapter {
         let stem = self.stem.clone();
         let meta_name = self.meta_stream_name.clone();
         let data_name = self.data_stream_name.clone();
+        let meta_subject = self.meta_subject.clone();
+        let data_subject = self.data_subject.clone();
         let claim_clone = claim.clone();
         let handle = self.runtime.handle().clone();
         let runtime = self.runtime.clone();
@@ -700,7 +727,7 @@ impl NatsStorageAdapter {
 
             js.create_stream(async_nats::jetstream::stream::Config {
                 name: data_name.clone(),
-                subjects: vec![data_name.clone()],
+                subjects: vec![data_subject.clone()],
                 storage: async_nats::jetstream::stream::StorageType::File,
                 ..Default::default()
             })
@@ -720,7 +747,7 @@ impl NatsStorageAdapter {
             );
             let data_ack = js
                 .publish_with_headers(
-                    data_name.clone(),
+                    data_subject.clone(),
                     init_data_headers,
                     header_bytes.to_vec().into(),
                 )
@@ -760,6 +787,8 @@ impl NatsStorageAdapter {
                 stem,
                 meta_stream_name: meta_name,
                 data_stream_name: data_name,
+                meta_subject,
+                data_subject,
                 carried_epoch: claim_clone.epoch,
                 claim: Some(claim_clone),
                 meta_records,
@@ -863,6 +892,8 @@ impl NatsStorageAdapter {
             stem: self.stem.clone(),
             meta_stream_name: self.meta_stream_name.clone(),
             data_stream_name: self.data_stream_name.clone(),
+            meta_subject: self.meta_subject.clone(),
+            data_subject: self.data_subject.clone(),
             carried_epoch,
             claim: Some(claim),
             meta_records: meta,
@@ -910,6 +941,8 @@ impl NatsStorageAdapter {
             stem: self.stem.clone(),
             meta_stream_name: self.meta_stream_name.clone(),
             data_stream_name: self.data_stream_name.clone(),
+            meta_subject: self.meta_subject.clone(),
+            data_subject: self.data_subject.clone(),
             carried_epoch: meta_records.latest_claim.as_ref().map_or(0, |c| c.epoch),
             claim: meta_records.latest_claim.clone(),
             meta_records,
@@ -948,7 +981,7 @@ impl NatsStorageAdapter {
         record: &OwnershipRecord,
     ) -> Result<(), OperationFailure> {
         let js = self.js.clone();
-        let meta_name = self.meta_stream_name.clone();
+        let meta_subject = self.meta_subject.clone();
         let record_clone = record.clone();
         let handle = self.runtime.handle().clone();
 
@@ -958,7 +991,7 @@ impl NatsStorageAdapter {
             let mut record_frame = Vec::new();
             ContainerFrame::encode_payload(&record_bytes, &mut record_frame);
 
-            js.publish(meta_name.clone(), record_frame.into())
+            js.publish(meta_subject, record_frame.into())
                 .await
                 .map_err(|err| {
                     OperationFailure::new(
@@ -1095,6 +1128,8 @@ pub struct NatsEngine {
     pub(crate) stem: String,
     pub(crate) meta_stream_name: String,
     pub(crate) data_stream_name: String,
+    pub(crate) meta_subject: String,
+    pub(crate) data_subject: String,
     pub(crate) carried_epoch: u64,
     pub(crate) claim: Option<OwnershipClaimRecord>,
     pub(crate) meta_records: NatsMetaRecords,
@@ -1124,6 +1159,18 @@ impl NatsEngine {
     #[must_use]
     pub fn data_stream_name(&self) -> &str {
         &self.data_stream_name
+    }
+
+    /// Returns the ownership record subject.
+    #[must_use]
+    pub fn meta_subject(&self) -> &str {
+        &self.meta_subject
+    }
+
+    /// Returns the event data subject.
+    #[must_use]
+    pub fn data_subject(&self) -> &str {
+        &self.data_subject
     }
 
     /// Returns the last consumed message sequence in the event data stream.
@@ -1204,14 +1251,14 @@ impl StorageEngine for NatsEngine {
         );
 
         let js = self.js.clone();
-        let data_name = self.data_stream_name.clone();
+        let data_subject = self.data_subject.clone();
         let timeout = self.publish_timeout;
         let carried_epoch = self.carried_epoch;
         let block_bytes = block.to_vec();
 
         let (ack, diagnostic) = run_future(&handle, async move {
             let pub_future = js
-                .publish_with_headers(data_name.clone(), headers, block_bytes.into())
+                .publish_with_headers(data_subject, headers, block_bytes.into())
                 .await
                 .map_err(|err| {
                     if is_wrong_last_sequence(&err) {
@@ -1362,7 +1409,7 @@ impl StorageEngine for NatsEngine {
             ));
         }
         let js = self.js.clone();
-        let meta_name = self.meta_stream_name.clone();
+        let meta_subject = self.meta_subject.clone();
         let handle = self.runtime.handle().clone();
         let timeout = self.publish_timeout;
         let record_clone = record.clone();
@@ -1373,7 +1420,7 @@ impl StorageEngine for NatsEngine {
             ContainerFrame::encode_payload(&record_bytes, &mut record_frame);
 
             let pub_future = js
-                .publish(meta_name.clone(), record_frame.into())
+                .publish(meta_subject, record_frame.into())
                 .await
                 .map_err(|err| {
                     OperationFailure::new(
