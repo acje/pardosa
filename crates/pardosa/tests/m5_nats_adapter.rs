@@ -131,34 +131,34 @@ fn test_m5_format_vectors_roundtrip_on_nats_adapter() {
     let vectors = json["vectors"].as_array().expect("vectors array");
 
     let server = LiveNatsServer::acquire();
-    let stem = unique_stem("format_vectors");
-    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
     let claim = sample_claim(1);
 
-    let mut writer = adapter.create(&claim).expect("create writer");
-    let mut expected_envelopes = Vec::new();
-
-    for vec in vectors {
+    for (idx, vec) in vectors.iter().enumerate() {
         let expected_outcome = vec["expected_outcome"].as_str().unwrap();
         if expected_outcome == "Success" {
             let bytes_hex = vec["bytes_hex"].as_str().unwrap();
             let bytes = hex::decode(bytes_hex).unwrap();
             let (env, _) = EventEnvelope::decode(&bytes).unwrap();
-            writer.append_envelope(&env).expect("append envelope");
-            expected_envelopes.push(env);
+            let stem = unique_stem(&format!("format_vec_{idx}"));
+            let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
+            let mut writer = adapter.create(&claim).expect("create writer");
+            let mut env_buf = Vec::new();
+            env.encode(&mut env_buf);
+            writer
+                .append_unvalidated_frame(&env_buf)
+                .expect("append raw frame");
+            drop(writer);
+
+            let mut reader = adapter.open_read().expect("open reader");
+            let read_envelopes = reader
+                .read_all_envelopes_for_migration()
+                .expect("read envelopes");
+            assert_eq!(read_envelopes.len(), 1);
+            assert_eq!(read_envelopes[0].header, env.header);
+            assert_eq!(read_envelopes[0].payload, env.payload);
+            adapter.delete_streams().expect("cleanup");
         }
     }
-    drop(writer);
-
-    let mut reader = adapter.open_read().expect("open reader");
-    let read_envelopes = reader.read_all_envelopes().expect("read envelopes");
-    assert_eq!(read_envelopes.len(), expected_envelopes.len());
-    for (read, exp) in read_envelopes.iter().zip(expected_envelopes.iter()) {
-        assert_eq!(read.header, exp.header);
-        assert_eq!(read.payload, exp.payload);
-    }
-
-    adapter.delete_streams().expect("cleanup");
 }
 
 #[test]
@@ -196,10 +196,12 @@ fn test_m5_nats_two_writer_occ_exclusion() {
     let mut writer1 = adapter.create(&claim).expect("create writer 1");
     let mut writer2 = adapter.open_write(1).expect("open writer 2");
 
-    let count1 = writer1.append_frame(b"event-from-w1").expect("w1 append");
+    let count1 = writer1
+        .append_raw_frame(b"event-from-w1")
+        .expect("w1 append");
     assert_eq!(count1, 1);
 
-    let conflict = writer2.append_frame(b"event-from-w2").unwrap_err();
+    let conflict = writer2.append_raw_frame(b"event-from-w2").unwrap_err();
     assert_eq!(conflict.condition(), &FailureCondition::ConcurrencyConflict);
 
     adapter.delete_streams().expect("cleanup");
@@ -213,14 +215,14 @@ fn test_m5_nats_per_landing_epoch_verification() {
     let claim1 = sample_claim(1);
 
     let mut writer1 = adapter.create(&claim1).expect("create writer 1");
-    let _ = writer1.append_frame(b"event-1").expect("append 1");
+    let _ = writer1.append_raw_frame(b"event-1").expect("append 1");
 
     let claim2 = sample_claim(2);
     adapter
         .record_ownership_claim(&claim2)
         .expect("supersede with epoch 2");
 
-    let stale = writer1.append_frame(b"event-2").unwrap_err();
+    let stale = writer1.append_raw_frame(b"event-2").unwrap_err();
     assert_eq!(stale.condition(), &FailureCondition::StaleEpoch);
 
     adapter.delete_streams().expect("cleanup");
@@ -234,13 +236,26 @@ fn test_m5_nats_indeterminate_landing_verdict() {
     let claim = sample_claim(1);
 
     let mut writer = adapter.create(&claim).expect("create writer");
-    let landed = writer.append_frame_verdict(b"event-1").expect("verdict");
+    let env1 = EventEnvelope::genesis([0x01; 16], [0xaa; 16], b"event-1").unwrap();
+    let mut buf1 = Vec::new();
+    env1.encode(&mut buf1);
+    let landed = writer.append_frame_verdict(&buf1).expect("verdict");
     assert_eq!(landed, WriteLandingVerdict::Landed(1));
 
     let mut writer_sim = writer.with_simulate_indeterminate(true);
-    let indet = writer_sim
-        .append_frame_verdict(b"event-2")
-        .expect("verdict");
+    let env2 = EventEnvelope {
+        header: EnvelopeHeader {
+            event_id: [0x02; 16],
+            fiber_id: [0xaa; 16],
+            detached: false,
+            precursor: [0x01; 16],
+            precursor_hash: env1.commitment(),
+        },
+        payload: b"event-2".to_vec(),
+    };
+    let mut buf2 = Vec::new();
+    env2.encode(&mut buf2);
+    let indet = writer_sim.append_frame_verdict(&buf2).expect("verdict");
     assert_eq!(
         indet,
         WriteLandingVerdict::Undetermined { carried_epoch: 1 }

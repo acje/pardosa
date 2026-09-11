@@ -67,7 +67,7 @@ fn test_m4_strict_create_and_refuse_existing() {
     let err = adapter.create(&claim).unwrap_err();
     assert_eq!(err.condition(), &FailureCondition::StoreAlreadyExists);
 
-    let _ = writer.append_frame(b"first-event");
+    let _ = writer.append_raw_frame(b"first-event");
 }
 
 #[test]
@@ -170,8 +170,8 @@ fn test_m4_readonly_open_concurrent_with_writer() {
     let claim = sample_claim(1);
 
     let mut writer = adapter.create(&claim).expect("create writer");
-    writer.append_frame(b"frame-1").expect("append frame 1");
-    writer.append_frame(b"frame-2").expect("append frame 2");
+    writer.append_raw_frame(b"frame-1").expect("append frame 1");
+    writer.append_raw_frame(b"frame-2").expect("append frame 2");
 
     let mut reader1 = adapter
         .open_read()
@@ -220,14 +220,16 @@ fn test_m4_incomplete_creation_and_orphan() {
         .expect("complete creation");
     assert_eq!(adapter.presence(), ArtefactPresence::Both);
     writer
-        .append_frame(b"after-completion")
+        .append_raw_frame(b"after-completion")
         .expect("append after completion");
     drop(writer);
 
     let orphan_path = dir.path().join("orphan_store");
     let orphan_adapter = FileStorageAdapter::new(&orphan_path);
     let mut orphan_writer = orphan_adapter.create(&claim).expect("create normal");
-    orphan_writer.append_frame(b"orphan-data").expect("append");
+    orphan_writer
+        .append_raw_frame(b"orphan-data")
+        .expect("append");
     drop(orphan_writer);
 
     fs::remove_file(orphan_adapter.meta_path()).expect("remove meta to make orphan");
@@ -257,7 +259,7 @@ fn test_m4_per_landing_epoch_verification() {
 
     let mut writer = adapter.create(&claim1).expect("create writer epoch 1");
     writer
-        .append_frame(b"frame-at-epoch-1")
+        .append_raw_frame(b"frame-at-epoch-1")
         .expect("first append at epoch 1");
 
     let claim2 = sample_claim(2);
@@ -265,7 +267,9 @@ fn test_m4_per_landing_epoch_verification() {
         .record_ownership_claim(&claim2)
         .expect("superseding claim in meta");
 
-    let stale_err = writer.append_frame(b"frame-with-stale-epoch").unwrap_err();
+    let stale_err = writer
+        .append_raw_frame(b"frame-with-stale-epoch")
+        .unwrap_err();
     assert_eq!(stale_err.condition(), &FailureCondition::StaleEpoch);
 
     let mut reader = adapter.open_read().expect("reader opens");
@@ -274,7 +278,9 @@ fn test_m4_per_landing_epoch_verification() {
     assert_eq!(frames[0], b"frame-at-epoch-1");
 
     fs::write(adapter.meta_path(), b"truncated").expect("corrupt meta");
-    let unreadable_err = writer.append_frame(b"frame-with-corrupt-meta").unwrap_err();
+    let unreadable_err = writer
+        .append_raw_frame(b"frame-with-corrupt-meta")
+        .unwrap_err();
     assert_eq!(
         unreadable_err.condition(),
         &FailureCondition::OwnershipRecordUnreadable
@@ -291,11 +297,15 @@ fn test_m4_continuous_rolling_commitment_and_crc32c() {
     let mut writer = adapter.create(&claim).expect("create writer");
     assert_eq!(writer.rolling_commitment().frame_count(), 0);
 
-    writer.append_frame(b"payload-alpha").expect("append alpha");
+    writer
+        .append_raw_frame(b"payload-alpha")
+        .expect("append alpha");
     assert_eq!(writer.rolling_commitment().frame_count(), 1);
     let digest1 = writer.rolling_commitment().current_commitment();
 
-    writer.append_frame(b"payload-beta").expect("append beta");
+    writer
+        .append_raw_frame(b"payload-beta")
+        .expect("append beta");
     assert_eq!(writer.rolling_commitment().frame_count(), 2);
     let digest2 = writer.rolling_commitment().current_commitment();
     assert_ne!(digest1, digest2);
@@ -310,8 +320,7 @@ fn test_m4_continuous_rolling_commitment_and_crc32c() {
     file_bytes[last_byte_idx] ^= 0xFF;
     fs::write(adapter.pgno_path(), file_bytes).expect("write corrupt pgno");
 
-    let mut corrupt_reader = adapter.open_read().expect("reader");
-    let err = corrupt_reader.read_all_frames().unwrap_err();
+    let err = adapter.open_read().unwrap_err();
     assert_eq!(
         err.condition(),
         &FailureCondition::PrecursorChainBroken(None)
@@ -427,31 +436,32 @@ fn test_m4_format_vectors_roundtrip_on_filesystem_adapter() {
     let vectors = json["vectors"].as_array().expect("vectors array");
 
     let dir = TestDir::new("format_vectors");
-    let store_path = dir.path().join("vector_store");
-    let adapter = FileStorageAdapter::new(&store_path);
     let claim = sample_claim(1);
 
-    let mut writer = adapter.create(&claim).expect("create writer");
-    let mut expected_envelopes = Vec::new();
-
-    for vec in vectors {
+    for (idx, vec) in vectors.iter().enumerate() {
         let expected_outcome = vec["expected_outcome"].as_str().unwrap();
         if expected_outcome == "Success" {
             let bytes_hex = vec["bytes_hex"].as_str().unwrap();
             let bytes = hex::decode(bytes_hex).unwrap();
             let (env, _) = EventEnvelope::decode(&bytes).unwrap();
-            writer.append_envelope(&env).expect("append envelope");
-            expected_envelopes.push(env);
-        }
-    }
-    drop(writer);
+            let store_path = dir.path().join(format!("vector_store_{idx}"));
+            let adapter = FileStorageAdapter::new(&store_path);
+            let mut writer = adapter.create(&claim).expect("create writer");
+            let mut env_buf = Vec::new();
+            env.encode(&mut env_buf);
+            writer
+                .append_unvalidated_frame(&env_buf)
+                .expect("append raw frame");
+            drop(writer);
 
-    let mut reader = adapter.open_read().expect("open reader");
-    let read_envelopes = reader.read_all_envelopes().expect("read envelopes");
-    assert_eq!(read_envelopes.len(), expected_envelopes.len());
-    for (read, exp) in read_envelopes.iter().zip(expected_envelopes.iter()) {
-        assert_eq!(read.header, exp.header);
-        assert_eq!(read.payload, exp.payload);
+            let mut reader = adapter.open_read().expect("open reader");
+            let read_envelopes = reader
+                .read_all_envelopes_for_migration()
+                .expect("read envelopes");
+            assert_eq!(read_envelopes.len(), 1);
+            assert_eq!(read_envelopes[0].header, env.header);
+            assert_eq!(read_envelopes[0].payload, env.payload);
+        }
     }
 }
 

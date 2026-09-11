@@ -6,6 +6,11 @@ use crate::encoding::{
 use crate::schema::{SchemaDescriptor, SchemaIdentity};
 use std::fmt;
 
+mod fiber_handle;
+mod session_index;
+pub use fiber_handle::{FiberHandle, MAX_EVENTS_PER_FIBER};
+pub use session_index::{AppendReservation, SessionIndex};
+
 /// State of a fiber within Pardosa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FiberState {

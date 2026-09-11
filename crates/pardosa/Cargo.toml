@@ -1,6 +1,6 @@
 [package]
 name = "pardosa"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 description = "Deterministic append-only event store foundation with schema descriptors, codecs, container formats, and fiber lifecycle management"
 license = "MIT OR Apache-2.0"
@@ -11,7 +11,7 @@ keywords = ["event-store", "eventsourcing", "storage", "schema", "linearizable"]
 categories = ["database-implementations", "data-structures"]
 
 [dependencies]
-pardosa-derive = { version = "0.5.2", path = "../pardosa-derive" }
+pardosa-derive = { version = "0.5.3", path = "../pardosa-derive" }
 crc32c = "0.6"
 blake3 = "1.5"
 uuid = { version = "1.10", optional = true }
@@ -20,7 +20,7 @@ uuid = { version = "1.10", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
-pardosa-nats = { version = "0.5.2", path = "../pardosa-nats" }
+pardosa-nats = { version = "0.5.3", path = "../pardosa-nats", features = ["unstable-test-support"] }
 tempfile = "3"
 
 [features]

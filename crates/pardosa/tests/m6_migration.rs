@@ -336,9 +336,11 @@ fn test_m6_broken_chain_election_refuse_vs_permit() {
         payload: b"broken_event".to_vec(),
     };
     writer.append_envelope(&env1).expect("append env1");
+    let mut broken_buf = Vec::new();
+    broken_env.encode(&mut broken_buf);
     writer
-        .append_envelope(&broken_env)
-        .expect("append broken_env");
+        .append_unvalidated_frame(&broken_buf)
+        .expect("append broken raw frame");
 
     let manager_refuse = MigrationManager::new(source_refuse.clone(), target_refuse.clone())
         .with_broken_chain_election(BrokenChainElection::RefuseOnBreak);
@@ -362,11 +364,20 @@ fn test_m6_broken_chain_election_refuse_vs_permit() {
         .expect("open write source permit");
     writer_permit.append_envelope(&env1).expect("append env1");
     writer_permit
-        .append_envelope(&broken_env)
-        .expect("append broken_env");
+        .append_unvalidated_frame(&broken_buf)
+        .expect("append broken raw frame");
 
     let mut src_reader = source_permit.open_read().expect("open source reader");
-    let src_envelopes = src_reader.read_all_envelopes().expect("read source");
+    let ordinary_err = src_reader
+        .read_all_envelopes()
+        .expect_err("ordinary reader on source must refuse broken chain");
+    assert!(matches!(
+        ordinary_err.condition(),
+        FailureCondition::PrecursorChainBroken(_)
+    ));
+    let src_envelopes = src_reader
+        .read_all_envelopes_for_migration()
+        .expect("migration reader on source permits broken history");
     let mut src_map = HashMap::new();
     for env in &src_envelopes {
         src_map.insert(env.header.event_id, env);
@@ -391,9 +402,16 @@ fn test_m6_broken_chain_election_refuse_vs_permit() {
     assert_eq!(summary.total_migrated_events, 2);
 
     let mut target_reader = target_permit.open_read().expect("open target reader");
-    let migrated = target_reader
+    let ordinary_target_err = target_reader
         .read_all_envelopes()
-        .expect("read target envelopes");
+        .expect_err("ordinary reader on target with broken history must refuse");
+    assert!(matches!(
+        ordinary_target_err.condition(),
+        FailureCondition::PrecursorChainBroken(_)
+    ));
+    let migrated = target_reader
+        .read_all_envelopes_for_migration()
+        .expect("migration reader on target reads broken history");
     assert_eq!(migrated.len(), 2);
 
     assert_eq!(migrated[0].header.precursor, [0u8; 16]);
@@ -594,9 +612,20 @@ fn test_m6_nats_broken_chain_election() {
         payload: b"nats_broken".to_vec(),
     };
     writer.append_envelope(&env1).expect("append env1");
+    let mut broken_buf = Vec::new();
+    broken_env.encode(&mut broken_buf);
     writer
-        .append_envelope(&broken_env)
-        .expect("append broken_env");
+        .append_unvalidated_frame(&broken_buf)
+        .expect("append broken raw frame");
+
+    let mut src_reader = source.open_read().expect("open source reader");
+    let src_ordinary_err = src_reader
+        .read_all_envelopes()
+        .expect_err("ordinary reader on nats source with broken history must refuse");
+    assert!(matches!(
+        src_ordinary_err.condition(),
+        FailureCondition::PrecursorChainBroken(_)
+    ));
 
     let manager_refuse = MigrationManager::new(source.clone(), target.clone())
         .with_broken_chain_election(BrokenChainElection::RefuseOnBreak);
@@ -619,7 +648,16 @@ fn test_m6_nats_broken_chain_election() {
     assert_eq!(summary.total_migrated_events, 2);
 
     let mut target_reader = target.open_read().expect("open target reader");
-    let migrated = target_reader.read_all_envelopes().expect("read target");
+    let target_ordinary_err = target_reader
+        .read_all_envelopes()
+        .expect_err("ordinary reader on nats target with broken history must refuse");
+    assert!(matches!(
+        target_ordinary_err.condition(),
+        FailureCondition::PrecursorChainBroken(_)
+    ));
+    let migrated = target_reader
+        .read_all_envelopes_for_migration()
+        .expect("read target envelopes");
     assert_eq!(migrated.len(), 2);
     assert_eq!(migrated[0].header.precursor, [0u8; 16]);
     assert_eq!(migrated[1].header.precursor, [0u8; 16]);

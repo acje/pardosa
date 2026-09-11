@@ -1,6 +1,7 @@
 //! JetStream storage adapter implementation for Pardosa.
 
 use pardosa::prelude::*;
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -130,7 +131,7 @@ async fn read_meta_records_async(
 async fn read_data_frames_async(
     js: &async_nats::jetstream::Context,
     data_stream_name: &str,
-) -> Result<(ContainerHeader, Vec<Vec<u8>>, RollingCommitment), OperationFailure> {
+) -> Result<(ContainerHeader, Vec<Vec<u8>>, RollingCommitment, u64), OperationFailure> {
     let mut stream = js.get_stream(data_stream_name).await.map_err(|err| {
         OperationFailure::new(
             FailureCondition::NoArtefactExists,
@@ -182,7 +183,7 @@ async fn read_data_frames_async(
         rolling.update_frame(&raw.payload);
         frames.push(payload);
     }
-    Ok((header, frames, rolling))
+    Ok((header, frames, rolling, last))
 }
 
 /// JetStream storage adapter managing container artefacts in NATS JetStream per C5.10, C5.11, and C10.3.
@@ -524,6 +525,10 @@ impl NatsStorageAdapter {
                 runtime,
                 publish_timeout: Duration::from_secs(5),
                 simulate_indeterminate: false,
+                fiber_index: SessionIndex::new(),
+                seen_events: HashSet::new(),
+                uncertain: false,
+                uncertain_diagnostic: None,
             })
         })
     }
@@ -742,6 +747,10 @@ impl NatsStorageAdapter {
                 runtime,
                 publish_timeout: Duration::from_secs(5),
                 simulate_indeterminate: false,
+                fiber_index: SessionIndex::new(),
+                seen_events: HashSet::new(),
+                uncertain: false,
+                uncertain_diagnostic: None,
             })
         })
     }
@@ -822,27 +831,20 @@ impl NatsStorageAdapter {
 
         let js_data = self.js.clone();
         let data_name = self.data_stream_name.clone();
-        let (_, _, rolling) = run_future(&handle, async move {
+        let (_, frames, rolling, last_data_seq) = run_future(&handle, async move {
             read_data_frames_async(&js_data, &data_name).await
         })?;
-
-        let js_seq = self.js.clone();
-        let data_name_seq = self.data_stream_name.clone();
-        let last_seq = run_future(&handle, async move {
-            let mut stream = js_seq.get_stream(&data_name_seq).await.map_err(|err| {
-                OperationFailure::new(
-                    FailureCondition::NoArtefactExists,
-                    format!("failed to get stream: {err}"),
-                )
-            })?;
-            let info = stream.info().await.map_err(|err| {
-                OperationFailure::new(
-                    FailureCondition::PrecursorChainBroken(None),
-                    format!("failed to get stream info: {err}"),
-                )
-            })?;
-            Ok::<u64, OperationFailure>(info.state.last_sequence)
-        })?;
+        let fiber_index = SessionIndex::build_from_frames(frames.iter().map(|f| f.as_slice()))?;
+        let mut seen_events = HashSet::new();
+        for frame in &frames {
+            if frame.len() >= 85 {
+                if let Ok((env, consumed)) = EventEnvelope::decode(frame) {
+                    if consumed == frame.len() {
+                        seen_events.insert(env.header.event_id);
+                    }
+                }
+            }
+        }
 
         Ok(NatsWriterSession {
             stem: self.stem.clone(),
@@ -851,12 +853,16 @@ impl NatsStorageAdapter {
             carried_epoch,
             claim,
             rolling_commitment: rolling,
-            last_data_seq: last_seq,
+            last_data_seq,
             client: self.client.clone(),
             js: self.js.clone(),
             runtime: self.runtime.clone(),
             publish_timeout: Duration::from_secs(5),
             simulate_indeterminate: false,
+            fiber_index,
+            seen_events,
+            uncertain: false,
+            uncertain_diagnostic: None,
         })
     }
 
@@ -884,6 +890,20 @@ impl NatsStorageAdapter {
 
         let admission = admit_open(presence, meta_records.latest_claim.clone(), false)?;
 
+        let mut fiber_index = SessionIndex::new();
+        let mut failed = None;
+        if presence == ArtefactPresence::Both || presence == ArtefactPresence::EventDataOnly {
+            let js_data = self.js.clone();
+            let data_name = self.data_stream_name.clone();
+            let (_, frames, _, _) = run_future(&handle, async move {
+                read_data_frames_async(&js_data, &data_name).await
+            })?;
+            match SessionIndex::build_from_frames(frames.iter().map(|f| f.as_slice())) {
+                Ok(idx) => fiber_index = idx,
+                Err(err) => failed = Some(err.condition().clone()),
+            }
+        }
+
         Ok(NatsReaderSession {
             stem: self.stem.clone(),
             meta_stream_name: self.meta_stream_name.clone(),
@@ -893,6 +913,8 @@ impl NatsStorageAdapter {
             rolling_commitment: RollingCommitment::new(),
             js: self.js.clone(),
             runtime: self.runtime.clone(),
+            fiber_index,
+            failed,
         })
     }
 
@@ -1070,6 +1092,10 @@ pub struct NatsWriterSession {
     runtime: Arc<tokio::runtime::Runtime>,
     publish_timeout: Duration,
     simulate_indeterminate: bool,
+    fiber_index: SessionIndex,
+    seen_events: HashSet<[u8; 16]>,
+    uncertain: bool,
+    uncertain_diagnostic: Option<String>,
 }
 
 impl fmt::Debug for NatsWriterSession {
@@ -1090,6 +1116,12 @@ impl NatsWriterSession {
     #[must_use]
     pub fn carried_epoch(&self) -> u64 {
         self.carried_epoch
+    }
+
+    /// Returns the diagnostic detail if the writer entered an uncertain state.
+    #[must_use]
+    pub fn uncertain_diagnostic(&self) -> Option<&str> {
+        self.uncertain_diagnostic.as_deref()
     }
 
     /// Returns the ownership claim record held by this writer session.
@@ -1142,30 +1174,13 @@ impl NatsWriterSession {
         self
     }
 
-    /// Appends a framed payload byte slice to the data stream with per-landing epoch verification and OCC sequence checks.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::StaleEpoch`] if epoch is superseded.
-    /// Returns [`OperationFailure`] with [`FailureCondition::ConcurrencyConflict`] if OCC expected sequence mismatches.
-    pub fn append_frame(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
-        match self.append_frame_verdict(payload)? {
-            WriteLandingVerdict::Landed(frame_count) => Ok(frame_count),
-            WriteLandingVerdict::Undetermined { carried_epoch } => Err(OperationFailure::new(
+    fn check_authority(&self) -> Result<(), OperationFailure> {
+        if self.uncertain {
+            return Err(OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
-                format!("write landing undetermined for carried epoch {carried_epoch} per C5.16"),
-            )),
+                "writer session in uncertain state; reconciliation required",
+            ));
         }
-    }
-
-    /// Appends a framed payload byte slice, returning a [`WriteLandingVerdict`] explicitly handling indeterminate landings per C5.16.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::StaleEpoch`] if epoch is superseded.
-    /// Returns [`OperationFailure`] with [`FailureCondition::ConcurrencyConflict`] if OCC sequence check fails.
-    pub fn append_frame_verdict(
-        &mut self,
-        payload: &[u8],
-    ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
         let js_meta = self.js.clone();
         let meta_name = self.meta_stream_name.clone();
         let handle = self.runtime.handle().clone();
@@ -1191,12 +1206,104 @@ impl NatsWriterSession {
                 "writer epoch superseded in meta stream; write rejected per C5.5 and C12.4",
             ));
         }
+        Ok(())
+    }
+
+    /// Appends a framed payload byte slice to the data stream with per-landing epoch verification and OCC sequence checks.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::StaleEpoch`] if epoch is superseded.
+    /// Returns [`OperationFailure`] with [`FailureCondition::ConcurrencyConflict`] if OCC expected sequence mismatches.
+    pub fn append_frame(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
+        match self.append_frame_verdict(payload)? {
+            WriteLandingVerdict::Landed(frame_count) => Ok(frame_count),
+            WriteLandingVerdict::Undetermined { carried_epoch } => {
+                self.uncertain = true;
+                let diagnostic = format!(
+                    "write landing undetermined for carried epoch {carried_epoch} per C5.16"
+                );
+                if self.uncertain_diagnostic.is_none() {
+                    self.uncertain_diagnostic = Some(diagnostic.clone());
+                }
+                Err(OperationFailure::new(
+                    FailureCondition::OwnershipRecordUnreadable,
+                    diagnostic,
+                ))
+            }
+        }
+    }
+
+    /// Appends a framed payload byte slice, returning a [`WriteLandingVerdict`] explicitly handling indeterminate landings per C5.16.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::StaleEpoch`] if epoch is superseded.
+    /// Returns [`OperationFailure`] with [`FailureCondition::ConcurrencyConflict`] if OCC sequence check fails.
+    pub fn append_frame_verdict(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
+        self.check_authority()?;
+
+        if payload.len() < 85 {
+            return Err(OperationFailure::new(
+                FailureCondition::EnvelopeMismatch,
+                format!("payload too short for event envelope: {}", payload.len()),
+            ));
+        }
+        let (env, consumed) = EventEnvelope::decode(payload).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::EnvelopeMismatch,
+                format!("failed to decode envelope: {err}"),
+            )
+        })?;
+        if consumed != payload.len() {
+            return Err(OperationFailure::new(
+                FailureCondition::EnvelopeMismatch,
+                format!(
+                    "frame decode error: {}",
+                    DecodeError::TruncatedPayload {
+                        expected: payload.len(),
+                        available: consumed,
+                    }
+                ),
+            ));
+        }
+        let reservation = self.fiber_index.prepare_append(&env)?;
+        let event_id = env.header.event_id;
 
         if self.simulate_indeterminate {
+            self.uncertain = true;
+            self.uncertain_diagnostic = Some(
+                "write landing undetermined: simulated indeterminate write landing".to_string(),
+            );
             return Ok(WriteLandingVerdict::Undetermined {
                 carried_epoch: self.carried_epoch,
             });
         }
+
+        let verdict = self.append_frame_verdict_raw(payload)?;
+        match verdict {
+            WriteLandingVerdict::Landed(_) => {
+                self.fiber_index.commit_append(reservation)?;
+                self.seen_events.insert(event_id);
+            }
+            WriteLandingVerdict::Undetermined { carried_epoch } => {
+                self.uncertain = true;
+                if self.uncertain_diagnostic.is_none() {
+                    self.uncertain_diagnostic = Some(format!(
+                        "write landing undetermined for carried epoch {carried_epoch} per C5.16"
+                    ));
+                }
+            }
+        }
+        Ok(verdict)
+    }
+
+    fn append_frame_verdict_raw(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
+        let handle = self.runtime.handle().clone();
 
         let mut frame_buf = Vec::new();
         ContainerFrame::encode_payload(payload, &mut frame_buf);
@@ -1213,7 +1320,7 @@ impl NatsWriterSession {
         let carried_epoch = self.carried_epoch;
         let payload_bytes = frame_buf.clone();
 
-        let ack = run_future(&handle, async move {
+        let (ack, diagnostic) = run_future(&handle, async move {
             let pub_future = js
                 .publish_with_headers(data_name.clone(), headers, payload_bytes.into())
                 .await
@@ -1232,7 +1339,7 @@ impl NatsWriterSession {
                 })?;
 
             match tokio::time::timeout(timeout, pub_future).await {
-                Ok(Ok(ack)) => Ok(WriteLandingVerdict::Landed(ack)),
+                Ok(Ok(ack)) => Ok((WriteLandingVerdict::Landed(ack), None)),
                 Ok(Err(err)) => {
                     if is_wrong_last_sequence(&err) {
                         Err(OperationFailure::new(
@@ -1240,10 +1347,20 @@ impl NatsWriterSession {
                             "two-writer concurrency collision: expected sequence mismatch",
                         ))
                     } else {
-                        Ok(WriteLandingVerdict::Undetermined { carried_epoch })
+                        Ok((
+                            WriteLandingVerdict::Undetermined { carried_epoch },
+                            Some(format!(
+                                "publish ack failed; write landing undetermined: {err}"
+                            )),
+                        ))
                     }
                 }
-                Err(_) => Ok(WriteLandingVerdict::Undetermined { carried_epoch }),
+                Err(_) => Ok((
+                    WriteLandingVerdict::Undetermined { carried_epoch },
+                    Some(format!(
+                        "publish ack timed out after {timeout:?}; write landing undetermined"
+                    )),
+                )),
             }
         })?;
 
@@ -1256,6 +1373,12 @@ impl NatsWriterSession {
                 ))
             }
             WriteLandingVerdict::Undetermined { carried_epoch } => {
+                self.uncertain = true;
+                self.uncertain_diagnostic = diagnostic.or_else(|| {
+                    Some(format!(
+                        "write landing undetermined for carried epoch {carried_epoch} per C5.16"
+                    ))
+                });
                 Ok(WriteLandingVerdict::Undetermined { carried_epoch })
             }
         }
@@ -1284,6 +1407,249 @@ impl NatsWriterSession {
         self.append_frame_verdict(&env_buf)
     }
 
+    /// Appends a raw frame payload to the data stream.
+    ///
+    /// If the payload decodes to an exact [`EventEnvelope`], it undergoes session index pre-admission validation.
+    /// Otherwise, the raw frame is appended and unindexes point lookups.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if authority check fails, pre-admission validation fails, or publish fails.
+    pub fn append_raw_frame(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
+        self.check_authority()?;
+
+        if self.simulate_indeterminate {
+            self.uncertain = true;
+            let diagnostic = format!(
+                "write landing undetermined for carried epoch {} per C5.16",
+                self.carried_epoch
+            );
+            self.uncertain_diagnostic = Some(diagnostic.clone());
+            return Err(OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                diagnostic,
+            ));
+        }
+
+        if payload.len() >= 85 {
+            if let Ok((env, consumed)) = EventEnvelope::decode(payload) {
+                if consumed == payload.len() {
+                    let reservation = self.fiber_index.prepare_append(&env)?;
+                    let verdict = self.append_frame_verdict_raw(payload)?;
+                    return match verdict {
+                        WriteLandingVerdict::Landed(seq) => {
+                            self.fiber_index.commit_append(reservation)?;
+                            self.seen_events.insert(env.header.event_id);
+                            Ok(seq)
+                        }
+                        WriteLandingVerdict::Undetermined { carried_epoch } => {
+                            self.uncertain = true;
+                            let diagnostic = format!(
+                                "write landing undetermined for carried epoch {carried_epoch} per C5.16"
+                            );
+                            if self.uncertain_diagnostic.is_none() {
+                                self.uncertain_diagnostic = Some(diagnostic.clone());
+                            }
+                            Err(OperationFailure::new(
+                                FailureCondition::OwnershipRecordUnreadable,
+                                diagnostic,
+                            ))
+                        }
+                    };
+                }
+            }
+        }
+
+        let verdict = self.append_frame_verdict_raw(payload)?;
+        match verdict {
+            WriteLandingVerdict::Landed(seq) => {
+                self.fiber_index.mark_has_raw_frames();
+                Ok(seq)
+            }
+            WriteLandingVerdict::Undetermined { carried_epoch } => {
+                self.uncertain = true;
+                let diagnostic = format!(
+                    "write landing undetermined for carried epoch {carried_epoch} per C5.16"
+                );
+                if self.uncertain_diagnostic.is_none() {
+                    self.uncertain_diagnostic = Some(diagnostic.clone());
+                }
+                Err(OperationFailure::new(
+                    FailureCondition::OwnershipRecordUnreadable,
+                    diagnostic,
+                ))
+            }
+        }
+    }
+
+    /// Appends an unvalidated raw frame directly to the data stream for testing or migration recovery.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if authority check fails, session is uncertain, or publish fails.
+    #[doc(hidden)]
+    pub fn append_unvalidated_frame(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
+        self.check_authority()?;
+        let verdict = self.append_frame_verdict_raw(payload)?;
+        match verdict {
+            WriteLandingVerdict::Landed(seq) => {
+                self.fiber_index.mark_has_raw_frames();
+                Ok(seq)
+            }
+            WriteLandingVerdict::Undetermined { carried_epoch } => {
+                self.uncertain = true;
+                let diagnostic = format!(
+                    "write landing undetermined for carried epoch {carried_epoch} per C5.16"
+                );
+                if self.uncertain_diagnostic.is_none() {
+                    self.uncertain_diagnostic = Some(diagnostic.clone());
+                }
+                Err(OperationFailure::new(
+                    FailureCondition::OwnershipRecordUnreadable,
+                    diagnostic,
+                ))
+            }
+        }
+    }
+
+    /// Returns a [`FiberHandle`] for the specified fiber identifier.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if the fiber is broken.
+    pub fn fiber(&self, fiber_id: [u8; 16]) -> Result<FiberHandle, OperationFailure> {
+        if self.uncertain {
+            return Err(OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                "writer session in uncertain state; reconciliation required",
+            ));
+        }
+        self.fiber_index.fiber(fiber_id)
+    }
+
+    /// Returns a [`FiberHandle`] derived from a domain key string.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if the fiber is broken.
+    pub fn fiber_with_key(&self, domain_key: &str) -> Result<FiberHandle, OperationFailure> {
+        self.fiber(derive_fiber_id(domain_key))
+    }
+
+    /// Returns the latest event envelope recorded for the specified fiber identifier.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if the fiber is broken.
+    pub fn get_latest(
+        &self,
+        fiber_id: [u8; 16],
+    ) -> Result<Option<&EventEnvelope>, OperationFailure> {
+        if self.uncertain {
+            return Err(OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                "writer session in uncertain state; reconciliation required",
+            ));
+        }
+        self.fiber_index.get_latest(&fiber_id)
+    }
+
+    /// Returns the latest event envelope recorded for the specified domain key.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if the fiber is broken.
+    pub fn get_latest_with_key(
+        &self,
+        domain_key: &str,
+    ) -> Result<Option<&EventEnvelope>, OperationFailure> {
+        self.get_latest(derive_fiber_id(domain_key))
+    }
+
+    /// Appends an event to the specified fiber, minting an envelope and advancing fiber state.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if append is rejected by fiber lifecycle or underlying JetStream storage fails.
+    pub fn append_to_fiber(
+        &mut self,
+        fiber_id: [u8; 16],
+        event_id: [u8; 16],
+        payload: impl Into<Vec<u8>>,
+    ) -> Result<WriteLandingVerdict<EventEnvelope>, OperationFailure> {
+        self.check_authority()?;
+        if self.seen_events.contains(&event_id) {
+            return Err(OperationFailure::new(
+                FailureCondition::PrecursorChainBroken(None),
+                "duplicate event ID observed across writer session per C5.61",
+            ));
+        }
+        let mut handle = self.fiber(fiber_id)?;
+        let envelope = handle.append(event_id, payload)?;
+        let mut env_buf = Vec::new();
+        envelope.encode(&mut env_buf);
+        let verdict = self.append_frame_verdict(&env_buf)?;
+        match verdict {
+            WriteLandingVerdict::Landed(_) => Ok(WriteLandingVerdict::Landed(envelope)),
+            WriteLandingVerdict::Undetermined { carried_epoch } => {
+                Ok(WriteLandingVerdict::Undetermined { carried_epoch })
+            }
+        }
+    }
+
+    /// Detaches the specified fiber, minting a detached envelope and recording soft deletion.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if detach is rejected by fiber lifecycle or underlying JetStream storage fails.
+    pub fn detach_fiber(
+        &mut self,
+        fiber_id: [u8; 16],
+        event_id: [u8; 16],
+        payload: impl Into<Vec<u8>>,
+    ) -> Result<WriteLandingVerdict<EventEnvelope>, OperationFailure> {
+        self.check_authority()?;
+        if self.seen_events.contains(&event_id) {
+            return Err(OperationFailure::new(
+                FailureCondition::PrecursorChainBroken(None),
+                "duplicate event ID observed across writer session per C5.61",
+            ));
+        }
+        let mut handle = self.fiber(fiber_id)?;
+        let envelope = handle.detach(event_id, payload)?;
+        let mut env_buf = Vec::new();
+        envelope.encode(&mut env_buf);
+        let verdict = self.append_frame_verdict(&env_buf)?;
+        match verdict {
+            WriteLandingVerdict::Landed(_) => Ok(WriteLandingVerdict::Landed(envelope)),
+            WriteLandingVerdict::Undetermined { carried_epoch } => {
+                Ok(WriteLandingVerdict::Undetermined { carried_epoch })
+            }
+        }
+    }
+
+    /// Rescues the specified detached or locked fiber, returning it to active state.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if rescue is rejected by fiber lifecycle or underlying JetStream storage fails.
+    pub fn rescue_fiber(
+        &mut self,
+        fiber_id: [u8; 16],
+        event_id: [u8; 16],
+        payload: impl Into<Vec<u8>>,
+    ) -> Result<WriteLandingVerdict<EventEnvelope>, OperationFailure> {
+        self.check_authority()?;
+        if self.seen_events.contains(&event_id) {
+            return Err(OperationFailure::new(
+                FailureCondition::PrecursorChainBroken(None),
+                "duplicate event ID observed across writer session per C5.61",
+            ));
+        }
+        let mut handle = self.fiber(fiber_id)?;
+        let envelope = handle.rescue(event_id, payload)?;
+        let mut env_buf = Vec::new();
+        envelope.encode(&mut env_buf);
+        let verdict = self.append_frame_verdict(&env_buf)?;
+        match verdict {
+            WriteLandingVerdict::Landed(_) => Ok(WriteLandingVerdict::Landed(envelope)),
+            WriteLandingVerdict::Undetermined { carried_epoch } => {
+                Ok(WriteLandingVerdict::Undetermined { carried_epoch })
+            }
+        }
+    }
+
     /// Attaches and validates a schema descriptor to the artefact per C8.2.
     ///
     /// # Errors
@@ -1292,6 +1658,7 @@ impl NatsWriterSession {
         &mut self,
         descriptor: &SchemaDescriptor,
     ) -> Result<(), OperationFailure> {
+        self.check_authority()?;
         descriptor.validate_structural_completeness()?;
         let mut desc_bytes = Vec::new();
         descriptor.root.encode(&mut desc_bytes);
@@ -1308,25 +1675,42 @@ impl NatsWriterSession {
         let js = self.js.clone();
         let meta_name = self.meta_stream_name.clone();
         let handle = self.runtime.handle().clone();
+        let timeout = self.publish_timeout;
 
-        run_future(&handle, async move {
-            js.publish(meta_name.clone(), frame_buf.into())
+        let ack_result = run_future(&handle, async move {
+            let pub_future = js
+                .publish(meta_name.clone(), frame_buf.into())
                 .await
                 .map_err(|err| {
                     OperationFailure::new(
                         FailureCondition::OwnershipRecordUnreadable,
                         format!("failed to publish schema descriptor to meta stream: {err}"),
                     )
-                })?
-                .await
-                .map_err(|err| {
-                    OperationFailure::new(
-                        FailureCondition::OwnershipRecordUnreadable,
-                        format!("failed to ack schema descriptor on meta stream: {err}"),
-                    )
                 })?;
-            Ok(())
-        })
+
+            match tokio::time::timeout(timeout, pub_future).await {
+                Ok(Ok(_ack)) => Ok(None),
+                Ok(Err(err)) => Ok(Some(format!(
+                    "failed to ack schema descriptor on meta stream: {err}"
+                ))),
+                Err(_) => Ok(Some(format!(
+                    "schema descriptor ack timed out after {timeout:?} on meta stream"
+                ))),
+            }
+        })?;
+
+        if let Some(diagnostic) = ack_result {
+            self.uncertain = true;
+            self.uncertain_diagnostic = Some(format!(
+                "schema descriptor write failed; write landing undetermined: {diagnostic}"
+            ));
+            return Err(OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                diagnostic,
+            ));
+        }
+
+        Ok(())
     }
 
     /// Flushes client connection to ensure broker receipt.
@@ -1334,6 +1718,7 @@ impl NatsWriterSession {
     /// # Errors
     /// Returns [`OperationFailure`] if flush fails.
     pub fn sync(&mut self) -> Result<(), OperationFailure> {
+        self.check_authority()?;
         let client = self.client.clone();
         let handle = self.runtime.handle().clone();
         run_future(&handle, async move {
@@ -1343,6 +1728,12 @@ impl NatsWriterSession {
                     format!("failed to flush NATS client: {err}"),
                 )
             })
+        })
+        .inspect_err(|err| {
+            self.uncertain = true;
+            self.uncertain_diagnostic = Some(format!(
+                "sync flush failed; write landing undetermined: {err}"
+            ));
         })
     }
 
@@ -1354,35 +1745,50 @@ impl NatsWriterSession {
         &mut self,
         record: &OwnershipRecord,
     ) -> Result<(), OperationFailure> {
+        self.check_authority()?;
         let js = self.js.clone();
         let meta_name = self.meta_stream_name.clone();
         let record_clone = record.clone();
         let handle = self.runtime.handle().clone();
+        let timeout = self.publish_timeout;
 
-        run_future(&handle, async move {
+        let ack_result = run_future(&handle, async move {
             let mut record_bytes = Vec::new();
             record_clone.encode(&mut record_bytes);
             let mut record_frame = Vec::new();
             ContainerFrame::encode_payload(&record_bytes, &mut record_frame);
 
-            js.publish(meta_name.clone(), record_frame.into())
+            let pub_future = js
+                .publish(meta_name.clone(), record_frame.into())
                 .await
                 .map_err(|err| {
                     OperationFailure::new(
                         FailureCondition::OwnershipRecordUnreadable,
                         format!("failed to publish meta frame: {err}"),
                     )
-                })?
-                .await
-                .map_err(|err| {
-                    OperationFailure::new(
-                        FailureCondition::OwnershipRecordUnreadable,
-                        format!("failed to ack meta frame: {err}"),
-                    )
                 })?;
 
-            Ok(())
-        })
+            match tokio::time::timeout(timeout, pub_future).await {
+                Ok(Ok(_ack)) => Ok(None),
+                Ok(Err(err)) => Ok(Some(format!("failed to ack meta frame: {err}"))),
+                Err(_) => Ok(Some(format!(
+                    "meta frame ack timed out after {timeout:?} on meta stream"
+                ))),
+            }
+        })?;
+
+        if let Some(diagnostic) = ack_result {
+            self.uncertain = true;
+            self.uncertain_diagnostic = Some(format!(
+                "ownership record write failed; write landing undetermined: {diagnostic}"
+            ));
+            return Err(OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                diagnostic,
+            ));
+        }
+
+        Ok(())
     }
 
     /// Appends an outbound generation pointer record to the meta stream per C6.17 and C5.63.
@@ -1451,6 +1857,8 @@ pub struct NatsReaderSession {
     rolling_commitment: RollingCommitment,
     js: async_nats::jetstream::Context,
     runtime: Arc<tokio::runtime::Runtime>,
+    fiber_index: SessionIndex,
+    failed: Option<FailureCondition>,
 }
 
 impl fmt::Debug for NatsReaderSession {
@@ -1558,30 +1966,131 @@ impl NatsReaderSession {
         let js = self.js.clone();
         let data_name = self.data_stream_name.clone();
         let handle = self.runtime.handle().clone();
-        let (_, frames, rolling) = run_future(&handle, async move {
+        let res = run_future(&handle, async move {
             read_data_frames_async(&js, &data_name).await
-        })?;
-        self.rolling_commitment = rolling;
-        Ok(frames)
+        });
+        match res {
+            Ok((_, frames, rolling, _)) => {
+                self.rolling_commitment = rolling;
+                Ok(frames)
+            }
+            Err(err) => {
+                self.failed = Some(err.condition().clone());
+                Err(err)
+            }
+        }
+    }
+
+    fn read_all_envelopes_inner(
+        &mut self,
+        for_migration: bool,
+    ) -> Result<Vec<EventEnvelope>, OperationFailure> {
+        let res = (|| {
+            let frames = self.read_all_frames()?;
+            for frame in &frames {
+                if frame.len() < 85 {
+                    return Err(OperationFailure::new(
+                        FailureCondition::EnvelopeMismatch,
+                        format!(
+                            "frame decode error: {}",
+                            DecodeError::TruncatedPayload {
+                                expected: 85,
+                                available: frame.len(),
+                            }
+                        ),
+                    ));
+                }
+            }
+            let session_index =
+                SessionIndex::build_from_frames(frames.iter().map(|f| f.as_slice()))?;
+            if !for_migration && session_index.has_broken_fibers() {
+                self.fiber_index = session_index;
+                return Err(OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    "discovered break in precursor chain",
+                ));
+            }
+            let envelopes = frames
+                .iter()
+                .map(|frame| SessionIndex::decode_and_validate_frame(frame))
+                .collect::<Result<Vec<_>, _>>()?;
+            self.fiber_index = session_index;
+            Ok(envelopes)
+        })();
+
+        if let Err(ref err) = res {
+            self.failed = Some(err.condition().clone());
+        }
+        res
     }
 
     /// Reads and decodes all event envelopes from the data stream.
     ///
     /// # Errors
-    /// Returns [`OperationFailure`] if frame checksum fails or envelope decode fails.
+    /// Returns [`OperationFailure`] if frame checksum fails, frame is shorter than 85 bytes,
+    /// envelope decode fails, or precursor chain is broken.
     pub fn read_all_envelopes(&mut self) -> Result<Vec<EventEnvelope>, OperationFailure> {
-        let frames = self.read_all_frames()?;
-        let mut envelopes = Vec::with_capacity(frames.len());
-        for frame in &frames {
-            let (env, _) = EventEnvelope::decode(frame).map_err(|err| {
-                OperationFailure::new(
-                    FailureCondition::PrecursorChainBroken(None),
-                    format!("failed to decode event envelope from data stream: {err}"),
-                )
-            })?;
-            envelopes.push(env);
+        self.read_all_envelopes_inner(false)
+    }
+
+    /// Reads and decodes all event envelopes for migration, permitting broken history per C5.28.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if frame checksum fails or envelope decode fails.
+    pub fn read_all_envelopes_for_migration(
+        &mut self,
+    ) -> Result<Vec<EventEnvelope>, OperationFailure> {
+        self.read_all_envelopes_inner(true)
+    }
+
+    /// Returns the latest event envelope recorded for the specified fiber identifier.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if the fiber is broken or reader session has failed.
+    pub fn get_latest(
+        &self,
+        fiber_id: [u8; 16],
+    ) -> Result<Option<&EventEnvelope>, OperationFailure> {
+        if let Some(cond) = &self.failed {
+            return Err(OperationFailure::new(
+                cond.clone(),
+                "reader in failed state",
+            ));
         }
-        Ok(envelopes)
+        self.fiber_index.get_latest(&fiber_id)
+    }
+
+    /// Returns the latest event envelope recorded for the specified domain key.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if the fiber is broken or reader session has failed.
+    pub fn get_latest_with_key(
+        &self,
+        domain_key: &str,
+    ) -> Result<Option<&EventEnvelope>, OperationFailure> {
+        self.get_latest(derive_fiber_id(domain_key))
+    }
+
+    /// Returns a [`FiberHandle`] for the specified fiber identifier.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if the fiber is broken or reader session has failed.
+    pub fn fiber(&self, fiber_id: [u8; 16]) -> Result<FiberHandle, OperationFailure> {
+        if let Some(cond) = &self.failed {
+            return Err(OperationFailure::new(
+                cond.clone(),
+                "reader in failed state",
+            ));
+        }
+        self.fiber_index.fiber(fiber_id)
+    }
+
+    /// Returns a [`FiberHandle`] derived from a domain key string.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if the fiber is broken.
+    pub fn fiber_with_key(&self, domain_key: &str) -> Result<FiberHandle, OperationFailure> {
+        self.fiber(derive_fiber_id(domain_key))
     }
 
     /// Validates structural completeness of the artefact's schema descriptor per C8.2.
@@ -1612,7 +2121,7 @@ impl MigrationSource for NatsStorageAdapter {
 
     fn read_envelopes(&self) -> Result<Vec<EventEnvelope>, OperationFailure> {
         let mut reader = self.open_read()?;
-        reader.read_all_envelopes()
+        reader.read_all_envelopes_for_migration()
     }
 
     fn record_outbound_pointer(
@@ -1645,7 +2154,9 @@ impl MigrationTarget for NatsStorageAdapter {
         let epoch = self.current_epoch()?;
         let mut writer = self.open_write(epoch)?;
         for env in envelopes {
-            writer.append_envelope(env)?;
+            let mut env_buf = Vec::new();
+            env.encode(&mut env_buf);
+            writer.append_unvalidated_frame(&env_buf)?;
         }
         writer.sync()
     }

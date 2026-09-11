@@ -226,13 +226,17 @@ fn test_m7_symmetric_format_vectors_roundtrip() {
     let file_adapter = FileStorageAdapter::new(dir.path().join("vectors_store"));
     let mut file_writer = file_adapter.create(&claim).expect("create file writer");
     for env in &valid_envelopes {
-        file_writer.append_envelope(env).expect("append file env");
+        let mut env_buf = Vec::new();
+        env.encode(&mut env_buf);
+        file_writer
+            .append_unvalidated_frame(&env_buf)
+            .expect("append file raw frame");
     }
     drop(file_writer);
 
     let mut file_reader = file_adapter.open_read().expect("open file reader");
     let file_read_envelopes = file_reader
-        .read_all_envelopes()
+        .read_all_envelopes_for_migration()
         .expect("read file envelopes");
     assert_eq!(file_read_envelopes.len(), valid_envelopes.len());
     for (read, exp) in file_read_envelopes.iter().zip(valid_envelopes.iter()) {
@@ -246,13 +250,17 @@ fn test_m7_symmetric_format_vectors_roundtrip() {
         NatsStorageAdapter::new(server.url(), &nats_stem).expect("connect nats adapter");
     let mut nats_writer = nats_adapter.create(&claim).expect("create nats writer");
     for env in &valid_envelopes {
-        nats_writer.append_envelope(env).expect("append nats env");
+        let mut env_buf = Vec::new();
+        env.encode(&mut env_buf);
+        nats_writer
+            .append_unvalidated_frame(&env_buf)
+            .expect("append nats raw frame");
     }
     drop(nats_writer);
 
     let mut nats_reader = nats_adapter.open_read().expect("open nats reader");
     let nats_read_envelopes = nats_reader
-        .read_all_envelopes()
+        .read_all_envelopes_for_migration()
         .expect("read nats envelopes");
     assert_eq!(nats_read_envelopes.len(), valid_envelopes.len());
     for (read, exp) in nats_read_envelopes.iter().zip(valid_envelopes.iter()) {
@@ -412,7 +420,7 @@ fn test_m7_dimension_1_concurrent_create_and_incomplete_creation() {
         .expect("complete file creation");
     assert_eq!(file_incomplete_adapter.presence(), ArtefactPresence::Both);
     file_completed
-        .append_frame(b"completed-frame")
+        .append_raw_frame(b"completed-frame")
         .expect("append after completion");
     drop(file_completed);
 
@@ -420,7 +428,7 @@ fn test_m7_dimension_1_concurrent_create_and_incomplete_creation() {
     let orphan_adapter = FileStorageAdapter::new(&orphan_path);
     let mut orphan_writer = orphan_adapter.create(&claim).expect("create orphan store");
     orphan_writer
-        .append_frame(b"orphan-frame")
+        .append_raw_frame(b"orphan-frame")
         .expect("append orphan frame");
     drop(orphan_writer);
     fs::remove_file(orphan_adapter.meta_path()).expect("remove meta to make orphan");
@@ -459,7 +467,7 @@ fn test_m7_dimension_1_concurrent_create_and_incomplete_creation() {
         .expect("complete nats creation");
     assert_eq!(nats_incomplete_adapter.presence(), ArtefactPresence::Both);
     nats_completed
-        .append_frame(b"completed-frame")
+        .append_raw_frame(b"completed-frame")
         .expect("append after completion");
 
     let cas_absent_err = evaluate_claim_cas(&RecordedOwnership::Absent, None, &claim).unwrap_err();
@@ -491,13 +499,13 @@ fn test_m7_dimension_2_overlapping_writers_and_epoch_fencing() {
     );
 
     let _ = file_writer1
-        .append_frame(b"file-frame-1")
+        .append_raw_frame(b"file-frame-1")
         .expect("append 1");
     let claim2 = sample_claim(2);
     file_adapter
         .record_ownership_claim(&claim2)
         .expect("supersede file claim");
-    let file_stale_err = file_writer1.append_frame(b"file-frame-2").unwrap_err();
+    let file_stale_err = file_writer1.append_raw_frame(b"file-frame-2").unwrap_err();
     assert_eq!(file_stale_err.condition(), &FailureCondition::StaleEpoch);
 
     let server = LiveNatsServer::acquire();
@@ -507,10 +515,10 @@ fn test_m7_dimension_2_overlapping_writers_and_epoch_fencing() {
     let mut nats_writer2 = nats_adapter.open_write(1).expect("open nats writer 2");
 
     let count1 = nats_writer1
-        .append_frame(b"nats-frame-1")
+        .append_raw_frame(b"nats-frame-1")
         .expect("append 1");
     assert_eq!(count1, 1);
-    let nats_occ_err = nats_writer2.append_frame(b"nats-frame-2").unwrap_err();
+    let nats_occ_err = nats_writer2.append_raw_frame(b"nats-frame-2").unwrap_err();
     assert_eq!(
         nats_occ_err.condition(),
         &FailureCondition::ConcurrencyConflict
@@ -519,7 +527,7 @@ fn test_m7_dimension_2_overlapping_writers_and_epoch_fencing() {
     nats_adapter
         .record_ownership_claim(&claim2)
         .expect("supersede nats claim");
-    let nats_stale_err = nats_writer1.append_frame(b"nats-frame-3").unwrap_err();
+    let nats_stale_err = nats_writer1.append_raw_frame(b"nats-frame-3").unwrap_err();
     assert_eq!(nats_stale_err.condition(), &FailureCondition::StaleEpoch);
 
     assert_eq!(file_stale_err.condition(), nats_stale_err.condition());
@@ -535,15 +543,26 @@ fn test_m7_dimension_3_unreadable_ownership_and_indeterminate_verdict() {
     let claim = sample_claim(1);
 
     let mut nats_writer = nats_adapter.create(&claim).expect("create nats writer");
-    let landed = nats_writer
-        .append_frame_verdict(b"clean-frame")
-        .expect("verdict");
+    let env1 = EventEnvelope::genesis([0x01; 16], [0x11; 16], b"clean-frame").unwrap();
+    let mut buf1 = Vec::new();
+    env1.encode(&mut buf1);
+    let landed = nats_writer.append_frame_verdict(&buf1).expect("verdict");
     assert_eq!(landed, WriteLandingVerdict::Landed(1));
 
     let mut indet_writer = nats_writer.with_simulate_indeterminate(true);
-    let undetermined = indet_writer
-        .append_frame_verdict(b"indet-frame")
-        .expect("verdict");
+    let env2 = EventEnvelope {
+        header: EnvelopeHeader {
+            event_id: [0x02; 16],
+            fiber_id: [0x11; 16],
+            detached: false,
+            precursor: env1.header.event_id,
+            precursor_hash: env1.commitment(),
+        },
+        payload: b"indet-frame".to_vec(),
+    };
+    let mut buf2 = Vec::new();
+    env2.encode(&mut buf2);
+    let undetermined = indet_writer.append_frame_verdict(&buf2).expect("verdict");
     assert_eq!(
         undetermined,
         WriteLandingVerdict::Undetermined { carried_epoch: 1 }
@@ -553,10 +572,10 @@ fn test_m7_dimension_3_unreadable_ownership_and_indeterminate_verdict() {
     let file_store_path = dir.path().join("corrupt_meta_store");
     let file_adapter = FileStorageAdapter::new(&file_store_path);
     let mut file_writer = file_adapter.create(&claim).expect("create file writer");
-    file_writer.append_frame(b"frame-1").expect("append 1");
+    file_writer.append_raw_frame(b"frame-1").expect("append 1");
 
     fs::write(file_adapter.meta_path(), b"garbage_corrupted_meta").expect("corrupt meta");
-    let file_unreadable_err = file_writer.append_frame(b"frame-2").unwrap_err();
+    let file_unreadable_err = file_writer.append_raw_frame(b"frame-2").unwrap_err();
     assert_eq!(
         file_unreadable_err.condition(),
         &FailureCondition::OwnershipRecordUnreadable
@@ -912,8 +931,10 @@ fn test_m7_dimension_7_chain_breaks_and_mismatch_refusal() {
         payload: b"broken_event".to_vec(),
     };
     file_writer.append_envelope(&env1).expect("append env1");
+    let mut broken_buf = Vec::new();
+    broken_env.encode(&mut broken_buf);
     file_writer
-        .append_envelope(&broken_env)
+        .append_unvalidated_frame(&broken_buf)
         .expect("append broken");
 
     let file_manager_refuse = MigrationManager::new(file_src.clone(), file_target.clone())
@@ -938,7 +959,7 @@ fn test_m7_dimension_7_chain_breaks_and_mismatch_refusal() {
     let mut nats_writer = nats_src.open_write(1).expect("open nats writer");
     nats_writer.append_envelope(&env1).expect("append env1");
     nats_writer
-        .append_envelope(&broken_env)
+        .append_unvalidated_frame(&broken_buf)
         .expect("append broken");
 
     let nats_manager_refuse = MigrationManager::new(nats_src.clone(), nats_target.clone())
@@ -999,7 +1020,9 @@ fn test_m7_dimension_8_unanchored_history_and_rolling_commitment() {
         let mut frame_buf = Vec::new();
         ContainerFrame::encode_payload(&payload, &mut frame_buf);
         expected_commitment.update_frame(&frame_buf);
-        file_writer.append_frame(&payload).expect("append frame");
+        file_writer
+            .append_raw_frame(&payload)
+            .expect("append frame");
     }
 
     assert_eq!(
@@ -1024,7 +1047,9 @@ fn test_m7_dimension_8_unanchored_history_and_rolling_commitment() {
 
     for i in 1..=5 {
         let payload = format!("rolling_frame_{i}").into_bytes();
-        nats_writer.append_frame(&payload).expect("append frame");
+        nats_writer
+            .append_raw_frame(&payload)
+            .expect("append frame");
     }
 
     assert_eq!(
@@ -1144,12 +1169,14 @@ fn test_m7_strict_cross_adapter_error_condition_parity() {
         payload: b"broken".to_vec(),
     };
     let mut file_w_broken = file_adapter.open_write(2).expect("open w2 file");
+    let mut broken_buf = Vec::new();
+    broken_env.encode(&mut broken_buf);
     file_w_broken
-        .append_envelope(&broken_env)
+        .append_unvalidated_frame(&broken_buf)
         .expect("append broken file");
     let mut nats_w_broken = nats_adapter.open_write(2).expect("open w2 nats");
     nats_w_broken
-        .append_envelope(&broken_env)
+        .append_unvalidated_frame(&broken_buf)
         .expect("append broken nats");
     drop(file_w_broken);
     drop(nats_w_broken);
@@ -1230,10 +1257,10 @@ fn test_m7_resource_contracts_under_saturation() {
     for seq in 1..=saturation_batch_count {
         let payload = format!("saturation_payload_data_item_{seq}").into_bytes();
         let file_seq = file_writer
-            .append_frame(&payload)
+            .append_raw_frame(&payload)
             .expect("append frame file");
         let nats_seq = nats_writer
-            .append_frame(&payload)
+            .append_raw_frame(&payload)
             .expect("append frame nats");
         assert_eq!(file_seq, seq);
         assert_eq!(nats_seq, seq);
@@ -1291,34 +1318,45 @@ fn test_m7_clean_cancellation_and_shutdown_lock_release() {
     let dir = TestDir::new("shutdown_release_suite");
     let server = LiveNatsServer::acquire();
 
+    let env1 = EventEnvelope::genesis([0x01; 16], [0x22; 16], b"shutdown_frame_1").unwrap();
+    let mut buf1 = Vec::new();
+    env1.encode(&mut buf1);
+
+    let env2 = EventEnvelope {
+        header: EnvelopeHeader {
+            event_id: [0x02; 16],
+            fiber_id: [0x22; 16],
+            detached: false,
+            precursor: env1.header.event_id,
+            precursor_hash: env1.commitment(),
+        },
+        payload: b"shutdown_frame_2".to_vec(),
+    };
+    let mut buf2 = Vec::new();
+    env2.encode(&mut buf2);
+
     let file_adapter = FileStorageAdapter::new(dir.path().join("shutdown_file"));
     let mut file_writer_1 = file_adapter.create(&claim).expect("create file writer 1");
-    file_writer_1
-        .append_frame(b"shutdown_frame_1")
-        .expect("append frame 1");
+    file_writer_1.append_frame(&buf1).expect("append frame 1");
     let file_comm_1 = file_writer_1.rolling_commitment().current_commitment();
     drop(file_writer_1);
 
     let mut file_writer_2 = file_adapter
         .open_write(1)
         .expect("open file writer 2 after writer 1 drop");
-    file_writer_2
-        .append_frame(b"shutdown_frame_2")
-        .expect("append frame 2");
+    file_writer_2.append_frame(&buf2).expect("append frame 2");
     drop(file_writer_2);
 
     let mut file_reader = file_adapter.open_read().expect("open file reader");
     let file_frames = file_reader.read_all_frames().expect("read all file frames");
     assert_eq!(file_frames.len(), 2);
-    assert_eq!(file_frames[0], b"shutdown_frame_1");
-    assert_eq!(file_frames[1], b"shutdown_frame_2");
+    assert_eq!(file_frames[0], buf1);
+    assert_eq!(file_frames[1], buf2);
 
     let nats_stem = unique_nats_stem("shutdown_nats");
     let nats_adapter = NatsStorageAdapter::new(server.url(), &nats_stem).expect("connect nats");
     let mut nats_writer_1 = nats_adapter.create(&claim).expect("create nats writer 1");
-    nats_writer_1
-        .append_frame(b"shutdown_frame_1")
-        .expect("append frame 1");
+    nats_writer_1.append_frame(&buf1).expect("append frame 1");
     let nats_comm_1 = nats_writer_1.rolling_commitment().current_commitment();
     assert_eq!(file_comm_1, nats_comm_1);
     drop(nats_writer_1);
@@ -1326,16 +1364,14 @@ fn test_m7_clean_cancellation_and_shutdown_lock_release() {
     let mut nats_writer_2 = nats_adapter
         .open_write(1)
         .expect("open nats writer 2 after writer 1 drop");
-    nats_writer_2
-        .append_frame(b"shutdown_frame_2")
-        .expect("append frame 2");
+    nats_writer_2.append_frame(&buf2).expect("append frame 2");
     drop(nats_writer_2);
 
     let mut nats_reader = nats_adapter.open_read().expect("open nats reader");
     let nats_frames = nats_reader.read_all_frames().expect("read all nats frames");
     assert_eq!(nats_frames.len(), 2);
-    assert_eq!(nats_frames[0], b"shutdown_frame_1");
-    assert_eq!(nats_frames[1], b"shutdown_frame_2");
+    assert_eq!(nats_frames[0], buf1);
+    assert_eq!(nats_frames[1], buf2);
 
     assert_eq!(
         file_reader.rolling_commitment().current_commitment(),

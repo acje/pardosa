@@ -131,7 +131,7 @@ impl MigrationSource for FileStorageAdapter {
 
     fn read_envelopes(&self) -> Result<Vec<EventEnvelope>, OperationFailure> {
         let mut reader = self.open_read()?;
-        reader.read_all_envelopes()
+        reader.read_all_envelopes_for_migration()
     }
 
     fn record_outbound_pointer(
@@ -163,7 +163,9 @@ impl MigrationTarget for FileStorageAdapter {
         let epoch = self.current_epoch()?;
         let mut writer = self.open_write(epoch)?;
         for env in envelopes {
-            writer.append_envelope(env)?;
+            let mut env_buf = Vec::new();
+            env.encode(&mut env_buf);
+            writer.append_unvalidated_frame(&env_buf)?;
         }
         writer.sync()
     }
