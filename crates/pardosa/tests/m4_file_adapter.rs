@@ -516,3 +516,62 @@ fn test_m4_adapter_retirement_and_generation_records() {
     let frames = reader.read_all_envelopes().expect("read frames");
     assert_eq!(frames.len(), 1);
 }
+
+#[test]
+fn test_m4_append_batch_rolling_commitment_matches_sequential_single_append() {
+    let dir = TestDir::new("batch_vs_single");
+    let store_path_a = dir.path().join("store_single");
+    let store_path_b = dir.path().join("store_batch");
+
+    let adapter_a = FileStorageAdapter::new(&store_path_a);
+    let adapter_b = FileStorageAdapter::new(&store_path_b);
+
+    let claim_a = sample_claim(1);
+    let claim_b = sample_claim(1);
+
+    let mut writer_a = adapter_a.create(&claim_a).expect("create writer a");
+    let mut writer_b = adapter_b.create(&claim_b).expect("create writer b");
+
+    let fiber1 = [0x41; 16];
+    let fiber2 = [0x42; 16];
+
+    let env1 =
+        EventEnvelope::genesis([0x01; 16], fiber1, b"batch-f1-e1".to_vec()).expect("env1 genesis");
+    let env2 =
+        EventEnvelope::chain(&env1, [0x02; 16], b"batch-f1-e2".to_vec()).expect("env2 chain");
+    let env3 =
+        EventEnvelope::genesis([0x03; 16], fiber2, b"batch-f2-e1".to_vec()).expect("env3 genesis");
+
+    writer_a.append_envelope(&env1).expect("single append 1");
+    writer_a.append_envelope(&env2).expect("single append 2");
+    writer_a.append_envelope(&env3).expect("single append 3");
+
+    let batch_count = writer_b
+        .append_batch_envelopes(&[env1.clone(), env2.clone(), env3.clone()])
+        .expect("batch append");
+
+    assert_eq!(batch_count, 3);
+    assert_eq!(
+        writer_b.rolling_commitment().frame_count(),
+        writer_a.rolling_commitment().frame_count()
+    );
+    assert_eq!(
+        writer_b.rolling_commitment().current_commitment(),
+        writer_a.rolling_commitment().current_commitment()
+    );
+
+    let pgno_a = fs::read(adapter_a.pgno_path()).expect("read pgno a");
+    let pgno_b = fs::read(adapter_b.pgno_path()).expect("read pgno b");
+    assert_eq!(pgno_a, pgno_b);
+
+    let mut reader_b = adapter_b.open_read().expect("open reader b");
+    let envelopes_b = reader_b.read_all_envelopes().expect("read all envelopes b");
+    assert_eq!(envelopes_b.len(), 3);
+    assert_eq!(envelopes_b[0], env1);
+    assert_eq!(envelopes_b[1], env2);
+    assert_eq!(envelopes_b[2], env3);
+    assert_eq!(
+        reader_b.rolling_commitment().current_commitment(),
+        writer_a.rolling_commitment().current_commitment()
+    );
+}

@@ -1200,6 +1200,71 @@ impl StorageEngine for FileEngine {
         Ok(WriteLandingVerdict::Landed(self.frame_count))
     }
 
+    fn append_batch(
+        &mut self,
+        blocks: &[&[u8]],
+    ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
+        self.check_authority()?;
+
+        if blocks.is_empty() {
+            return Ok(WriteLandingVerdict::Landed(self.frame_count));
+        }
+
+        if self.simulate_indeterminate {
+            self.uncertain = true;
+            self.uncertain_diagnostic = Some(
+                "write landing undetermined: simulated indeterminate write landing".to_string(),
+            );
+            return Ok(WriteLandingVerdict::Undetermined {
+                carried_epoch: self.carried_epoch,
+            });
+        }
+
+        let file = self.file.as_mut().ok_or_else(|| {
+            OperationFailure::new(
+                FailureCondition::OwnershipUnestablished,
+                "no file open for writing",
+            )
+        })?;
+
+        for block in blocks {
+            let write_res = if self.simulate_write_error {
+                Err(std::io::Error::other("simulated write_all failure"))
+            } else {
+                file.write_all(block)
+            };
+
+            if let Err(err) = write_res {
+                self.uncertain = true;
+                self.uncertain_diagnostic = Some(format!(
+                    "write_all failed; write landing undetermined: {err}"
+                ));
+                return Ok(WriteLandingVerdict::Undetermined {
+                    carried_epoch: self.carried_epoch,
+                });
+            }
+        }
+
+        let sync_res = if self.simulate_sync_error {
+            Err(std::io::Error::other("simulated sync_data failure"))
+        } else {
+            file.sync_data()
+        };
+
+        if let Err(err) = sync_res {
+            self.uncertain = true;
+            self.uncertain_diagnostic = Some(format!(
+                "sync_data failed; write landing undetermined: {err}"
+            ));
+            return Ok(WriteLandingVerdict::Undetermined {
+                carried_epoch: self.carried_epoch,
+            });
+        }
+
+        self.frame_count += blocks.len() as u64;
+        Ok(WriteLandingVerdict::Landed(self.frame_count))
+    }
+
     fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
         let Some(file) = &mut self.file else {
             return Ok(Vec::new());

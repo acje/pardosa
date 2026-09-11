@@ -28,6 +28,29 @@ pub trait StorageEngine {
     /// Returns [`OperationFailure`] if storage write or synchronization fails.
     fn append_block(&mut self, block: &[u8]) -> Result<WriteLandingVerdict<u64>, OperationFailure>;
 
+    /// Appends a batch of raw frame blocks, returning the write landing verdict with sequence or frame count.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if storage write or synchronization fails.
+    fn append_batch(
+        &mut self,
+        blocks: &[&[u8]],
+    ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
+        self.check_authority()?;
+        let mut last_verdict = WriteLandingVerdict::Landed(0);
+        for block in blocks {
+            match self.append_block(block)? {
+                WriteLandingVerdict::Landed(seq) => {
+                    last_verdict = WriteLandingVerdict::Landed(seq);
+                }
+                WriteLandingVerdict::Undetermined { carried_epoch } => {
+                    return Ok(WriteLandingVerdict::Undetermined { carried_epoch });
+                }
+            }
+        }
+        Ok(last_verdict)
+    }
+
     /// Reads a single block at the specified sequence or index.
     ///
     /// # Errors

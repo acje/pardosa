@@ -1350,6 +1350,30 @@ impl OperationFailure {
     pub fn diagnostic_detail(&self) -> &DiagnosticDetail {
         &self.diagnostic_detail
     }
+
+    /// Returns true if the failure condition is StoreAlreadyExists.
+    #[must_use]
+    pub fn is_already_exists(&self) -> bool {
+        matches!(self.condition, FailureCondition::StoreAlreadyExists)
+    }
+
+    /// Returns true if the failure condition is NoArtefactExists.
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        matches!(self.condition, FailureCondition::NoArtefactExists)
+    }
+
+    /// Returns true if the failure condition is ConcurrencyConflict.
+    #[must_use]
+    pub fn is_concurrency_conflict(&self) -> bool {
+        matches!(self.condition, FailureCondition::ConcurrencyConflict)
+    }
+
+    /// Returns true if the failure condition is StaleEpoch.
+    #[must_use]
+    pub fn is_stale_epoch(&self) -> bool {
+        matches!(self.condition, FailureCondition::StaleEpoch)
+    }
 }
 
 impl fmt::Display for OperationFailure {
@@ -3264,6 +3288,33 @@ mod tests {
             format!("{broken_none}"),
             "precursor chain broken: integrity break"
         );
+    }
+
+    #[test]
+    fn test_operation_failure_predicates() {
+        let exists = OperationFailure::new(FailureCondition::StoreAlreadyExists, "exists");
+        assert!(exists.is_already_exists());
+        assert!(!exists.is_not_found());
+        assert!(!exists.is_concurrency_conflict());
+        assert!(!exists.is_stale_epoch());
+
+        let not_found = OperationFailure::new(FailureCondition::NoArtefactExists, "not found");
+        assert!(!not_found.is_already_exists());
+        assert!(not_found.is_not_found());
+        assert!(!not_found.is_concurrency_conflict());
+        assert!(!not_found.is_stale_epoch());
+
+        let conflict = OperationFailure::new(FailureCondition::ConcurrencyConflict, "conflict");
+        assert!(!conflict.is_already_exists());
+        assert!(!conflict.is_not_found());
+        assert!(conflict.is_concurrency_conflict());
+        assert!(!conflict.is_stale_epoch());
+
+        let stale = OperationFailure::new(FailureCondition::StaleEpoch, "stale");
+        assert!(!stale.is_already_exists());
+        assert!(!stale.is_not_found());
+        assert!(!stale.is_concurrency_conflict());
+        assert!(stale.is_stale_epoch());
     }
 
     #[test]

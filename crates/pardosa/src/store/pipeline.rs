@@ -484,6 +484,126 @@ impl<E: StorageEngine> Store<E> {
         }
     }
 
+    /// Appends a batch of framed payload byte slices, returning a [`WriteLandingVerdict`].
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if validation or storage write fails.
+    pub fn append_batch_verdict(
+        &mut self,
+        payloads: &[&[u8]],
+    ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
+        self.engine.check_authority()?;
+        if payloads.is_empty() {
+            return Ok(WriteLandingVerdict::Landed(
+                self.rolling_commitment.frame_count(),
+            ));
+        }
+
+        let mut scratch_index = self.fiber_index.clone();
+        let mut frame_buffers = Vec::with_capacity(payloads.len());
+
+        for payload in payloads {
+            if payload.len() < 85 {
+                return Err(OperationFailure::new(
+                    FailureCondition::EnvelopeMismatch,
+                    format!("payload too short for event envelope: {}", payload.len()),
+                ));
+            }
+            let (env, consumed) = EventEnvelope::decode(payload).map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::EnvelopeMismatch,
+                    format!("failed to decode envelope: {err}"),
+                )
+            })?;
+            if consumed != payload.len() {
+                return Err(OperationFailure::new(
+                    FailureCondition::EnvelopeMismatch,
+                    format!(
+                        "frame decode error: {}",
+                        crate::encoding::DecodeError::TruncatedPayload {
+                            expected: payload.len(),
+                            available: consumed,
+                        }
+                    ),
+                ));
+            }
+
+            scratch_index.validate_append(&env)?;
+            scratch_index.commit_envelope_unchecked(env);
+
+            let mut frame_buf = Vec::new();
+            ContainerFrame::encode_payload(payload, &mut frame_buf);
+            frame_buffers.push(frame_buf);
+        }
+
+        let block_refs: Vec<&[u8]> = frame_buffers.iter().map(|f| f.as_slice()).collect();
+        let verdict = self.engine.append_batch(&block_refs)?;
+
+        match verdict {
+            WriteLandingVerdict::Landed(_) => {
+                for frame_buf in &frame_buffers {
+                    self.rolling_commitment.update_frame(frame_buf);
+                }
+                self.fiber_index = scratch_index;
+                Ok(WriteLandingVerdict::Landed(
+                    self.rolling_commitment.frame_count(),
+                ))
+            }
+            WriteLandingVerdict::Undetermined { carried_epoch } => {
+                Ok(WriteLandingVerdict::Undetermined { carried_epoch })
+            }
+        }
+    }
+
+    /// Appends a batch of framed payload byte slices, unwrapping the landing verdict.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if validation, storage write, or landing fails.
+    pub fn append_batch(&mut self, payloads: &[&[u8]]) -> Result<u64, OperationFailure> {
+        match self.append_batch_verdict(payloads)? {
+            WriteLandingVerdict::Landed(count) => Ok(count),
+            WriteLandingVerdict::Undetermined { .. } => Err(OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                "write landing undetermined: operation may or may not have landed",
+            )),
+        }
+    }
+
+    /// Appends a batch of event envelopes returning a [`WriteLandingVerdict`].
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if validation or storage write fails.
+    pub fn append_batch_envelopes_verdict(
+        &mut self,
+        envelopes: &[EventEnvelope],
+    ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
+        let mut encoded_payloads = Vec::with_capacity(envelopes.len());
+        for env in envelopes {
+            let mut env_buf = Vec::new();
+            env.encode(&mut env_buf);
+            encoded_payloads.push(env_buf);
+        }
+        let payload_refs: Vec<&[u8]> = encoded_payloads.iter().map(|p| p.as_slice()).collect();
+        self.append_batch_verdict(&payload_refs)
+    }
+
+    /// Appends a batch of event envelopes to the container after pre-landing validation.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if validation, storage write, or landing fails.
+    pub fn append_batch_envelopes(
+        &mut self,
+        envelopes: &[EventEnvelope],
+    ) -> Result<u64, OperationFailure> {
+        match self.append_batch_envelopes_verdict(envelopes)? {
+            WriteLandingVerdict::Landed(count) => Ok(count),
+            WriteLandingVerdict::Undetermined { .. } => Err(OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                "write landing undetermined: operation may or may not have landed",
+            )),
+        }
+    }
+
     /// Appends an event to the specified fiber.
     ///
     /// # Errors
@@ -697,6 +817,17 @@ mod tests {
         ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
             self.check_authority()?;
             self.blocks.push(block.to_vec());
+            Ok(WriteLandingVerdict::Landed(self.blocks.len() as u64))
+        }
+
+        fn append_batch(
+            &mut self,
+            blocks: &[&[u8]],
+        ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
+            self.check_authority()?;
+            for block in blocks {
+                self.blocks.push(block.to_vec());
+            }
             Ok(WriteLandingVerdict::Landed(self.blocks.len() as u64))
         }
 
@@ -987,5 +1118,52 @@ mod tests {
             *err_point.condition(),
             FailureCondition::PrecursorChainBroken(None)
         );
+    }
+
+    #[test]
+    fn test_store_append_batch_rolling_commitment_matches_single_append() {
+        let fiber1 = [0x11; 16];
+        let fiber2 = [0x22; 16];
+        let env1 = EventEnvelope::genesis([0x01; 16], fiber1, b"f1-genesis".to_vec())
+            .expect("env1 genesis");
+        let env2 =
+            EventEnvelope::chain(&env1, [0x02; 16], b"f1-event2".to_vec()).expect("env2 chain");
+        let env3 = EventEnvelope::genesis([0x03; 16], fiber2, b"f2-genesis".to_vec())
+            .expect("env3 genesis");
+
+        let mut store_single = Store::open_writer(InMemoryEngine {
+            epoch: 1,
+            ..Default::default()
+        })
+        .expect("open single store");
+
+        store_single.append_envelope(&env1).expect("append env1");
+        store_single.append_envelope(&env2).expect("append env2");
+        store_single.append_envelope(&env3).expect("append env3");
+
+        let mut store_batch = Store::open_writer(InMemoryEngine {
+            epoch: 1,
+            ..Default::default()
+        })
+        .expect("open batch store");
+
+        let batch_count = store_batch
+            .append_batch_envelopes(&[env1, env2, env3])
+            .expect("append batch envelopes");
+
+        assert_eq!(batch_count, 3);
+        assert_eq!(
+            store_batch.rolling_commitment().frame_count(),
+            store_single.rolling_commitment().frame_count()
+        );
+        assert_eq!(
+            store_batch.rolling_commitment().current_commitment(),
+            store_single.rolling_commitment().current_commitment()
+        );
+
+        let h1 = store_batch.fiber(fiber1).expect("fiber1");
+        assert_eq!(h1.event_count(), 2);
+        let h2 = store_batch.fiber(fiber2).expect("fiber2");
+        assert_eq!(h2.event_count(), 1);
     }
 }
