@@ -511,7 +511,7 @@ fn test_m4_adapter_retirement_and_generation_records() {
     );
 
     let mut reader = adapter.open_read().expect("historical read must succeed");
-    assert!(reader.is_retired_source());
+    assert!(reader.is_retired_source().expect("query retired source"));
     assert_eq!(reader.outbound_pointer(), Some(&outbound));
     let frames = reader.read_all_envelopes().expect("read frames");
     assert_eq!(frames.len(), 1);

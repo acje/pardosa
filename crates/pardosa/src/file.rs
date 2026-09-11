@@ -4,13 +4,11 @@ use crate::encoding::{
     DecodeError, EventEnvelope, InboundPointerRecord, MigrationEndRecord, MigrationStartRecord,
     OutboundPointerRecord, OwnershipClaimRecord, OwnershipRecord, RescuePolicyChoiceRecord,
 };
-use crate::schema::{derive_fiber_id, DescriptorNode, SchemaDescriptor};
+use crate::schema::{DescriptorNode, SchemaDescriptor};
 use crate::store::{
-    admit_create, admit_open, ArtefactPresence, FailureCondition, FiberHandle, OpenAdmission,
-    OperationFailure, SessionIndex, WriteLandingVerdict,
+    admit_create, admit_open, ArtefactPresence, FailureCondition, OpenAdmission, OperationFailure,
+    StorageEngine, Store, WriteLandingVerdict,
 };
-use std::collections::HashSet;
-use std::fmt;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -371,31 +369,64 @@ pub fn read_meta_records(meta_path: &Path) -> Result<MetaRecords, OperationFailu
     Ok(records)
 }
 
-fn append_meta_record(meta_path: &Path, record: &OwnershipRecord) -> Result<(), OperationFailure> {
+#[derive(Debug)]
+enum MetaWriteError {
+    Open(OperationFailure),
+    WriteOrSync(OperationFailure),
+}
+
+impl MetaWriteError {
+    fn into_failure(self) -> OperationFailure {
+        match self {
+            Self::Open(f) | Self::WriteOrSync(f) => f,
+        }
+    }
+}
+
+fn append_meta_record(meta_path: &Path, record: &OwnershipRecord) -> Result<(), MetaWriteError> {
+    append_meta_record_impl(meta_path, record, false, false)
+}
+
+fn append_meta_record_impl(
+    meta_path: &Path,
+    record: &OwnershipRecord,
+    simulate_write_error: bool,
+    simulate_sync_error: bool,
+) -> Result<(), MetaWriteError> {
     let mut meta_file = OpenOptions::new()
         .append(true)
         .open(meta_path)
         .map_err(|err| {
-            OperationFailure::new(
+            MetaWriteError::Open(OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
                 format!("failed to open .meta for append: {err}"),
-            )
+            ))
         })?;
     let mut rec_buf = Vec::new();
     record.encode(&mut rec_buf);
     let mut frame_buf = Vec::new();
     ContainerFrame::encode_payload(&rec_buf, &mut frame_buf);
-    meta_file.write_all(&frame_buf).map_err(|err| {
-        OperationFailure::new(
+    let write_res = if simulate_write_error {
+        Err(std::io::Error::other("simulated write_all failure"))
+    } else {
+        meta_file.write_all(&frame_buf)
+    };
+    write_res.map_err(|err| {
+        MetaWriteError::WriteOrSync(OperationFailure::new(
             FailureCondition::OwnershipRecordUnreadable,
             format!("failed to write record to .meta: {err}"),
-        )
+        ))
     })?;
-    meta_file.sync_data().map_err(|err| {
-        OperationFailure::new(
+    let sync_res = if simulate_sync_error {
+        Err(std::io::Error::other("simulated sync_data failure"))
+    } else {
+        meta_file.sync_data()
+    };
+    sync_res.map_err(|err| {
+        MetaWriteError::WriteOrSync(OperationFailure::new(
             FailureCondition::OwnershipRecordUnreadable,
             format!("failed to sync .meta: {err}"),
-        )
+        ))
     })?;
     Ok(())
 }
@@ -585,23 +616,29 @@ impl FileStorageAdapter {
 
         acquire_file_exclusion(&pgno_file, self.exclusion_policy)?;
 
-        Ok(FileWriterSession {
-            file: pgno_file,
+        let engine = FileEngine {
+            file: Some(pgno_file),
             meta_path: self.meta_path.clone(),
             pgno_path: self.pgno_path.clone(),
             carried_epoch: initial_claim.epoch,
-            claim: initial_claim.clone(),
-            rolling_commitment: RollingCommitment::new(),
+            claim: Some(initial_claim.clone()),
+            admission: OpenAdmission::Ready,
+            meta_records: MetaRecords {
+                latest_claim: Some(initial_claim.clone()),
+                ..Default::default()
+            },
             exclusion_policy: self.exclusion_policy,
             locked: true,
-            fiber_index: SessionIndex::new(),
-            seen_events: HashSet::new(),
+            frame_count: 0,
             uncertain: false,
             uncertain_diagnostic: None,
             simulate_indeterminate: false,
             simulate_sync_error: false,
             simulate_write_error: false,
-        })
+        };
+
+        let store = Store::open_writer(engine)?;
+        Ok(FileWriterSession { store })
     }
 
     /// Creates only the .meta component of an artefact for testing incomplete creation per C5.10.
@@ -671,6 +708,21 @@ impl FileStorageAdapter {
                 "artefact creation is not in incomplete state per C5.10",
             ));
         }
+
+        let meta = read_meta_records(&self.meta_path)?;
+        let durable_claim = meta.latest_claim.as_ref().ok_or_else(|| {
+            OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                "no ownership claim found in .meta per C5.12",
+            )
+        })?;
+        if durable_claim != claim {
+            return Err(OperationFailure::new(
+                FailureCondition::OwnershipUnestablished,
+                "supplied claim does not match durable claim in .meta per C5.10",
+            ));
+        }
+
         let mut pgno_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -697,23 +749,26 @@ impl FileStorageAdapter {
         })?;
         acquire_file_exclusion(&pgno_file, self.exclusion_policy)?;
 
-        Ok(FileWriterSession {
-            file: pgno_file,
+        let engine = FileEngine {
+            file: Some(pgno_file),
             meta_path: self.meta_path.clone(),
             pgno_path: self.pgno_path.clone(),
             carried_epoch: claim.epoch,
-            claim: claim.clone(),
-            rolling_commitment: RollingCommitment::new(),
+            claim: Some(claim.clone()),
+            admission: OpenAdmission::Ready,
+            meta_records: meta,
             exclusion_policy: self.exclusion_policy,
             locked: true,
-            fiber_index: SessionIndex::new(),
-            seen_events: HashSet::new(),
+            frame_count: 0,
             uncertain: false,
             uncertain_diagnostic: None,
             simulate_indeterminate: false,
             simulate_sync_error: false,
             simulate_write_error: false,
-        })
+        };
+
+        let store = Store::open_writer(engine)?;
+        Ok(FileWriterSession { store })
     }
 
     /// Opens the artefact strictly for writing with a carried epoch per C5.5, C5.6, C5.62, and C12.4.
@@ -746,7 +801,7 @@ impl FileStorageAdapter {
                         "artefact append authority permanently retired via outbound pointer per C5.63",
                     ));
                 }
-                let claim = meta.latest_claim.ok_or_else(|| {
+                let claim = meta.latest_claim.clone().ok_or_else(|| {
                     OperationFailure::new(
                         FailureCondition::OwnershipUnestablished,
                         "ownership record unseeded; cannot open writer session without established claim per C5.10",
@@ -770,7 +825,7 @@ impl FileStorageAdapter {
                 "artefact append authority permanently retired via outbound pointer per C5.63",
             ));
         }
-        let claim = meta.latest_claim.ok_or_else(|| {
+        let claim = meta.latest_claim.clone().ok_or_else(|| {
             OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
                 "no ownership claim found in .meta per C5.12",
@@ -796,18 +851,7 @@ impl FileStorageAdapter {
 
         acquire_file_exclusion(&pgno_file, self.exclusion_policy)?;
 
-        let (_, frames, rolling) = read_container_frames(&mut pgno_file)?;
-        let fiber_index = SessionIndex::build_from_frames(frames.iter().map(|f| f.as_slice()))?;
-        let mut seen_events = HashSet::new();
-        for frame in &frames {
-            if frame.len() >= 85 {
-                if let Ok((env, consumed)) = EventEnvelope::decode(frame) {
-                    if consumed == frame.len() {
-                        seen_events.insert(env.header.event_id);
-                    }
-                }
-            }
-        }
+        let (_, frames, _) = read_container_frames(&mut pgno_file)?;
         pgno_file.seek(SeekFrom::End(0)).map_err(|err| {
             OperationFailure::new(
                 FailureCondition::PrecursorChainBroken(None),
@@ -815,23 +859,27 @@ impl FileStorageAdapter {
             )
         })?;
 
-        Ok(FileWriterSession {
-            file: pgno_file,
+        let frame_count = frames.len() as u64;
+        let engine = FileEngine {
+            file: Some(pgno_file),
             meta_path: self.meta_path.clone(),
             pgno_path: self.pgno_path.clone(),
             carried_epoch,
-            claim,
-            rolling_commitment: rolling,
+            claim: Some(claim),
+            admission: OpenAdmission::Ready,
+            meta_records: meta,
             exclusion_policy: self.exclusion_policy,
             locked: true,
-            fiber_index,
-            seen_events,
+            frame_count,
             uncertain: false,
             uncertain_diagnostic: None,
             simulate_indeterminate: false,
             simulate_sync_error: false,
             simulate_write_error: false,
-        })
+        };
+
+        let store = Store::open_writer(engine)?;
+        Ok(FileWriterSession { store })
     }
 
     /// Opens the artefact strictly for reading per C5.6, C5.11, C5.62, and C6.14.
@@ -857,7 +905,7 @@ impl FileStorageAdapter {
 
         let admission = admit_open(presence, meta_records.latest_claim.clone(), false)?;
 
-        let (file, fiber_index, failed) = if self.pgno_path.exists() {
+        let (file, frames) = if self.pgno_path.exists() {
             let mut f = OpenOptions::new()
                 .read(true)
                 .open(&self.pgno_path)
@@ -868,32 +916,38 @@ impl FileStorageAdapter {
                     )
                 })?;
             let (_, frames, _) = read_container_frames(&mut f)?;
-            let (fiber_index, failed) =
-                match SessionIndex::build_from_frames(frames.iter().map(|f| f.as_slice())) {
-                    Ok(idx) => (idx, None),
-                    Err(err) => (SessionIndex::new(), Some(err.condition().clone())),
-                };
             f.seek(SeekFrom::Start(0)).map_err(|err| {
                 OperationFailure::new(
                     FailureCondition::PrecursorChainBroken(None),
                     format!("failed to seek .pgno to start: {err}"),
                 )
             })?;
-            (Some(f), fiber_index, failed)
+            (Some(f), frames)
         } else {
-            (None, SessionIndex::new(), None)
+            (None, Vec::new())
         };
 
-        Ok(FileReaderSession {
+        let frame_count = frames.len() as u64;
+        let engine = FileEngine {
             file,
             meta_path: self.meta_path.clone(),
             pgno_path: self.pgno_path.clone(),
+            carried_epoch: meta_records.latest_claim.as_ref().map_or(0, |c| c.epoch),
+            claim: meta_records.latest_claim.clone(),
             admission,
             meta_records,
-            rolling_commitment: RollingCommitment::new(),
-            fiber_index,
-            failed,
-        })
+            exclusion_policy: FileExclusionPolicy::Standard,
+            locked: false,
+            frame_count,
+            uncertain: false,
+            uncertain_diagnostic: None,
+            simulate_indeterminate: false,
+            simulate_sync_error: false,
+            simulate_write_error: false,
+        };
+
+        let store = Store::open_reader(engine);
+        Ok(FileReaderSession { store })
     }
 
     /// Reads all ownership records from the .meta file.
@@ -909,7 +963,7 @@ impl FileStorageAdapter {
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
     pub fn record_meta_record(&self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
-        append_meta_record(&self.meta_path, record)
+        append_meta_record(&self.meta_path, record).map_err(MetaWriteError::into_failure)
     }
 
     /// Appends an updated ownership claim record to the .meta file.
@@ -1003,50 +1057,27 @@ impl FileStorageAdapter {
     }
 }
 
-/// Active writer session holding exclusive OS lock on .pgno file per C5.6, C5.65.
-pub struct FileWriterSession {
-    file: File,
+/// Pure filesystem storage driver implementing [`StorageEngine`].
+#[derive(Debug)]
+pub struct FileEngine {
+    file: Option<File>,
     meta_path: PathBuf,
     pgno_path: PathBuf,
     carried_epoch: u64,
-    claim: OwnershipClaimRecord,
-    rolling_commitment: RollingCommitment,
+    claim: Option<OwnershipClaimRecord>,
+    admission: OpenAdmission,
+    meta_records: MetaRecords,
     exclusion_policy: FileExclusionPolicy,
     locked: bool,
-    fiber_index: SessionIndex,
-    seen_events: HashSet<[u8; 16]>,
-    uncertain: bool,
-    uncertain_diagnostic: Option<String>,
-    simulate_indeterminate: bool,
-    simulate_sync_error: bool,
-    simulate_write_error: bool,
+    frame_count: u64,
+    pub(crate) uncertain: bool,
+    pub(crate) uncertain_diagnostic: Option<String>,
+    pub(crate) simulate_indeterminate: bool,
+    pub(crate) simulate_sync_error: bool,
+    pub(crate) simulate_write_error: bool,
 }
 
-impl FileWriterSession {
-    /// Returns the monotonic epoch carried by this writer session.
-    #[must_use]
-    pub fn carried_epoch(&self) -> u64 {
-        self.carried_epoch
-    }
-
-    /// Returns the diagnostic detail if the writer entered an uncertain state.
-    #[must_use]
-    pub fn uncertain_diagnostic(&self) -> Option<&str> {
-        self.uncertain_diagnostic.as_deref()
-    }
-
-    /// Returns the ownership claim record held by this writer session.
-    #[must_use]
-    pub fn claim(&self) -> &OwnershipClaimRecord {
-        &self.claim
-    }
-
-    /// Returns the current running physical rolling commitment per C5.26.
-    #[must_use]
-    pub fn rolling_commitment(&self) -> &RollingCommitment {
-        &self.rolling_commitment
-    }
-
+impl FileEngine {
     /// Returns the path to the ownership record file (.meta).
     #[must_use]
     pub fn meta_path(&self) -> &Path {
@@ -1059,28 +1090,10 @@ impl FileWriterSession {
         &self.pgno_path
     }
 
-    /// Configures whether to simulate an indeterminate write landing per C5.16.
-    #[cfg(any(test, feature = "unstable-test-support"))]
+    /// Returns all ownership records read from .meta.
     #[must_use]
-    pub fn with_simulate_indeterminate(mut self, simulate: bool) -> Self {
-        self.simulate_indeterminate = simulate;
-        self
-    }
-
-    /// Configures whether to simulate a sync_data failure on write.
-    #[cfg(any(test, feature = "unstable-test-support"))]
-    #[must_use]
-    pub fn with_simulate_sync_error(mut self, simulate: bool) -> Self {
-        self.simulate_sync_error = simulate;
-        self
-    }
-
-    /// Configures whether to simulate a write_all failure on write.
-    #[cfg(any(test, feature = "unstable-test-support"))]
-    #[must_use]
-    pub fn with_simulate_write_error(mut self, simulate: bool) -> Self {
-        self.simulate_write_error = simulate;
-        self
+    pub fn meta_records(&self) -> &MetaRecords {
+        &self.meta_records
     }
 
     fn check_authority(&self) -> Result<(), OperationFailure> {
@@ -1088,6 +1101,15 @@ impl FileWriterSession {
             return Err(OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
                 "writer session in uncertain state; reconciliation required",
+            ));
+        }
+        if self.file.is_some()
+            && !self.locked
+            && self.exclusion_policy == FileExclusionPolicy::Standard
+        {
+            return Err(OperationFailure::new(
+                FailureCondition::AnotherOwnerHoldsExclusion,
+                "writer session has released or does not hold required file exclusion per C5.6 and C5.65",
             ));
         }
         let meta = read_meta_records(&self.meta_path)?;
@@ -1111,107 +1133,19 @@ impl FileWriterSession {
         }
         Ok(())
     }
+}
 
-    fn append_frame_raw(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
-        self.check_authority()?;
-
-        let mut frame_buf = Vec::new();
-        ContainerFrame::encode_payload(payload, &mut frame_buf);
-        let write_res = if self.simulate_write_error {
-            Err(std::io::Error::other("simulated write_all failure"))
-        } else {
-            self.file.write_all(&frame_buf)
-        };
-        write_res.map_err(|err| {
-            self.uncertain = true;
-            self.uncertain_diagnostic = Some(format!(
-                "write_all failed; write landing undetermined: {err}"
-            ));
-            OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                format!("write landing undetermined on write_all failure: {err}"),
-            )
-        })?;
-        let sync_res = if self.simulate_sync_error {
-            Err(std::io::Error::other("simulated sync_data failure"))
-        } else {
-            self.file.sync_data()
-        };
-        sync_res.map_err(|err| {
-            self.uncertain = true;
-            self.uncertain_diagnostic = Some(format!(
-                "sync_data failed; write landing undetermined: {err}"
-            ));
-            OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                format!("write landing undetermined on sync_data failure: {err}"),
-            )
-        })?;
-        self.rolling_commitment.update_frame(&frame_buf);
-        Ok(self.rolling_commitment.frame_count())
+impl StorageEngine for FileEngine {
+    fn carried_epoch(&self) -> u64 {
+        self.carried_epoch
     }
 
-    /// Appends a framed payload byte slice to .pgno with per-landing epoch verification per C5.5 and C12.4.
-    ///
-    /// [`WriteLandingVerdict`] is the authoritative C5.16 outcome returned by [`Self::append_to_fiber`],
-    /// [`Self::detach_fiber`], [`Self::rescue_fiber`], [`Self::append_frame_verdict`], and
-    /// [`Self::append_envelope_verdict`].
-    ///
-    /// This method is a convenience wrapper returning `Result<u64, OperationFailure>` (unwrapping
-    /// [`WriteLandingVerdict::Landed`], mapping [`WriteLandingVerdict::Undetermined`] to
-    /// [`FailureCondition::OwnershipRecordUnreadable`]), matching the established `pardosa-nats`
-    /// API contract since 0.5.1.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::StaleEpoch`] if epoch is superseded.
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if write landing is undetermined.
-    pub fn append_frame(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
-        match self.append_frame_verdict(payload)? {
-            WriteLandingVerdict::Landed(count) => Ok(count),
-            WriteLandingVerdict::Undetermined { .. } => Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                "write landing undetermined; session in uncertain state",
-            )),
-        }
+    fn check_authority(&self) -> Result<(), OperationFailure> {
+        self.check_authority()
     }
 
-    /// Appends a framed payload byte slice, returning a [`WriteLandingVerdict`] explicitly handling indeterminate landings per C5.16.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::StaleEpoch`] if epoch is superseded.
-    /// Returns [`OperationFailure`] with [`FailureCondition::EnvelopeMismatch`] if frame decode or validation fails.
-    pub fn append_frame_verdict(
-        &mut self,
-        payload: &[u8],
-    ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
+    fn append_block(&mut self, block: &[u8]) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
         self.check_authority()?;
-
-        if payload.len() < 85 {
-            return Err(OperationFailure::new(
-                FailureCondition::EnvelopeMismatch,
-                format!("payload too short for event envelope: {}", payload.len()),
-            ));
-        }
-        let (env, consumed) = EventEnvelope::decode(payload).map_err(|err| {
-            OperationFailure::new(
-                FailureCondition::EnvelopeMismatch,
-                format!("failed to decode envelope: {err}"),
-            )
-        })?;
-        if consumed != payload.len() {
-            return Err(OperationFailure::new(
-                FailureCondition::EnvelopeMismatch,
-                format!(
-                    "frame decode error: {}",
-                    DecodeError::TruncatedPayload {
-                        expected: payload.len(),
-                        available: consumed,
-                    }
-                ),
-            ));
-        }
-        let reservation = self.fiber_index.prepare_append(&env)?;
-        let event_id = env.header.event_id;
 
         if self.simulate_indeterminate {
             self.uncertain = true;
@@ -1223,13 +1157,17 @@ impl FileWriterSession {
             });
         }
 
-        let mut frame_buf = Vec::new();
-        ContainerFrame::encode_payload(payload, &mut frame_buf);
+        let file = self.file.as_mut().ok_or_else(|| {
+            OperationFailure::new(
+                FailureCondition::OwnershipUnestablished,
+                "no file open for writing",
+            )
+        })?;
 
         let write_res = if self.simulate_write_error {
             Err(std::io::Error::other("simulated write_all failure"))
         } else {
-            self.file.write_all(&frame_buf)
+            file.write_all(block)
         };
 
         if let Err(err) = write_res {
@@ -1245,7 +1183,7 @@ impl FileWriterSession {
         let sync_res = if self.simulate_sync_error {
             Err(std::io::Error::other("simulated sync_data failure"))
         } else {
-            self.file.sync_data()
+            file.sync_data()
         };
 
         if let Err(err) = sync_res {
@@ -1258,381 +1196,305 @@ impl FileWriterSession {
             });
         }
 
-        self.rolling_commitment.update_frame(&frame_buf);
-        self.fiber_index.commit_append(reservation)?;
-        self.seen_events.insert(event_id);
-        Ok(WriteLandingVerdict::Landed(
-            self.rolling_commitment.frame_count(),
-        ))
+        self.frame_count += 1;
+        Ok(WriteLandingVerdict::Landed(self.frame_count))
     }
 
-    /// Appends an event envelope returning a [`WriteLandingVerdict`].
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if candidate validation, append, or epoch verification fails.
-    pub fn append_envelope_verdict(
-        &mut self,
-        envelope: &EventEnvelope,
-    ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-        let mut env_buf = Vec::new();
-        envelope.encode(&mut env_buf);
-        self.append_frame_verdict(&env_buf)
-    }
-
-    /// Appends an event envelope to .pgno after pre-landing validation against the session index.
-    ///
-    /// [`WriteLandingVerdict`] is the authoritative C5.16 outcome returned by [`Self::append_to_fiber`],
-    /// [`Self::detach_fiber`], [`Self::rescue_fiber`], [`Self::append_frame_verdict`], and
-    /// [`Self::append_envelope_verdict`].
-    ///
-    /// This method is a convenience wrapper returning `Result<u64, OperationFailure>` (unwrapping
-    /// [`WriteLandingVerdict::Landed`], mapping [`WriteLandingVerdict::Undetermined`] to
-    /// [`FailureCondition::OwnershipRecordUnreadable`]), matching the established `pardosa-nats`
-    /// API contract since 0.5.1.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if candidate validation, append, or epoch verification fails.
-    pub fn append_envelope(&mut self, envelope: &EventEnvelope) -> Result<u64, OperationFailure> {
-        match self.append_envelope_verdict(envelope)? {
-            WriteLandingVerdict::Landed(count) => Ok(count),
-            WriteLandingVerdict::Undetermined { .. } => Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                "write landing undetermined; session in uncertain state",
-            )),
-        }
-    }
-
-    /// Appends a raw frame payload to the container.
-    ///
-    /// If the payload decodes to an exact [`EventEnvelope`], it undergoes session index pre-admission validation.
-    /// Otherwise, the raw frame is appended and unindexes point lookups.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if authority check fails, pre-admission validation fails, or write/sync fails.
-    pub fn append_raw_frame(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
-        self.check_authority()?;
-
-        if payload.len() >= 85 {
-            if let Ok((env, consumed)) = EventEnvelope::decode(payload) {
-                if consumed == payload.len() {
-                    let reservation = self.fiber_index.prepare_append(&env)?;
-                    let count = self.append_frame_raw(payload)?;
-                    self.fiber_index.commit_append(reservation)?;
-                    self.seen_events.insert(env.header.event_id);
-                    return Ok(count);
-                }
-            }
-        }
-
-        let count = self.append_frame_raw(payload)?;
-        self.fiber_index.mark_has_raw_frames();
-        Ok(count)
-    }
-
-    /// Appends an unvalidated raw frame directly to the container for testing or migration recovery.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if authority check fails, session is uncertain, or write/sync fails.
-    #[doc(hidden)]
-    pub fn append_unvalidated_frame(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
-        let count = self.append_frame_raw(payload)?;
-        self.fiber_index.mark_has_raw_frames();
-        Ok(count)
-    }
-
-    /// Returns a [`FiberHandle`] for the specified fiber identifier.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if the fiber is broken.
-    pub fn fiber(&self, fiber_id: [u8; 16]) -> Result<FiberHandle, OperationFailure> {
-        if self.uncertain {
-            return Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                "writer session in uncertain state; reconciliation required",
-            ));
-        }
-        self.fiber_index.fiber(fiber_id)
-    }
-
-    /// Returns a [`FiberHandle`] derived from a domain key string.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if the fiber is broken.
-    pub fn fiber_with_key(&self, domain_key: &str) -> Result<FiberHandle, OperationFailure> {
-        self.fiber(derive_fiber_id(domain_key))
-    }
-
-    /// Returns the latest event envelope recorded for the specified fiber identifier.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if the fiber is broken.
-    pub fn get_latest(
-        &self,
-        fiber_id: [u8; 16],
-    ) -> Result<Option<&EventEnvelope>, OperationFailure> {
-        if self.uncertain {
-            return Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                "writer session in uncertain state; reconciliation required",
-            ));
-        }
-        self.fiber_index.get_latest(&fiber_id)
-    }
-
-    /// Returns the latest event envelope recorded for the specified domain key.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if the fiber is broken.
-    pub fn get_latest_with_key(
-        &self,
-        domain_key: &str,
-    ) -> Result<Option<&EventEnvelope>, OperationFailure> {
-        self.get_latest(derive_fiber_id(domain_key))
-    }
-
-    /// Appends an event to the specified fiber, minting an envelope and advancing fiber state.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if append is rejected by fiber lifecycle or underlying storage fails.
-    pub fn append_to_fiber(
-        &mut self,
-        fiber_id: [u8; 16],
-        event_id: [u8; 16],
-        payload: impl Into<Vec<u8>>,
-    ) -> Result<WriteLandingVerdict<EventEnvelope>, OperationFailure> {
-        self.check_authority()?;
-        if self.seen_events.contains(&event_id) {
-            return Err(OperationFailure::new(
+    fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
+        let Some(file) = &mut self.file else {
+            return Ok(Vec::new());
+        };
+        file.seek(SeekFrom::Start(0)).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::NoArtefactExists,
+                format!("failed to seek container file: {err}"),
+            )
+        })?;
+        let (_, frames, _) = read_container_frames(file)?;
+        file.seek(SeekFrom::End(0)).map_err(|err| {
+            OperationFailure::new(
                 FailureCondition::PrecursorChainBroken(None),
-                "duplicate event ID observed across writer session per C5.61",
-            ));
-        }
-        let mut handle = self.fiber(fiber_id)?;
-        let envelope = handle.append(event_id, payload)?;
-        let mut env_buf = Vec::new();
-        envelope.encode(&mut env_buf);
-        let verdict = self.append_frame_verdict(&env_buf)?;
-        match verdict {
-            WriteLandingVerdict::Landed(_) => Ok(WriteLandingVerdict::Landed(envelope)),
-            WriteLandingVerdict::Undetermined { carried_epoch } => {
-                Ok(WriteLandingVerdict::Undetermined { carried_epoch })
-            }
-        }
+                format!("failed to seek to end of container: {err}"),
+            )
+        })?;
+        Ok(frames)
     }
 
-    /// Detaches the specified fiber, minting a detached envelope and recording soft deletion.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if detach is rejected by fiber lifecycle or underlying storage fails.
-    pub fn detach_fiber(
-        &mut self,
-        fiber_id: [u8; 16],
-        event_id: [u8; 16],
-        payload: impl Into<Vec<u8>>,
-    ) -> Result<WriteLandingVerdict<EventEnvelope>, OperationFailure> {
+    fn acquire_exclusion(&mut self) -> Result<(), OperationFailure> {
+        if let Some(f) = &self.file {
+            acquire_file_exclusion(f, self.exclusion_policy)?;
+            self.locked = true;
+        }
+        Ok(())
+    }
+
+    fn release_exclusion(&mut self) -> Result<(), OperationFailure> {
+        if self.locked && self.exclusion_policy == FileExclusionPolicy::Standard {
+            if let Some(f) = &self.file {
+                f.unlock().map_err(|err| {
+                    OperationFailure::new(
+                        FailureCondition::ExclusionUnavailable,
+                        format!("failed to release file exclusion: {err}"),
+                    )
+                })?;
+                self.locked = false;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_retired(&self) -> Result<bool, OperationFailure> {
+        let meta = read_meta_records(&self.meta_path)?;
+        Ok(meta.outbound_pointer.is_some())
+    }
+
+    fn sync(&mut self) -> Result<(), OperationFailure> {
         self.check_authority()?;
-        if self.seen_events.contains(&event_id) {
-            return Err(OperationFailure::new(
-                FailureCondition::PrecursorChainBroken(None),
-                "duplicate event ID observed across writer session per C5.61",
-            ));
+        if let Some(f) = &mut self.file {
+            f.sync_data().map_err(|err| {
+                self.uncertain = true;
+                self.uncertain_diagnostic = Some(format!(
+                    "sync_data failed; write landing undetermined: {err}"
+                ));
+                OperationFailure::new(
+                    FailureCondition::OwnershipRecordUnreadable,
+                    format!("failed to sync .pgno: {err}"),
+                )
+            })?;
         }
-        let mut handle = self.fiber(fiber_id)?;
-        let envelope = handle.detach(event_id, payload)?;
-        let mut env_buf = Vec::new();
-        envelope.encode(&mut env_buf);
-        let verdict = self.append_frame_verdict(&env_buf)?;
-        match verdict {
-            WriteLandingVerdict::Landed(_) => Ok(WriteLandingVerdict::Landed(envelope)),
-            WriteLandingVerdict::Undetermined { carried_epoch } => {
-                Ok(WriteLandingVerdict::Undetermined { carried_epoch })
-            }
-        }
+        Ok(())
     }
 
-    /// Rescues the specified detached or locked fiber, returning it to active state.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if rescue is rejected by fiber lifecycle or underlying storage fails.
-    pub fn rescue_fiber(
-        &mut self,
-        fiber_id: [u8; 16],
-        event_id: [u8; 16],
-        payload: impl Into<Vec<u8>>,
-    ) -> Result<WriteLandingVerdict<EventEnvelope>, OperationFailure> {
-        self.check_authority()?;
-        if self.seen_events.contains(&event_id) {
-            return Err(OperationFailure::new(
-                FailureCondition::PrecursorChainBroken(None),
-                "duplicate event ID observed across writer session per C5.61",
-            ));
-        }
-        let mut handle = self.fiber(fiber_id)?;
-        let envelope = handle.rescue(event_id, payload)?;
-        let mut env_buf = Vec::new();
-        envelope.encode(&mut env_buf);
-        let verdict = self.append_frame_verdict(&env_buf)?;
-        match verdict {
-            WriteLandingVerdict::Landed(_) => Ok(WriteLandingVerdict::Landed(envelope)),
-            WriteLandingVerdict::Undetermined { carried_epoch } => {
-                Ok(WriteLandingVerdict::Undetermined { carried_epoch })
-            }
-        }
+    fn uncertain_diagnostic(&self) -> Option<&str> {
+        self.uncertain_diagnostic.as_deref()
     }
 
-    /// Attaches and validates a schema descriptor to the artefact per C8.2.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if schema descriptor is structurally incomplete or write fails.
-    pub fn set_schema_descriptor(
+    fn claim(&self) -> Option<&OwnershipClaimRecord> {
+        self.claim.as_ref()
+    }
+
+    fn admission(&self) -> &OpenAdmission {
+        &self.admission
+    }
+
+    fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
+        self.meta_records.schema_descriptor.as_ref()
+    }
+
+    fn set_schema_descriptor(
         &mut self,
         descriptor: &SchemaDescriptor,
     ) -> Result<(), OperationFailure> {
-        self.check_authority()?;
-        descriptor.validate_structural_completeness()?;
-        let mut desc_bytes = Vec::new();
-        descriptor.root.encode(&mut desc_bytes);
+        let mut descriptor_bytes = Vec::new();
+        descriptor.root.encode(&mut descriptor_bytes);
         let record = OwnershipRecord::SchemaDescriptor {
             schema_version: descriptor.version,
-            descriptor_bytes: desc_bytes,
+            descriptor_bytes,
         };
-        append_meta_record(&self.meta_path, &record).inspect_err(|err| {
-            self.uncertain = true;
-            self.uncertain_diagnostic = Some(format!(
-                "metadata write failed; write landing undetermined: {err}"
-            ));
-        })
+        self.record_meta_record(&record)
     }
 
-    /// Flushes and syncs all pending writes to disk.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if sync fails.
-    pub fn sync(&mut self) -> Result<(), OperationFailure> {
+    fn record_meta_record(&mut self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
         self.check_authority()?;
-        self.file.sync_data().map_err(|err| {
-            self.uncertain = true;
-            self.uncertain_diagnostic = Some(format!(
-                "sync_data failed; write landing undetermined: {err}"
+        if self.uncertain {
+            return Err(OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                format!(
+                    "writer session is uncertain: {}",
+                    self.uncertain_diagnostic.as_deref().unwrap_or("unknown")
+                ),
             ));
-            OperationFailure::new(
-                FailureCondition::PrecursorChainBroken(None),
-                format!("failed to sync .pgno: {err}"),
-            )
-        })
-    }
-
-    /// Appends an arbitrary ownership record to the .meta file.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_meta_record(&mut self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
-        self.check_authority()?;
-        append_meta_record(&self.meta_path, record).inspect_err(|err| {
-            self.uncertain = true;
-            self.uncertain_diagnostic = Some(format!(
-                "metadata write failed; write landing undetermined: {err}"
-            ));
-        })
-    }
-
-    /// Appends an outbound generation pointer record to the .meta file per C6.17 and C5.63.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_outbound_pointer(
-        &mut self,
-        pointer: &OutboundPointerRecord,
-    ) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::OutboundPointer(pointer.clone()))
-    }
-
-    /// Appends an inbound generation pointer record to the .meta file per C6.16.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_inbound_pointer(
-        &mut self,
-        pointer: &InboundPointerRecord,
-    ) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::InboundPointer(pointer.clone()))
-    }
-
-    /// Appends a migration start record to the .meta file per C4.13.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_migration_start(
-        &mut self,
-        start: &MigrationStartRecord,
-    ) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::MigrationStart(start.clone()))
-    }
-
-    /// Appends a migration end record to the .meta file per C4.13.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_migration_end(
-        &mut self,
-        end: &MigrationEndRecord,
-    ) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::MigrationEnd(end.clone()))
-    }
-
-    /// Appends a rescue policy choice record to the .meta file per C4.13.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_rescue_policy_choice(
-        &mut self,
-        choice: &RescuePolicyChoiceRecord,
-    ) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::RescuePolicyChoice(choice.clone()))
-    }
-}
-
-impl fmt::Debug for FileWriterSession {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FileWriterSession")
-            .field("meta_path", &self.meta_path)
-            .field("pgno_path", &self.pgno_path)
-            .field("carried_epoch", &self.carried_epoch)
-            .field("claim", &self.claim)
-            .field("exclusion_policy", &self.exclusion_policy)
-            .field("locked", &self.locked)
-            .finish()
-    }
-}
-
-impl Drop for FileWriterSession {
-    fn drop(&mut self) {
-        if self.locked && self.exclusion_policy == FileExclusionPolicy::Standard {
-            let _ = self.file.unlock();
         }
+        match append_meta_record_impl(
+            &self.meta_path,
+            record,
+            self.simulate_write_error,
+            self.simulate_sync_error,
+        ) {
+            Ok(()) => {}
+            Err(MetaWriteError::Open(err)) => {
+                return Err(err);
+            }
+            Err(MetaWriteError::WriteOrSync(err)) => {
+                self.uncertain = true;
+                self.uncertain_diagnostic = Some(format!(
+                    "metadata write failed; write landing undetermined: {err}"
+                ));
+                return Err(err);
+            }
+        }
+        match record {
+            OwnershipRecord::OwnershipClaim(claim) => {
+                self.meta_records.latest_claim = Some(claim.clone());
+            }
+            OwnershipRecord::SchemaDescriptor {
+                schema_version,
+                descriptor_bytes,
+            } => {
+                let (root, _) = DescriptorNode::decode(descriptor_bytes).map_err(|err| {
+                    OperationFailure::new(
+                        FailureCondition::OwnershipRecordUnreadable,
+                        format!("failed to decode schema descriptor in .meta: {err}"),
+                    )
+                })?;
+                self.meta_records.schema_descriptor =
+                    Some(SchemaDescriptor::new(*schema_version, root));
+            }
+            OwnershipRecord::OutboundPointer(pointer) => {
+                self.meta_records.outbound_pointer = Some(pointer.clone());
+            }
+            OwnershipRecord::InboundPointer(pointer) => {
+                self.meta_records.inbound_pointer = Some(pointer.clone());
+            }
+            OwnershipRecord::MigrationStart(start) => {
+                self.meta_records.migration_start = Some(start.clone());
+            }
+            OwnershipRecord::MigrationEnd(end) => {
+                self.meta_records.migration_end = Some(end.clone());
+            }
+            OwnershipRecord::RescuePolicyChoice(choice) => {
+                self.meta_records.rescue_policy_choice = Some(choice.clone());
+            }
+            OwnershipRecord::IdentityStructure(_) | OwnershipRecord::CleanRelease(_) => {}
+        }
+        Ok(())
+    }
+
+    fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
+        self.meta_records.outbound_pointer.as_ref()
+    }
+
+    fn inbound_pointer(&self) -> Option<&InboundPointerRecord> {
+        self.meta_records.inbound_pointer.as_ref()
+    }
+
+    fn migration_start(&self) -> Option<&MigrationStartRecord> {
+        self.meta_records.migration_start.as_ref()
+    }
+
+    fn migration_end(&self) -> Option<&MigrationEndRecord> {
+        self.meta_records.migration_end.as_ref()
+    }
+
+    fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
+        self.meta_records.rescue_policy_choice.as_ref()
+    }
+
+    fn set_simulate_indeterminate(&mut self, simulate: bool) {
+        self.simulate_indeterminate = simulate;
+    }
+}
+
+impl FileEngine {
+    fn best_effort_unlock_on_drop(&mut self) {
+        if self.locked && self.exclusion_policy == FileExclusionPolicy::Standard {
+            if let Some(f) = &self.file {
+                match f.unlock() {
+                    Ok(()) | Err(_) => {
+                        self.locked = false;
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for FileEngine {
+    fn drop(&mut self) {
+        self.best_effort_unlock_on_drop();
+    }
+}
+
+/// Active writer session holding exclusive OS lock on .pgno file per C5.6, C5.65.
+#[derive(Debug)]
+pub struct FileWriterSession {
+    store: Store<FileEngine>,
+}
+
+impl std::ops::Deref for FileWriterSession {
+    type Target = Store<FileEngine>;
+    fn deref(&self) -> &Self::Target {
+        &self.store
+    }
+}
+
+impl std::ops::DerefMut for FileWriterSession {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.store
+    }
+}
+
+impl FileWriterSession {
+    /// Returns the active ownership claim record.
+    #[must_use]
+    pub fn claim(&self) -> &OwnershipClaimRecord {
+        self.store
+            .engine()
+            .claim()
+            .expect("writer session must have admitted claim")
+    }
+
+    /// Releases exclusive file lock and consumes write authority.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if releasing exclusion fails.
+    pub fn release_exclusion(mut self) -> Result<(), OperationFailure> {
+        self.store.engine.release_exclusion()
+    }
+
+    /// Returns the path to the ownership record file (.meta).
+    #[must_use]
+    pub fn meta_path(&self) -> &Path {
+        self.store.engine().meta_path()
+    }
+
+    /// Returns the path to the event data container file (.pgno).
+    #[must_use]
+    pub fn pgno_path(&self) -> &Path {
+        self.store.engine().pgno_path()
+    }
+
+    /// Returns all ownership records read from .meta.
+    #[must_use]
+    pub fn meta_records(&self) -> &MetaRecords {
+        self.store.engine().meta_records()
+    }
+
+    /// Configures whether to simulate an indeterminate write landing per C5.16.
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    #[must_use]
+    pub fn with_simulate_indeterminate(mut self, simulate: bool) -> Self {
+        self.store.set_simulate_indeterminate(simulate);
+        self
+    }
+
+    /// Configures whether to simulate a sync_data failure on write.
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    #[must_use]
+    pub fn with_simulate_sync_error(mut self, simulate: bool) -> Self {
+        self.store.engine.simulate_sync_error = simulate;
+        self
+    }
+
+    /// Configures whether to simulate a write_all failure on write.
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    #[must_use]
+    pub fn with_simulate_write_error(mut self, simulate: bool) -> Self {
+        self.store.engine.simulate_write_error = simulate;
+        self
     }
 }
 
 /// Reader session providing non-exclusive read-only access to an artefact container per C5.6, C5.11, and C6.14.
+#[derive(Debug)]
 pub struct FileReaderSession {
-    file: Option<File>,
-    meta_path: PathBuf,
-    pgno_path: PathBuf,
-    admission: OpenAdmission,
-    meta_records: MetaRecords,
-    rolling_commitment: RollingCommitment,
-    fiber_index: SessionIndex,
-    failed: Option<FailureCondition>,
+    store: Store<FileEngine>,
 }
 
-impl fmt::Debug for FileReaderSession {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FileReaderSession")
-            .field("meta_path", &self.meta_path)
-            .field("pgno_path", &self.pgno_path)
-            .field("admission", &self.admission)
-            .field("meta_records", &self.meta_records)
-            .finish()
+impl std::ops::Deref for FileReaderSession {
+    type Target = Store<FileEngine>;
+    fn deref(&self) -> &Self::Target {
+        &self.store
     }
 }
 
@@ -1640,233 +1502,53 @@ impl FileReaderSession {
     /// Returns the path to the ownership record file (.meta).
     #[must_use]
     pub fn meta_path(&self) -> &Path {
-        &self.meta_path
+        self.store.engine().meta_path()
     }
 
     /// Returns the path to the event data container file (.pgno).
     #[must_use]
     pub fn pgno_path(&self) -> &Path {
-        &self.pgno_path
+        self.store.engine().pgno_path()
     }
 
-    /// Returns the open admission status for this reader session.
-    #[must_use]
-    pub fn admission(&self) -> &OpenAdmission {
-        &self.admission
-    }
-
-    /// Returns all meta records decoded from .meta.
+    /// Returns all ownership records read from .meta.
     #[must_use]
     pub fn meta_records(&self) -> &MetaRecords {
-        &self.meta_records
-    }
-
-    /// Returns the recorded ownership claim if present.
-    #[must_use]
-    pub fn claim(&self) -> Option<&OwnershipClaimRecord> {
-        self.meta_records.latest_claim.as_ref()
-    }
-
-    /// Returns the recorded schema descriptor if present.
-    #[must_use]
-    pub fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
-        self.meta_records.schema_descriptor.as_ref()
-    }
-
-    /// Returns the outbound generation pointer if present.
-    #[must_use]
-    pub fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
-        self.meta_records.outbound_pointer.as_ref()
-    }
-
-    /// Returns the inbound generation pointer if present.
-    #[must_use]
-    pub fn inbound_pointer(&self) -> Option<&InboundPointerRecord> {
-        self.meta_records.inbound_pointer.as_ref()
-    }
-
-    /// Returns the migration start record if present.
-    #[must_use]
-    pub fn migration_start(&self) -> Option<&MigrationStartRecord> {
-        self.meta_records.migration_start.as_ref()
-    }
-
-    /// Returns the migration end record if present.
-    #[must_use]
-    pub fn migration_end(&self) -> Option<&MigrationEndRecord> {
-        self.meta_records.migration_end.as_ref()
-    }
-
-    /// Returns the rescue policy choice record if present.
-    #[must_use]
-    pub fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
-        self.meta_records.rescue_policy_choice.as_ref()
-    }
-
-    /// Returns true if this artefact is a retired migration source per C5.63.
-    #[must_use]
-    pub fn is_retired_source(&self) -> bool {
-        self.meta_records.outbound_pointer.is_some()
-    }
-
-    /// Returns the running physical rolling commitment computed across read frames.
-    #[must_use]
-    pub fn rolling_commitment(&self) -> &RollingCommitment {
-        &self.rolling_commitment
+        self.store.engine().meta_records()
     }
 
     /// Reads all framed payloads from the .pgno container file, validating CRC32C on each frame.
     ///
     /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::PrecursorChainBroken`] if checksum fails or file corrupted.
+    /// Returns [`OperationFailure`] if reading fails or frame checksum fails.
     pub fn read_all_frames(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
-        let Some(file) = &mut self.file else {
-            return Ok(Vec::new());
-        };
-        let res = read_container_frames(file);
-        match res {
-            Ok((_, frames, rolling)) => {
-                self.rolling_commitment = rolling;
-                Ok(frames)
-            }
-            Err(err) => {
-                self.failed = Some(err.condition().clone());
-                Err(err)
-            }
-        }
+        self.store.read_all_frames()
     }
 
-    fn read_all_envelopes_inner(
-        &mut self,
-        for_migration: bool,
-    ) -> Result<Vec<EventEnvelope>, OperationFailure> {
-        let res = (|| {
-            let frames = self.read_all_frames()?;
-            for frame in &frames {
-                if frame.len() < 85 {
-                    return Err(OperationFailure::new(
-                        FailureCondition::EnvelopeMismatch,
-                        format!(
-                            "frame decode error: {}",
-                            DecodeError::TruncatedPayload {
-                                expected: 85,
-                                available: frame.len(),
-                            }
-                        ),
-                    ));
-                }
-            }
-            let session_index =
-                SessionIndex::build_from_frames(frames.iter().map(|f| f.as_slice()))?;
-            if !for_migration && session_index.has_broken_fibers() {
-                self.fiber_index = session_index;
-                return Err(OperationFailure::new(
-                    FailureCondition::PrecursorChainBroken(None),
-                    "discovered break in precursor chain",
-                ));
-            }
-            let envelopes = frames
-                .iter()
-                .map(|frame| SessionIndex::decode_and_validate_frame(frame))
-                .collect::<Result<Vec<_>, _>>()?;
-            self.fiber_index = session_index;
-            Ok(envelopes)
-        })();
-
-        if let Err(ref err) = res {
-            self.failed = Some(err.condition().clone());
-        }
-        res
-    }
-
-    /// Reads and decodes all event envelopes from the .pgno container file.
+    /// Reads and decodes all event envelopes from the container.
     ///
     /// # Errors
-    /// Returns [`OperationFailure`] if frame checksum fails, frame is shorter than 85 bytes,
-    /// envelope decode fails, or precursor chain is broken.
+    /// Returns [`OperationFailure`] if any frame is invalid or history contains broken fibers.
     pub fn read_all_envelopes(&mut self) -> Result<Vec<EventEnvelope>, OperationFailure> {
-        self.read_all_envelopes_inner(false)
+        self.store.read_all_envelopes()
     }
 
-    /// Reads and decodes all event envelopes for migration, permitting broken history per C5.28.
+    /// Reads all event envelopes for migration, tolerating broken fiber history.
     ///
     /// # Errors
-    /// Returns [`OperationFailure`] if frame checksum fails or envelope decode fails.
+    /// Returns [`OperationFailure`] if reading frames fails or frame decoding fails.
     pub fn read_all_envelopes_for_migration(
         &mut self,
     ) -> Result<Vec<EventEnvelope>, OperationFailure> {
-        self.read_all_envelopes_inner(true)
-    }
-
-    /// Returns the latest event envelope recorded for the specified fiber identifier.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if the fiber is broken or reader session has failed.
-    pub fn get_latest(
-        &self,
-        fiber_id: [u8; 16],
-    ) -> Result<Option<&EventEnvelope>, OperationFailure> {
-        if let Some(cond) = &self.failed {
-            return Err(OperationFailure::new(
-                cond.clone(),
-                "reader in failed state",
-            ));
-        }
-        self.fiber_index.get_latest(&fiber_id)
-    }
-
-    /// Returns the latest event envelope recorded for the specified domain key.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if the fiber is broken or reader session has failed.
-    pub fn get_latest_with_key(
-        &self,
-        domain_key: &str,
-    ) -> Result<Option<&EventEnvelope>, OperationFailure> {
-        self.get_latest(derive_fiber_id(domain_key))
-    }
-
-    /// Returns a [`FiberHandle`] for the specified fiber identifier.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if the fiber is broken or reader session has failed.
-    pub fn fiber(&self, fiber_id: [u8; 16]) -> Result<FiberHandle, OperationFailure> {
-        if let Some(cond) = &self.failed {
-            return Err(OperationFailure::new(
-                cond.clone(),
-                "reader in failed state",
-            ));
-        }
-        self.fiber_index.fiber(fiber_id)
-    }
-
-    /// Returns a [`FiberHandle`] derived from a domain key string.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if the fiber is broken.
-    pub fn fiber_with_key(&self, domain_key: &str) -> Result<FiberHandle, OperationFailure> {
-        self.fiber(derive_fiber_id(domain_key))
-    }
-
-    /// Validates structural completeness of the artefact's schema descriptor per C8.2.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::MissingSchemaDescriptor`] if descriptor is absent.
-    /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] if descriptor is invalid.
-    pub fn validate_schema_completeness(&self) -> Result<(), OperationFailure> {
-        match self.schema_descriptor() {
-            Some(descriptor) => descriptor.validate_structural_completeness(),
-            None => Err(OperationFailure::new(
-                FailureCondition::MissingSchemaDescriptor,
-                "artefact schema descriptor is absent per C8.2",
-            )),
-        }
+        self.store.read_all_envelopes_for_migration()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::EventEnvelope;
+    use crate::schema::derive_fiber_id;
     use crate::store::FiberState;
 
     #[test]
@@ -2218,7 +1900,7 @@ mod tests {
         let mut broken_bytes = Vec::new();
         broken_env.encode(&mut broken_bytes);
         writer
-            .append_frame_raw(&broken_bytes)
+            .append_unvalidated_frame(&broken_bytes)
             .expect("append raw frame");
 
         let read_err = reader.read_all_envelopes().unwrap_err();
@@ -2276,7 +1958,9 @@ mod tests {
             operator_label: "test-operator".to_string(),
         };
         let mut writer = adapter.create(&claim).expect("create writer");
-        writer.uncertain = true;
+        writer.store.engine.uncertain = true;
+        writer.store.engine.uncertain_diagnostic =
+            Some("writer session in uncertain state; reconciliation required".to_string());
         let descriptor = crate::schema::SchemaDescriptor::new(
             1,
             crate::schema::DescriptorNode::Struct {
@@ -2319,14 +2003,18 @@ mod tests {
             .expect("append raw frame");
 
         let reader = adapter.open_read().expect("open reader with raw frames");
-        assert!(reader.failed.is_some());
+        assert!(reader.broken_reader_cause.is_some());
         let err = reader.get_latest([0x11; 16]).unwrap_err();
         assert_eq!(*err.condition(), FailureCondition::EnvelopeMismatch);
-        assert!(err.to_string().contains("reader in failed state"));
+        assert!(err
+            .to_string()
+            .contains("reader session retained broken state"));
 
         let err_fiber = reader.fiber([0x11; 16]).unwrap_err();
         assert_eq!(*err_fiber.condition(), FailureCondition::EnvelopeMismatch);
-        assert!(err_fiber.to_string().contains("reader in failed state"));
+        assert!(err_fiber
+            .to_string()
+            .contains("reader session retained broken state"));
     }
 
     #[test]
@@ -2597,14 +2285,7 @@ mod tests {
             *meta_err.condition(),
             FailureCondition::OwnershipRecordUnreadable
         );
-
-        let meta_diag = meta_writer
-            .uncertain_diagnostic()
-            .expect("retained metadata diagnostic");
-        assert!(
-            meta_diag.starts_with("metadata write failed; write landing undetermined:"),
-            "expected metadata write prefix, found: {meta_diag}"
-        );
+        assert!(meta_writer.uncertain_diagnostic().is_none());
 
         #[cfg(unix)]
         {
@@ -2621,5 +2302,358 @@ mod tests {
             perms.set_readonly(false);
             std::fs::set_permissions(meta_writer.meta_path(), perms).expect("restore permissions");
         }
+
+        meta_writer
+            .record_meta_record(&dummy_record)
+            .expect("recording succeeds after restoring permissions");
+        assert!(meta_writer.uncertain_diagnostic().is_none());
+    }
+
+    #[test]
+    fn test_file_metadata_authority_checks() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stem = temp_dir.path().join("test_file_meta_auth");
+        let adapter = FileStorageAdapter::new(&stem);
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1u8; 16],
+            boot_id: [2u8; 16],
+            process_id: 12345,
+            process_start_time_ns: 1_000_000,
+            claim_time_ns: 2_000_000,
+            operator_label: "test-operator".to_string(),
+        };
+        let mut writer = adapter.create(&claim).expect("create writer");
+
+        let borrowed_claim: &OwnershipClaimRecord = writer.claim();
+        assert_eq!(borrowed_claim.epoch, 1);
+
+        let mut claim2 = claim.clone();
+        claim2.epoch = 2;
+        append_meta_record(writer.meta_path(), &OwnershipRecord::OwnershipClaim(claim2))
+            .expect("append higher epoch");
+
+        let choice = RescuePolicyChoiceRecord {
+            policy_tag: 0,
+            parameter_payload: vec![],
+        };
+        let err_meta = writer.record_rescue_policy_choice(&choice).unwrap_err();
+        assert_eq!(*err_meta.condition(), FailureCondition::StaleEpoch);
+
+        let descriptor = SchemaDescriptor::new(1, DescriptorNode::U64);
+        let err_schema = writer.set_schema_descriptor(&descriptor).unwrap_err();
+        assert_eq!(*err_schema.condition(), FailureCondition::StaleEpoch);
+
+        let meta_records = adapter.read_meta_records().expect("read meta");
+        assert!(meta_records.rescue_policy_choice.is_none());
+        assert!(meta_records.schema_descriptor.is_none());
+    }
+
+    #[test]
+    fn test_file_writer_release_exclusion_consumes_authority() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stem = temp_dir.path().join("test_file_release_excl");
+        let adapter = FileStorageAdapter::new(&stem);
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1u8; 16],
+            boot_id: [2u8; 16],
+            process_id: 12345,
+            process_start_time_ns: 1_000_000,
+            claim_time_ns: 2_000_000,
+            operator_label: "test-operator".to_string(),
+        };
+        let writer = adapter.create(&claim).expect("create writer");
+        writer
+            .release_exclusion()
+            .expect("release exclusion succeeds");
+
+        let writer2 = adapter
+            .open_write(1)
+            .expect("second writer succeeds after release");
+        assert_eq!(writer2.claim().epoch, 1);
+    }
+
+    #[test]
+    fn test_file_metadata_only_open_reads_empty_frames() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stem = temp_dir.path().join("test_file_meta_only");
+        let adapter = FileStorageAdapter::new(&stem);
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1u8; 16],
+            boot_id: [2u8; 16],
+            process_id: 12345,
+            process_start_time_ns: 1_000_000,
+            claim_time_ns: 2_000_000,
+            operator_label: "test-operator".to_string(),
+        };
+        adapter
+            .create_incomplete_meta_only(&claim)
+            .expect("create meta only");
+
+        let mut reader = adapter
+            .open_read()
+            .expect("open read succeeds on meta only");
+        let frames = reader
+            .read_all_frames()
+            .expect("read frames on meta only succeeds");
+        assert!(frames.is_empty());
+        let envelopes = reader
+            .read_all_envelopes()
+            .expect("read envelopes on meta only succeeds");
+        assert!(envelopes.is_empty());
+        let claim_opt: Option<&OwnershipClaimRecord> = reader.claim();
+        assert_eq!(claim_opt.map(|c| c.epoch), Some(1));
+    }
+
+    #[test]
+    fn test_file_sync_authority_check_and_error_uncertainty() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stem = temp_dir.path().join("test_file_sync_auth");
+        let adapter = FileStorageAdapter::new(&stem);
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1u8; 16],
+            boot_id: [2u8; 16],
+            process_id: 12345,
+            process_start_time_ns: 1_000_000,
+            claim_time_ns: 2_000_000,
+            operator_label: "test-operator".to_string(),
+        };
+        let mut writer = adapter.create(&claim).expect("create writer");
+
+        let mut claim2 = claim.clone();
+        claim2.epoch = 2;
+        append_meta_record(writer.meta_path(), &OwnershipRecord::OwnershipClaim(claim2))
+            .expect("append higher epoch");
+
+        let sync_err = writer.sync().unwrap_err();
+        assert_eq!(*sync_err.condition(), FailureCondition::StaleEpoch);
+    }
+
+    #[test]
+    fn test_file_reader_terminal_failure_on_corrupted_frame() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stem = temp_dir.path().join("test_file_reader_terminal");
+        let adapter = FileStorageAdapter::new(&stem);
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1u8; 16],
+            boot_id: [2u8; 16],
+            process_id: 12345,
+            process_start_time_ns: 1_000_000,
+            claim_time_ns: 2_000_000,
+            operator_label: "test-operator".to_string(),
+        };
+        let mut writer = adapter.create(&claim).expect("create writer");
+        let fiber_id = [0x42; 16];
+        writer
+            .append_to_fiber(fiber_id, [0x01; 16], b"payload")
+            .expect("append");
+
+        let mut reader = adapter.open_read().expect("open read");
+        let latest = reader
+            .get_latest(fiber_id)
+            .expect("get latest before corruption");
+        assert!(latest.is_some());
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(reader.pgno_path())
+            .unwrap();
+        file.seek(SeekFrom::End(-1)).unwrap();
+        file.write_all(&[0xFF]).unwrap();
+
+        let read_err = reader.read_all_frames().unwrap_err();
+        assert_eq!(
+            *read_err.condition(),
+            FailureCondition::PrecursorChainBroken(None)
+        );
+
+        let point_err = reader.get_latest(fiber_id).unwrap_err();
+        assert_eq!(
+            *point_err.condition(),
+            FailureCondition::PrecursorChainBroken(None)
+        );
+        let fiber_err = reader.fiber(fiber_id).unwrap_err();
+        assert_eq!(
+            *fiber_err.condition(),
+            FailureCondition::PrecursorChainBroken(None)
+        );
+    }
+
+    #[test]
+    fn test_file_migration_read_rejects_malformed_envelope() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stem = temp_dir.path().join("test_file_migration_malformed");
+        let adapter = FileStorageAdapter::new(&stem);
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1u8; 16],
+            boot_id: [2u8; 16],
+            process_id: 12345,
+            process_start_time_ns: 1_000_000,
+            claim_time_ns: 2_000_000,
+            operator_label: "test-operator".to_string(),
+        };
+        let mut writer = adapter.create(&claim).expect("create writer");
+        writer
+            .append_unvalidated_frame(b"short-payload")
+            .expect("append short frame");
+
+        let mut reader = adapter.open_read().expect("open read");
+        let err = reader.read_all_envelopes_for_migration().unwrap_err();
+        assert_eq!(*err.condition(), FailureCondition::EnvelopeMismatch);
+    }
+
+    #[test]
+    fn test_file_record_meta_record_prewrite_failure_preserves_certainty_and_recovers() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stem = temp_dir.path().join("test_meta_prewrite_recovery");
+        let adapter = FileStorageAdapter::new(&stem);
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1u8; 16],
+            boot_id: [2u8; 16],
+            process_id: 12345,
+            process_start_time_ns: 1_000_000,
+            claim_time_ns: 2_000_000,
+            operator_label: "test-operator".to_string(),
+        };
+        let mut writer = adapter.create(&claim).expect("create writer");
+        let meta_path = stem.with_extension("meta");
+
+        let mut perms = std::fs::metadata(&meta_path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&meta_path, perms).unwrap();
+
+        let inbound_record = OwnershipRecord::InboundPointer(InboundPointerRecord {
+            prior_generation_locator_id: [0x88; 16],
+            prior_generation_epoch: 2,
+        });
+
+        let err = writer.record_meta_record(&inbound_record).unwrap_err();
+        assert_eq!(
+            *err.condition(),
+            FailureCondition::OwnershipRecordUnreadable
+        );
+        assert!(err.to_string().contains("failed to open .meta for append"));
+        assert!(writer.uncertain_diagnostic().is_none());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&meta_path, std::fs::Permissions::from_mode(0o644))
+                .expect("restore permissions");
+        }
+        #[cfg(not(unix))]
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            let mut restore_perms = std::fs::metadata(&meta_path).unwrap().permissions();
+            restore_perms.set_readonly(false);
+            std::fs::set_permissions(&meta_path, restore_perms).unwrap();
+        }
+
+        writer
+            .record_meta_record(&inbound_record)
+            .expect("recording meta record succeeds after permissions restored");
+        assert!(writer.uncertain_diagnostic().is_none());
+        assert!(writer.inbound_pointer().is_some());
+
+        let fiber_id = [0x55; 16];
+        let event_id = [0x77; 16];
+        let verdict = writer
+            .append_to_fiber(fiber_id, event_id, b"payload-after-meta-recovery")
+            .expect("append succeeds after meta recovery");
+        assert!(matches!(verdict, WriteLandingVerdict::Landed(_)));
+        assert!(writer.uncertain_diagnostic().is_none());
+    }
+
+    #[test]
+    fn test_file_record_meta_record_write_or_sync_failure_marks_uncertain() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stem = temp_dir.path().join("test_meta_write_or_sync_failure");
+        let adapter = FileStorageAdapter::new(&stem);
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1u8; 16],
+            boot_id: [2u8; 16],
+            process_id: 12345,
+            process_start_time_ns: 1_000_000,
+            claim_time_ns: 2_000_000,
+            operator_label: "test-operator".to_string(),
+        };
+        let writer = adapter.create(&claim).expect("create writer");
+        let mut sync_err_writer = writer.with_simulate_sync_error(true);
+
+        let inbound_record = OwnershipRecord::InboundPointer(InboundPointerRecord {
+            prior_generation_locator_id: [0x88; 16],
+            prior_generation_epoch: 2,
+        });
+
+        let err = sync_err_writer
+            .record_meta_record(&inbound_record)
+            .unwrap_err();
+        assert_eq!(
+            *err.condition(),
+            FailureCondition::OwnershipRecordUnreadable
+        );
+        assert!(err.to_string().contains("simulated sync_data failure"));
+        assert!(sync_err_writer.uncertain_diagnostic().is_some());
+        let diag = sync_err_writer.uncertain_diagnostic().unwrap();
+        assert!(diag.contains("metadata write failed; write landing undetermined"));
+        assert!(diag.contains("failed to sync .meta: simulated sync_data failure"));
+
+        let subsequent_err = sync_err_writer
+            .record_meta_record(&inbound_record)
+            .unwrap_err();
+        assert_eq!(
+            *subsequent_err.condition(),
+            FailureCondition::OwnershipRecordUnreadable
+        );
+        assert!(subsequent_err
+            .to_string()
+            .contains("writer session in uncertain state"));
+
+        let fiber_id = [0x55; 16];
+        let event_id = [0x77; 16];
+        let append_err = sync_err_writer
+            .append_to_fiber(fiber_id, event_id, b"payload-during-uncertainty")
+            .unwrap_err();
+        assert_eq!(
+            *append_err.condition(),
+            FailureCondition::OwnershipRecordUnreadable
+        );
+        assert!(append_err
+            .to_string()
+            .contains("writer session in uncertain state"));
+
+        let stem_write = temp_dir.path().join("test_meta_write_failure");
+        let adapter_write = FileStorageAdapter::new(&stem_write);
+        let writer_write = adapter_write.create(&claim).expect("create writer 2");
+        let mut write_err_writer = writer_write.with_simulate_write_error(true);
+
+        let err_write = write_err_writer
+            .record_meta_record(&inbound_record)
+            .unwrap_err();
+        assert_eq!(
+            *err_write.condition(),
+            FailureCondition::OwnershipRecordUnreadable
+        );
+        assert!(err_write
+            .to_string()
+            .contains("simulated write_all failure"));
+        assert!(write_err_writer.uncertain_diagnostic().is_some());
+        let diag_write = write_err_writer.uncertain_diagnostic().unwrap();
+        assert!(diag_write.contains("metadata write failed; write landing undetermined"));
+        assert!(diag_write.contains("failed to write record to .meta: simulated write_all failure"));
+
+        let subsequent_write_err = write_err_writer
+            .record_meta_record(&inbound_record)
+            .unwrap_err();
+        assert!(subsequent_write_err
+            .to_string()
+            .contains("writer session in uncertain state"));
     }
 }

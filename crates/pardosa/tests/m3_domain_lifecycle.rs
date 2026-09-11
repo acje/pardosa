@@ -697,15 +697,17 @@ fn run_rustc(code: &str) -> (bool, String) {
     let entries = std::fs::read_dir(&deps_dir)
         .unwrap_or_else(|e| panic!("failed to read deps dir {}: {e}", deps_dir.display()));
     let mut rlibs = Vec::new();
+    let mut nats_rlibs = Vec::new();
     for entry in entries {
         let entry =
             entry.unwrap_or_else(|e| panic!("failed to read entry in {}: {e}", deps_dir.display()));
         let p = entry.path();
-        if p.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|s| s.starts_with("libpardosa-") && s.ends_with(".rlib"))
-        {
-            rlibs.push(p);
+        if let Some(s) = p.file_name().and_then(|n| n.to_str()) {
+            if s.starts_with("libpardosa-") && s.ends_with(".rlib") {
+                rlibs.push(p.clone());
+            } else if s.starts_with("libpardosa_nats-") && s.ends_with(".rlib") {
+                nats_rlibs.push(p);
+            }
         }
     }
     let rlib = match rlibs.len() {
@@ -723,15 +725,32 @@ fn run_rustc(code: &str) -> (bool, String) {
             rlibs.pop().unwrap()
         }
     };
+    let nats_rlib = match nats_rlibs.len() {
+        0 => None,
+        1 => Some(nats_rlibs.remove(0)),
+        _ => {
+            nats_rlibs.sort_by_key(|p| {
+                std::fs::metadata(p)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+            });
+            Some(nats_rlibs.pop().unwrap())
+        }
+    };
 
     let rustc_cmd = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-    let mut child = Command::new(&rustc_cmd)
-        .arg("--edition")
+    let mut cmd = Command::new(&rustc_cmd);
+    cmd.arg("--edition")
         .arg("2021")
         .arg("-L")
         .arg(&deps_dir)
         .arg("--extern")
-        .arg(format!("pardosa={}", rlib.display()))
+        .arg(format!("pardosa={}", rlib.display()));
+    if let Some(nats_rlib) = &nats_rlib {
+        cmd.arg("--extern")
+            .arg(format!("pardosa_nats={}", nats_rlib.display()));
+    }
+    let mut child = cmd
         .arg("--crate-type")
         .arg("lib")
         .arg("--emit")
@@ -1030,6 +1049,175 @@ fn test_compile_fail_and_positive_controls_external_boundary() {
     assert!(
         lit_stderr.contains("private"),
         "rejection must be private fields: {lit_stderr}"
+    );
+
+    let file_reader_append_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_invalid(mut reader: FileReaderSession) {
+            let _ = reader.append_frame(b"illegal-append-on-reader");
+        }
+    "#;
+    let (reader_append_ok, reader_append_stderr) = run_rustc(file_reader_append_code);
+    assert!(
+        !reader_append_ok,
+        "FileReaderSession must not expose append_frame (H2)"
+    );
+    assert!(
+        reader_append_stderr.contains("DerefMut")
+            || reader_append_stderr.contains("E0596")
+            || reader_append_stderr.contains("no method named `append_frame`")
+            || reader_append_stderr.contains("E0599"),
+        "rejection must be missing DerefMut or missing method: {reader_append_stderr}"
+    );
+
+    let file_reader_set_schema_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_invalid(mut reader: FileReaderSession, desc: &SchemaDescriptor) {
+            let _ = reader.set_schema_descriptor(desc);
+        }
+    "#;
+    let (reader_schema_ok, reader_schema_stderr) = run_rustc(file_reader_set_schema_code);
+    assert!(
+        !reader_schema_ok,
+        "FileReaderSession must not expose set_schema_descriptor (H2)"
+    );
+    assert!(
+        reader_schema_stderr.contains("DerefMut")
+            || reader_schema_stderr.contains("E0596")
+            || reader_schema_stderr.contains("no method named `set_schema_descriptor`")
+            || reader_schema_stderr.contains("E0599"),
+        "rejection must be missing DerefMut or missing method: {reader_schema_stderr}"
+    );
+
+    let file_reader_meta_record_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_invalid(mut reader: FileReaderSession, record: &OwnershipRecord) {
+            let _ = reader.record_meta_record(record);
+        }
+    "#;
+    let (reader_meta_ok, reader_meta_stderr) = run_rustc(file_reader_meta_record_code);
+    assert!(
+        !reader_meta_ok,
+        "FileReaderSession must not expose record_meta_record (H2)"
+    );
+    assert!(
+        reader_meta_stderr.contains("DerefMut")
+            || reader_meta_stderr.contains("E0596")
+            || reader_meta_stderr.contains("no method named `record_meta_record`")
+            || reader_meta_stderr.contains("E0599"),
+        "rejection must be missing DerefMut or missing method: {reader_meta_stderr}"
+    );
+
+    let file_writer_mutation_positive_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_valid(mut writer: FileWriterSession, env: &EventEnvelope, desc: &SchemaDescriptor, record: &OwnershipRecord) {
+            let _ = writer.append_envelope(env);
+            let _ = writer.set_schema_descriptor(desc);
+            let _ = writer.record_meta_record(record);
+            let _claim: &OwnershipClaimRecord = writer.claim();
+            let _ = writer.release_exclusion();
+        }
+    "#;
+    let (writer_mut_ok, writer_mut_stderr) = run_rustc(file_writer_mutation_positive_code);
+    assert!(
+        writer_mut_ok,
+        "FileWriterSession must expose valid writer controls (H2):\n{writer_mut_stderr}"
+    );
+
+    let store_from_parts_code = r#"
+        use pardosa::store::{Store, StorageEngine};
+        pub fn run_invalid<E: StorageEngine>(engine: E) {
+            let _ = Store::from_parts(engine, todo!(), todo!());
+        }
+    "#;
+    let (from_parts_ok, from_parts_stderr) = run_rustc(store_from_parts_code);
+    assert!(
+        !from_parts_ok,
+        "Store::from_parts must not exist (R2-H1, R2-M1)"
+    );
+    assert!(
+        from_parts_stderr.contains("no function or associated item named `from_parts`")
+            || from_parts_stderr.contains("E0599"),
+        "rejection must be missing from_parts: {from_parts_stderr}"
+    );
+
+    let store_engine_mut_code = r#"
+        use pardosa::store::{Store, StorageEngine};
+        pub fn run_invalid<E: StorageEngine>(mut store: Store<E>) {
+            let _ = store.engine_mut();
+        }
+    "#;
+    let (engine_mut_ok, engine_mut_stderr) = run_rustc(store_engine_mut_code);
+    assert!(!engine_mut_ok, "Store::engine_mut must not exist (R2-H1)");
+    assert!(
+        engine_mut_stderr.contains("no method named `engine_mut`")
+            || engine_mut_stderr.contains("E0599"),
+        "rejection must be missing engine_mut: {engine_mut_stderr}"
+    );
+
+    let file_writer_engine_mut_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_invalid(mut writer: FileWriterSession) {
+            let _ = writer.engine_mut();
+        }
+    "#;
+    let (fw_engine_mut_ok, fw_engine_mut_stderr) = run_rustc(file_writer_engine_mut_code);
+    assert!(
+        !fw_engine_mut_ok,
+        "FileWriterSession must not expose engine_mut (R2-H1)"
+    );
+    assert!(
+        fw_engine_mut_stderr.contains("no method named `engine_mut`")
+            || fw_engine_mut_stderr.contains("E0599"),
+        "rejection must be missing engine_mut: {fw_engine_mut_stderr}"
+    );
+
+    let file_writer_reuse_after_release_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_invalid(writer: FileWriterSession, env: &EventEnvelope) {
+            let _ = writer.release_exclusion();
+            let _ = writer.append_envelope(env);
+        }
+    "#;
+    let (fw_reuse_ok, fw_reuse_stderr) = run_rustc(file_writer_reuse_after_release_code);
+    assert!(
+        !fw_reuse_ok,
+        "FileWriterSession must not be reusable after release_exclusion (R2-H1)"
+    );
+    assert!(
+        fw_reuse_stderr.contains("use of moved value") || fw_reuse_stderr.contains("E0382"),
+        "rejection must be use of moved value: {fw_reuse_stderr}"
+    );
+
+    let nats_reader_client_escape_code = r#"
+        use pardosa_nats::NatsReaderSession;
+        pub fn run_invalid(reader: &NatsReaderSession) {
+            let _ = reader.engine().client();
+        }
+    "#;
+    let (client_ok, client_stderr) = run_rustc(nats_reader_client_escape_code);
+    assert!(
+        !client_ok,
+        "NatsReaderSession::engine().client() must not exist (R2-H2)"
+    );
+    assert!(
+        client_stderr.contains("no method named `client`") || client_stderr.contains("E0599"),
+        "rejection must cite missing client method: {client_stderr}"
+    );
+
+    let nats_reader_positive_code = r#"
+        use pardosa_nats::NatsReaderSession;
+        pub fn run_valid(reader: &NatsReaderSession) {
+            let _ = reader.stem();
+            let _ = reader.meta_stream_name();
+            let _ = reader.data_stream_name();
+            let _ = reader.engine().stem();
+        }
+    "#;
+    let (pos_nats_ok, pos_nats_stderr) = run_rustc(nats_reader_positive_code);
+    assert!(
+        pos_nats_ok,
+        "valid NatsReaderSession methods must compile cleanly:\n{pos_nats_stderr}"
     );
 }
 

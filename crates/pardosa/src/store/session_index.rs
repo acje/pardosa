@@ -1,26 +1,14 @@
 //! Session-level fiber index coordinating validated tip admission, precursor tracking, and event counts.
 
 use crate::encoding::{DecodeError, EventEnvelope, ValueConstraint};
-use crate::store::fiber_handle::{FiberHandle, MAX_EVENTS_PER_FIBER};
+use crate::store::fiber_handle::FiberHandle;
 use crate::store::{FailureCondition, FiberState, OperationFailure};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
-
-static NEXT_INDEX_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Maximum active tracked fibers in a session index.
 pub const MAX_ACTIVE_FIBERS: usize = 100_000;
 
-/// Maximum active append reservations in a session index.
-pub const MAX_ACTIVE_RESERVATIONS: usize = 1024;
-
-/// Maximum retained index bytes in a session index (64 MiB).
-pub const MAX_INDEX_BYTES: usize = 64 * 1024 * 1024;
-
-const FIBER_ENTRY_OVERHEAD: usize = 128;
-const SEEN_EVENT_OVERHEAD: usize = 32;
-const BROKEN_MARKER_OVERHEAD: usize = 64;
+pub use crate::store::fiber_handle::MAX_EVENTS_PER_FIBER;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FiberTip {
@@ -31,129 +19,24 @@ pub(crate) struct FiberTip {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FiberSlot {
     Active(FiberTip),
-    Broken(Box<str>),
-}
-
-/// Non-cloneable reservation certifying that an event envelope has been validated against a session index.
-#[derive(Debug)]
-pub struct AppendReservation {
-    pub(crate) index_id: u64,
-    pub(crate) expected_revision: u64,
-    pub(crate) fiber_id: [u8; 16],
-    pub(crate) event_id: [u8; 16],
-    pub(crate) envelope: Option<EventEnvelope>,
-    pub(crate) active_reservations: Arc<AtomicUsize>,
-    pub(crate) pending_reservation_bytes: Arc<AtomicUsize>,
-    pub(crate) entry_bytes: usize,
-    pub(crate) committed: bool,
-}
-
-impl Drop for AppendReservation {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.active_reservations.fetch_sub(1, Ordering::Relaxed);
-            self.pending_reservation_bytes
-                .fetch_sub(self.entry_bytes, Ordering::Relaxed);
-        }
-    }
-}
-
-impl PartialEq for AppendReservation {
-    fn eq(&self, other: &Self) -> bool {
-        self.index_id == other.index_id
-            && self.expected_revision == other.expected_revision
-            && self.fiber_id == other.fiber_id
-            && self.event_id == other.event_id
-            && self.envelope == other.envelope
-            && self.entry_bytes == other.entry_bytes
-    }
-}
-
-impl Eq for AppendReservation {}
-
-impl AppendReservation {
-    /// Returns a reference to the reserved event envelope.
-    #[must_use]
-    pub fn envelope(&self) -> &EventEnvelope {
-        self.envelope
-            .as_ref()
-            .expect("reservation envelope present")
-    }
-
-    /// Returns the fiber identifier targeted by the reservation.
-    #[must_use]
-    pub fn fiber_id(&self) -> [u8; 16] {
-        self.fiber_id
-    }
-
-    /// Returns the event identifier targeted by the reservation.
-    #[must_use]
-    pub fn event_id(&self) -> [u8; 16] {
-        self.event_id
-    }
-
-    /// Returns the expected index revision for this reservation.
-    #[must_use]
-    pub fn expected_revision(&self) -> u64 {
-        self.expected_revision
-    }
+    Broken { reason: Box<str>, event_count: u64 },
 }
 
 /// In-memory session index tracking active fibers and event counts.
 ///
-/// # Resource Contract
+/// Coordinates sequential tip validation, precursor chaining, and active fiber bounds.
 ///
-/// - **Boundary**: Per-instance logical accounting ceiling for a single [`SessionIndex`] managing active fiber tips and seen event IDs. Each [`SessionIndex`] clone constitutes an independent instance with its own budget; there is no aggregate cross-session bound.
-/// - **Workload**: Append-only event streams and point-lookups up to 100,000 active fibers.
-/// - **Named Budgets**:
-///   - `MAX_ACTIVE_FIBERS = 100_000` fibers (all slots including broken).
-///   - `MAX_INDEX_BYTES = 64 * 1024 * 1024` (64 MiB) is the per-instance logical accounting ceiling for retained and pending logical charges of a single `SessionIndex` (128B entry overhead, 85B envelope overhead, 32B event ID overhead, 64B broken marker + reason string capped at 256 Unicode scalars (at most 1024 UTF-8 bytes), plus payload bytes).
-///   - `MAX_ACTIVE_RESERVATIONS = 1024` concurrent in-flight uncommitted append reservations.
-/// - **Accounting & Ownership**: RAII drop deduction, zero-copy payload moves on commit.
-/// - **Exclusions**: Explicit exclusions from the 64 MiB logical index budget include: separate writer session `seen_events` sets, spare collection capacities in HashMaps/HashSets, transient frame acquisition/serialization buffers (such as entire-file buffers in `read_container_frames`, frame vectors in `read_all_frames`, and transient envelope decode/encode allocations), OS kernel file buffers and page cache, TCP/JetStream socket buffers, allocator heap metadata, process stack, and independent [`SessionIndex`] clones.
-/// - **Exhaustion Policy**: Returns `Err(OperationFailure::new(FailureCondition::ValueConstraintViolated { constraint: ValueConstraint::TooLong }, ...))`.
-#[derive(Debug)]
+/// # Resource Contract
+/// - Boundary: Pure count-based bounding for `SessionIndex` and store sessions per Priority 3.
+/// - Named Budgets: `MAX_ACTIVE_FIBERS = 100_000` and `MAX_EVENTS_PER_FIBER = 100_000`.
+/// - Explicit Application Exclusions: In-memory tip payload allocations, transient bulk history buffers during `read_all_frames`/`build_from_frames`, process stack, allocator heap overhead, and durable payload storage in OS page cache or JetStream streams. Byte-reservation scaffolding is permanently retired.
+/// - Exhaustion: `ValueConstraint::TooLong` when fiber count or event count exceeds 100,000.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionIndex {
     fibers: HashMap<[u8; 16], FiberSlot>,
     seen_event_ids: HashSet<[u8; 16]>,
-    retained_bytes: usize,
-    index_id: u64,
     revision: u64,
-    active_reservations: Arc<AtomicUsize>,
-    pending_reservation_bytes: Arc<AtomicUsize>,
     has_raw_frames: bool,
-}
-
-impl PartialEq for SessionIndex {
-    fn eq(&self, other: &Self) -> bool {
-        self.fibers == other.fibers
-            && self.seen_event_ids == other.seen_event_ids
-            && self.retained_bytes == other.retained_bytes
-            && self.index_id == other.index_id
-            && self.revision == other.revision
-            && self.active_reservations.load(Ordering::Relaxed)
-                == other.active_reservations.load(Ordering::Relaxed)
-            && self.pending_reservation_bytes.load(Ordering::Relaxed)
-                == other.pending_reservation_bytes.load(Ordering::Relaxed)
-            && self.has_raw_frames == other.has_raw_frames
-    }
-}
-
-impl Eq for SessionIndex {}
-
-impl Clone for SessionIndex {
-    fn clone(&self) -> Self {
-        Self {
-            fibers: self.fibers.clone(),
-            seen_event_ids: self.seen_event_ids.clone(),
-            retained_bytes: self.retained_bytes,
-            index_id: NEXT_INDEX_ID.fetch_add(1, Ordering::Relaxed),
-            revision: self.revision,
-            active_reservations: Arc::new(AtomicUsize::new(0)),
-            pending_reservation_bytes: Arc::new(AtomicUsize::new(0)),
-            has_raw_frames: self.has_raw_frames,
-        }
-    }
 }
 
 impl Default for SessionIndex {
@@ -169,25 +52,9 @@ impl SessionIndex {
         Self {
             fibers: HashMap::new(),
             seen_event_ids: HashSet::new(),
-            retained_bytes: 0,
-            index_id: NEXT_INDEX_ID.fetch_add(1, Ordering::Relaxed),
             revision: 0,
-            active_reservations: Arc::new(AtomicUsize::new(0)),
-            pending_reservation_bytes: Arc::new(AtomicUsize::new(0)),
             has_raw_frames: false,
         }
-    }
-
-    /// Returns the number of currently active append reservations.
-    #[must_use]
-    pub fn active_reservations(&self) -> usize {
-        self.active_reservations.load(Ordering::Relaxed)
-    }
-
-    /// Returns the number of bytes currently reserved across active reservations.
-    #[must_use]
-    pub fn pending_reservation_bytes(&self) -> usize {
-        self.pending_reservation_bytes.load(Ordering::Relaxed)
     }
 
     /// Marks that the index has unindexed raw frames.
@@ -217,124 +84,30 @@ impl SessionIndex {
             .collect::<String>()
             .into_boxed_str();
 
-        let broken_bytes = FIBER_ENTRY_OVERHEAD + BROKEN_MARKER_OVERHEAD + reason.len();
-        let pending = self.pending_reservation_bytes.load(Ordering::Relaxed);
-
-        if let Some(slot) = self.fibers.get_mut(&fiber_id) {
-            match slot {
-                FiberSlot::Active(tip) => {
-                    let old_bytes = FIBER_ENTRY_OVERHEAD + 85 + tip.envelope.payload.len();
-                    let projected_bytes = self
-                        .retained_bytes
-                        .saturating_sub(old_bytes)
-                        .checked_add(broken_bytes)
-                        .ok_or_else(|| {
-                            OperationFailure::new(
-                                FailureCondition::ValueConstraintViolated {
-                                    constraint: ValueConstraint::TooLong,
-                                },
-                                "retained bytes calculation overflow",
-                            )
-                        })?;
-                    let total_bytes = projected_bytes.checked_add(pending).ok_or_else(|| {
-                        OperationFailure::new(
-                            FailureCondition::ValueConstraintViolated {
-                                constraint: ValueConstraint::TooLong,
-                            },
-                            "retained bytes calculation overflow",
-                        )
-                    })?;
-                    if total_bytes > MAX_INDEX_BYTES {
-                        return Err(OperationFailure::new(
-                            FailureCondition::ValueConstraintViolated {
-                                constraint: ValueConstraint::TooLong,
-                            },
-                            "session index memory capacity exceeded (MAX_INDEX_BYTES)",
-                        ));
-                    }
-                    self.retained_bytes = projected_bytes;
-                    *slot = FiberSlot::Broken(reason);
-                    self.revision = self.revision.wrapping_add(1);
-                    Ok(())
-                }
-                FiberSlot::Broken(old_reason) => {
-                    let old_bytes =
-                        FIBER_ENTRY_OVERHEAD + BROKEN_MARKER_OVERHEAD + old_reason.len();
-                    let projected_bytes = self
-                        .retained_bytes
-                        .saturating_sub(old_bytes)
-                        .checked_add(broken_bytes)
-                        .ok_or_else(|| {
-                            OperationFailure::new(
-                                FailureCondition::ValueConstraintViolated {
-                                    constraint: ValueConstraint::TooLong,
-                                },
-                                "retained bytes calculation overflow",
-                            )
-                        })?;
-                    let total_bytes = projected_bytes.checked_add(pending).ok_or_else(|| {
-                        OperationFailure::new(
-                            FailureCondition::ValueConstraintViolated {
-                                constraint: ValueConstraint::TooLong,
-                            },
-                            "retained bytes calculation overflow",
-                        )
-                    })?;
-                    if total_bytes > MAX_INDEX_BYTES {
-                        return Err(OperationFailure::new(
-                            FailureCondition::ValueConstraintViolated {
-                                constraint: ValueConstraint::TooLong,
-                            },
-                            "session index memory capacity exceeded (MAX_INDEX_BYTES)",
-                        ));
-                    }
-                    self.retained_bytes = projected_bytes;
-                    *slot = FiberSlot::Broken(reason);
-                    self.revision = self.revision.wrapping_add(1);
-                    Ok(())
-                }
-            }
-        } else {
-            if self.fibers.len() >= MAX_ACTIVE_FIBERS {
-                return Err(OperationFailure::new(
-                    FailureCondition::ValueConstraintViolated {
-                        constraint: ValueConstraint::TooLong,
-                    },
-                    "active tracked fibers capacity exceeded (MAX_ACTIVE_FIBERS)",
-                ));
-            }
-            let projected_bytes =
-                self.retained_bytes
-                    .checked_add(broken_bytes)
-                    .ok_or_else(|| {
-                        OperationFailure::new(
-                            FailureCondition::ValueConstraintViolated {
-                                constraint: ValueConstraint::TooLong,
-                            },
-                            "retained bytes calculation overflow",
-                        )
-                    })?;
-            let total_bytes = projected_bytes.checked_add(pending).ok_or_else(|| {
-                OperationFailure::new(
-                    FailureCondition::ValueConstraintViolated {
-                        constraint: ValueConstraint::TooLong,
-                    },
-                    "retained bytes calculation overflow",
-                )
-            })?;
-            if total_bytes > MAX_INDEX_BYTES {
-                return Err(OperationFailure::new(
-                    FailureCondition::ValueConstraintViolated {
-                        constraint: ValueConstraint::TooLong,
-                    },
-                    "session index memory capacity exceeded (MAX_INDEX_BYTES)",
-                ));
-            }
-            self.retained_bytes = projected_bytes;
-            self.fibers.insert(fiber_id, FiberSlot::Broken(reason));
-            self.revision = self.revision.wrapping_add(1);
-            Ok(())
+        if !self.fibers.contains_key(&fiber_id) && self.fibers.len() >= MAX_ACTIVE_FIBERS {
+            return Err(OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                },
+                "active tracked fibers capacity exceeded (MAX_ACTIVE_FIBERS)",
+            ));
         }
+
+        let event_count = match self.fibers.get(&fiber_id) {
+            Some(FiberSlot::Active(tip)) => tip.event_count,
+            Some(FiberSlot::Broken { event_count, .. }) => *event_count,
+            None => 0,
+        };
+
+        self.fibers.insert(
+            fiber_id,
+            FiberSlot::Broken {
+                reason,
+                event_count,
+            },
+        );
+        self.revision = self.revision.wrapping_add(1);
+        Ok(())
     }
 
     /// Invalidates a fiber identifier by marking it broken.
@@ -350,7 +123,7 @@ impl SessionIndex {
     pub fn has_broken_fibers(&self) -> bool {
         self.fibers
             .values()
-            .any(|slot| matches!(slot, FiberSlot::Broken(_)))
+            .any(|slot| matches!(slot, FiberSlot::Broken { .. }))
     }
 
     /// Returns the number of distinct active fibers currently tracked.
@@ -366,12 +139,6 @@ impl SessionIndex {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// Returns the total bytes currently accounted for in the session index.
-    #[must_use]
-    pub fn retained_bytes(&self) -> usize {
-        self.retained_bytes
     }
 
     /// Returns the current revision of the session index.
@@ -397,15 +164,15 @@ impl SessionIndex {
         }
         match self.fibers.get(fiber_id) {
             Some(FiberSlot::Active(tip)) => Ok(Some(&tip.envelope)),
-            Some(FiberSlot::Broken(_)) => Err(OperationFailure::new(
+            Some(FiberSlot::Broken { .. }) => Err(OperationFailure::new(
                 FailureCondition::PrecursorChainBroken(None),
-                "discovered break in precursor chain",
+                "cannot get latest envelope on broken fiber",
             )),
             None => Ok(None),
         }
     }
 
-    /// Returns the total event count recorded for the specified fiber identifier.
+    /// Returns the event count for the specified fiber identifier.
     ///
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::EnvelopeMismatch`] if raw frames exist.
@@ -419,15 +186,15 @@ impl SessionIndex {
         }
         match self.fibers.get(fiber_id) {
             Some(FiberSlot::Active(tip)) => Ok(tip.event_count),
-            Some(FiberSlot::Broken(_)) => Err(OperationFailure::new(
+            Some(FiberSlot::Broken { .. }) => Err(OperationFailure::new(
                 FailureCondition::PrecursorChainBroken(None),
-                "discovered break in precursor chain",
+                "cannot query event count on broken fiber",
             )),
             None => Ok(0),
         }
     }
 
-    /// Returns a [`FiberHandle`] for the specified fiber identifier.
+    /// Returns a [`FiberHandle`] reflecting the current state of the specified fiber.
     ///
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::EnvelopeMismatch`] if raw frames exist.
@@ -441,49 +208,37 @@ impl SessionIndex {
         }
         match self.fibers.get(&fiber_id) {
             Some(FiberSlot::Active(tip)) => {
-                let state = match tip.envelope.header.detached {
-                    true => FiberState::Detached,
-                    false => FiberState::Defined,
+                let state = if tip.envelope.header.detached {
+                    FiberState::Detached
+                } else {
+                    FiberState::Defined
                 };
-                FiberHandle::with_state(
+                Ok(FiberHandle::with_state(
                     fiber_id,
                     state,
                     tip.envelope.header.event_id,
                     tip.envelope.commitment(),
                     tip.event_count,
-                )
+                )?)
             }
-            Some(FiberSlot::Broken(_)) => Err(OperationFailure::new(
+            Some(FiberSlot::Broken { .. }) => Err(OperationFailure::new(
                 FailureCondition::PrecursorChainBroken(None),
-                "discovered break in precursor chain",
+                "cannot construct fiber handle for broken fiber",
             )),
             None => Ok(FiberHandle::new(fiber_id)),
         }
     }
 
-    /// Prepares an append reservation certifying that the envelope is valid against the current index revision.
+    /// Validates an event envelope candidate against session index constraints before write landing.
     ///
     /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::EnvelopeMismatch`] if raw frames exist in the session.
-    /// Returns [`OperationFailure`] if the envelope violates precursor chain consistency,
-    /// precursor hash binding, genesis rules, duplicate event identities, or resource capacity limits.
-    pub fn prepare_append(
-        &mut self,
-        envelope: &EventEnvelope,
-    ) -> Result<AppendReservation, OperationFailure> {
+    /// Returns [`OperationFailure`] if raw frames exist, event_id is zero, duplicate event_id is seen,
+    /// precursor chain or hash is broken, event count limit is reached, or capacity limit is breached.
+    pub fn validate_append(&self, envelope: &EventEnvelope) -> Result<(), OperationFailure> {
         if self.has_raw_frames {
             return Err(OperationFailure::new(
                 FailureCondition::EnvelopeMismatch,
                 "session contains unindexed raw frames; append unavailable",
-            ));
-        }
-
-        if self.active_reservations.load(Ordering::Relaxed) >= MAX_ACTIVE_RESERVATIONS {
-            return Err(OperationFailure::new(
-                FailureCondition::ValueConstraintViolated {
-                    constraint: ValueConstraint::TooLong,
-                },
-                "active reservations limit exceeded (1024)",
             ));
         }
 
@@ -503,36 +258,21 @@ impl SessionIndex {
             ));
         }
 
-        let entry_bytes = FIBER_ENTRY_OVERHEAD + 85 + envelope.payload.len() + SEEN_EVENT_OVERHEAD;
-        let pending = self.pending_reservation_bytes.load(Ordering::Relaxed);
-        let projected_bytes = self
-            .retained_bytes
-            .checked_add(pending)
-            .and_then(|sum| sum.checked_add(entry_bytes))
-            .ok_or_else(|| {
-                OperationFailure::new(
-                    FailureCondition::ValueConstraintViolated {
-                        constraint: ValueConstraint::TooLong,
-                    },
-                    "retained bytes calculation overflow",
-                )
-            })?;
-        if projected_bytes > MAX_INDEX_BYTES {
+        let max_seen_events = MAX_ACTIVE_FIBERS.saturating_mul(MAX_EVENTS_PER_FIBER as usize);
+        if self.seen_event_ids.len() >= max_seen_events {
             return Err(OperationFailure::new(
                 FailureCondition::ValueConstraintViolated {
                     constraint: ValueConstraint::TooLong,
                 },
-                "session index memory capacity exceeded (MAX_INDEX_BYTES)",
+                "seen event ids limit exceeded",
             ));
         }
 
         match self.fibers.get(&envelope.header.fiber_id) {
-            Some(FiberSlot::Broken(_)) => {
-                return Err(OperationFailure::new(
-                    FailureCondition::InvariantBreakingConfiguration,
-                    "cannot append to broken fiber",
-                ));
-            }
+            Some(FiberSlot::Broken { .. }) => Err(OperationFailure::new(
+                FailureCondition::InvariantBreakingConfiguration,
+                "cannot append to broken fiber",
+            )),
             Some(FiberSlot::Active(tip)) => {
                 if envelope.header.precursor == [0u8; 16] {
                     return Err(OperationFailure::new(
@@ -560,6 +300,7 @@ impl SessionIndex {
                         "event count boundary reached (MAX_EVENTS_PER_FIBER)",
                     ));
                 }
+                Ok(())
             }
             None => {
                 if self.fibers.len() >= MAX_ACTIVE_FIBERS {
@@ -578,72 +319,40 @@ impl SessionIndex {
                         "initial envelope on fiber must carry genesis precursor zeroes per C4.19 and C5.40",
                     ));
                 }
+                Ok(())
             }
         }
-
-        self.active_reservations.fetch_add(1, Ordering::Relaxed);
-        self.pending_reservation_bytes
-            .fetch_add(entry_bytes, Ordering::Relaxed);
-        Ok(AppendReservation {
-            index_id: self.index_id,
-            expected_revision: self.revision,
-            fiber_id: envelope.header.fiber_id,
-            event_id: envelope.header.event_id,
-            envelope: Some(envelope.clone()),
-            active_reservations: Arc::clone(&self.active_reservations),
-            pending_reservation_bytes: Arc::clone(&self.pending_reservation_bytes),
-            entry_bytes,
-            committed: false,
-        })
     }
 
-    /// Commits an append reservation to the session index, verifying index ownership and revision.
+    /// Pre-validates an event envelope candidate against session index constraints.
     ///
     /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::InvariantBreakingConfiguration`]
-    /// if reservation belongs to a different index or revision has advanced.
-    pub fn commit_append(
-        &mut self,
-        mut reservation: AppendReservation,
-    ) -> Result<(), OperationFailure> {
-        if self.index_id != reservation.index_id {
-            return Err(OperationFailure::new(
-                FailureCondition::InvariantBreakingConfiguration,
-                "append reservation belongs to a different session index",
-            ));
-        }
-        if self.revision != reservation.expected_revision {
-            return Err(OperationFailure::new(
-                FailureCondition::InvariantBreakingConfiguration,
-                "session index revision mismatch: index was mutated since reservation was prepared",
-            ));
-        }
+    /// Returns [`OperationFailure`] if candidate validation fails.
+    pub fn prepare_append(&self, envelope: &EventEnvelope) -> Result<(), OperationFailure> {
+        self.validate_append(envelope)
+    }
 
-        reservation.committed = true;
-        self.active_reservations.fetch_sub(1, Ordering::Relaxed);
-        self.pending_reservation_bytes
-            .fetch_sub(reservation.entry_bytes, Ordering::Relaxed);
+    /// Commits an event envelope directly after validation.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if candidate validation fails.
+    pub fn commit_envelope(&mut self, envelope: EventEnvelope) -> Result<(), OperationFailure> {
+        self.validate_append(&envelope)?;
+        self.commit_envelope_unchecked(envelope);
+        Ok(())
+    }
 
-        let fiber_id = reservation.fiber_id;
-        let envelope = reservation
-            .envelope
-            .take()
-            .expect("reservation envelope present");
+    /// Commits an event envelope without re-validating preconditions.
+    pub(crate) fn commit_envelope_unchecked(&mut self, envelope: EventEnvelope) {
+        let fiber_id = envelope.header.fiber_id;
         self.seen_event_ids.insert(envelope.header.event_id);
 
         match self.fibers.get_mut(&fiber_id) {
             Some(FiberSlot::Active(tip)) => {
-                let old_bytes = FIBER_ENTRY_OVERHEAD + 85 + tip.envelope.payload.len();
-                let new_bytes =
-                    FIBER_ENTRY_OVERHEAD + 85 + envelope.payload.len() + SEEN_EVENT_OVERHEAD;
-                self.retained_bytes = self.retained_bytes.saturating_sub(old_bytes) + new_bytes;
                 tip.envelope = envelope;
                 tip.event_count += 1;
             }
             _ => {
-                let entry_bytes =
-                    FIBER_ENTRY_OVERHEAD + 85 + envelope.payload.len() + SEEN_EVENT_OVERHEAD;
-                self.retained_bytes += entry_bytes;
                 self.fibers.insert(
                     fiber_id,
                     FiberSlot::Active(FiberTip {
@@ -655,16 +364,6 @@ impl SessionIndex {
         }
 
         self.revision = self.revision.wrapping_add(1);
-        Ok(())
-    }
-
-    /// Commits an event envelope directly by preparing and committing an append reservation.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if candidate validation fails.
-    pub fn commit_envelope(&mut self, envelope: EventEnvelope) -> Result<(), OperationFailure> {
-        let reservation = self.prepare_append(&envelope)?;
-        self.commit_append(reservation)
     }
 
     /// Decodes a container frame payload and verifies full frame consumption.
@@ -694,47 +393,47 @@ impl SessionIndex {
         Ok(env)
     }
 
-    fn record_broken_event_id(&mut self, event_id: [u8; 16]) -> Result<(), OperationFailure> {
-        if self.seen_event_ids.contains(&event_id) {
-            return Ok(());
-        }
-        let pending = self.pending_reservation_bytes.load(Ordering::Relaxed);
-        let projected = self
-            .retained_bytes
-            .checked_add(SEEN_EVENT_OVERHEAD)
-            .ok_or_else(|| {
+    fn record_broken_event_id(
+        &mut self,
+        fiber_id: [u8; 16],
+        event_id: [u8; 16],
+    ) -> Result<(), OperationFailure> {
+        if let Some(FiberSlot::Broken { event_count, .. }) = self.fibers.get_mut(&fiber_id) {
+            let next_count = event_count.checked_add(1).ok_or_else(|| {
                 OperationFailure::new(
                     FailureCondition::ValueConstraintViolated {
                         constraint: ValueConstraint::TooLong,
                     },
-                    "retained bytes calculation overflow",
+                    "broken fiber event count limit exceeded",
                 )
             })?;
-        let total = projected.checked_add(pending).ok_or_else(|| {
-            OperationFailure::new(
-                FailureCondition::ValueConstraintViolated {
-                    constraint: ValueConstraint::TooLong,
-                },
-                "retained bytes calculation overflow",
-            )
-        })?;
-        if total > MAX_INDEX_BYTES {
-            return Err(OperationFailure::new(
-                FailureCondition::ValueConstraintViolated {
-                    constraint: ValueConstraint::TooLong,
-                },
-                "session index memory capacity exceeded (MAX_INDEX_BYTES)",
-            ));
+            if next_count > MAX_EVENTS_PER_FIBER {
+                return Err(OperationFailure::new(
+                    FailureCondition::ValueConstraintViolated {
+                        constraint: ValueConstraint::TooLong,
+                    },
+                    "broken fiber event count limit exceeded",
+                ));
+            }
+            *event_count = next_count;
         }
-        self.retained_bytes = projected;
-        self.seen_event_ids.insert(event_id);
+
+        let max_seen_events = MAX_ACTIVE_FIBERS.saturating_mul(MAX_EVENTS_PER_FIBER as usize);
+        if !self.seen_event_ids.contains(&event_id) {
+            if self.seen_event_ids.len() >= max_seen_events {
+                return Err(OperationFailure::new(
+                    FailureCondition::ValueConstraintViolated {
+                        constraint: ValueConstraint::TooLong,
+                    },
+                    "seen event ids limit exceeded",
+                ));
+            }
+            self.seen_event_ids.insert(event_id);
+        }
         Ok(())
     }
 
     /// Rebuilds a session index from an ordered sequence of raw container frames.
-    ///
-    /// Requires exact envelope decoding; refuses frames shorter than 85 bytes or malformed envelopes per M2.
-    /// Envelopes with broken precursor chains mark the fiber as broken rather than failing rebuild.
     ///
     /// # Errors
     /// Returns [`OperationFailure`] if frame is shorter than 85 bytes, frame decode fails,
@@ -756,13 +455,13 @@ impl SessionIndex {
                     "frame length < 85 bytes or malformed envelope in ordinary session index",
                 )
             })?;
-            if let Some(FiberSlot::Broken(_)) = index.fibers.get(&env.header.fiber_id) {
-                index.record_broken_event_id(env.header.event_id)?;
+            if let Some(FiberSlot::Broken { .. }) = index.fibers.get(&env.header.fiber_id) {
+                index.record_broken_event_id(env.header.fiber_id, env.header.event_id)?;
                 continue;
             }
-            match index.prepare_append(&env) {
-                Ok(reservation) => {
-                    index.commit_append(reservation)?;
+            match index.validate_append(&env) {
+                Ok(()) => {
+                    index.commit_envelope_unchecked(env);
                 }
                 Err(err) => match err.condition() {
                     FailureCondition::PrecursorChainBroken(_) => {
@@ -770,7 +469,7 @@ impl SessionIndex {
                             env.header.fiber_id,
                             err.diagnostic_detail().message().to_string(),
                         )?;
-                        index.record_broken_event_id(env.header.event_id)?;
+                        index.record_broken_event_id(env.header.fiber_id, env.header.event_id)?;
                     }
                     _ => return Err(err),
                 },
@@ -793,9 +492,6 @@ mod tests {
         let corrupt_short = b"short_frame";
         let err_short = SessionIndex::build_from_frames([corrupt_short.as_slice()]).unwrap_err();
         assert_eq!(*err_short.condition(), FailureCondition::EnvelopeMismatch);
-        assert!(err_short
-            .to_string()
-            .contains("frame length < 85 bytes or malformed envelope in ordinary session index"));
 
         let mut corrupt_frame = Vec::new();
         env1.header.encode(&mut corrupt_frame);
@@ -813,15 +509,19 @@ mod tests {
             FailureCondition::EnvelopeMismatch
         );
 
-        let err_mixed =
+        let err_mid =
             SessionIndex::build_from_frames([env_buf.as_slice(), corrupt_frame.as_slice()])
                 .unwrap_err();
-        assert_eq!(*err_mixed.condition(), FailureCondition::EnvelopeMismatch);
+        assert_eq!(*err_mid.condition(), FailureCondition::EnvelopeMismatch);
 
-        let ok_index =
+        let index_ok =
             SessionIndex::build_from_frames([env_buf.as_slice()]).expect("build succeeds");
-        assert_eq!(ok_index.len(), 1);
-        assert_eq!(ok_index.event_count(&[0x10; 16]).unwrap(), 1);
+        assert_eq!(index_ok.len(), 1);
+        assert!(!index_ok.has_broken_fibers());
+        assert_eq!(
+            index_ok.get_latest(&[0x10; 16]).unwrap().unwrap().payload,
+            b"first"
+        );
 
         let broken_env = EventEnvelope {
             header: crate::encoding::EnvelopeHeader {
@@ -835,8 +535,10 @@ mod tests {
         };
         let mut broken_buf = Vec::new();
         broken_env.encode(&mut broken_buf);
+
         let index_broken =
             SessionIndex::build_from_frames([env_buf.as_slice(), broken_buf.as_slice()]).unwrap();
+        assert!(index_broken.has_broken_fibers());
         assert_eq!(index_broken.len(), 1);
         assert!(index_broken.get_latest(&[0x22; 16]).is_err());
         assert!(index_broken.fiber([0x22; 16]).is_err());
@@ -857,18 +559,17 @@ mod tests {
             },
             payload: vec![],
         };
-        let err_orphan = index.prepare_append(&orphan_env).unwrap_err();
+        let err_orphan = index.validate_append(&orphan_env).unwrap_err();
         assert_eq!(
             *err_orphan.condition(),
             FailureCondition::PrecursorChainBroken(None)
         );
 
         let genesis_env = EventEnvelope::genesis([0x01; 16], fiber_id, b"genesis").unwrap();
-        let reservation = index.prepare_append(&genesis_env).unwrap();
-        index.commit_append(reservation).unwrap();
+        index.commit_envelope(genesis_env.clone()).unwrap();
 
         let dup_genesis = EventEnvelope::genesis([0x02; 16], fiber_id, b"dup_genesis").unwrap();
-        let err_dup = index.prepare_append(&dup_genesis).unwrap_err();
+        let err_dup = index.validate_append(&dup_genesis).unwrap_err();
         assert_eq!(
             *err_dup.condition(),
             FailureCondition::PrecursorChainBroken(None)
@@ -884,7 +585,7 @@ mod tests {
             },
             payload: vec![],
         };
-        let err_prev = index.prepare_append(&wrong_prev_id).unwrap_err();
+        let err_prev = index.validate_append(&wrong_prev_id).unwrap_err();
         assert_eq!(
             *err_prev.condition(),
             FailureCondition::PrecursorChainBroken(None)
@@ -900,7 +601,7 @@ mod tests {
             },
             payload: vec![],
         };
-        let err_hash = index.prepare_append(&wrong_hash).unwrap_err();
+        let err_hash = index.validate_append(&wrong_hash).unwrap_err();
         assert_eq!(
             *err_hash.condition(),
             FailureCondition::PrecursorChainBroken(None)
@@ -939,7 +640,7 @@ mod tests {
             },
             payload: vec![],
         };
-        let err_broken = index.prepare_append(&next_env).unwrap_err();
+        let err_broken = index.validate_append(&next_env).unwrap_err();
         assert_eq!(
             *err_broken.condition(),
             FailureCondition::InvariantBreakingConfiguration
@@ -957,7 +658,7 @@ mod tests {
         index.commit_envelope(env1).unwrap();
 
         let env2 = EventEnvelope::genesis(shared_event_id, f2, b"f2").unwrap();
-        let err_dup = index.prepare_append(&env2).unwrap_err();
+        let err_dup = index.validate_append(&env2).unwrap_err();
         assert_eq!(
             *err_dup.condition(),
             FailureCondition::PrecursorChainBroken(None)
@@ -984,13 +685,16 @@ mod tests {
         let mut frame1 = Vec::new();
         broken_env.encode(&mut frame1);
 
-        let mut index = SessionIndex::build_from_frames([frame1.as_slice()])
+        let index = SessionIndex::build_from_frames([frame1.as_slice()])
             .expect("rebuild succeeds with broken fiber");
-        assert!(matches!(index.fibers.get(&f1), Some(FiberSlot::Broken(_))));
+        assert!(matches!(
+            index.fibers.get(&f1),
+            Some(FiberSlot::Broken { .. })
+        ));
 
         let env_on_f2 = EventEnvelope::genesis(shared_event_id, f2, b"f2").unwrap();
         let err = index
-            .prepare_append(&env_on_f2)
+            .validate_append(&env_on_f2)
             .expect_err("duplicate event ID from broken fiber must be rejected");
         assert_eq!(
             *err.condition(),
@@ -1007,19 +711,16 @@ mod tests {
         let fiber_id = [0x50; 16];
         let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"payload").unwrap();
 
-        let reservation = index.prepare_append(&genesis).expect("valid reservation");
-        assert_eq!(reservation.envelope(), &genesis);
-        assert_eq!(reservation.fiber_id(), fiber_id);
-        assert_eq!(reservation.event_id(), [0x01; 16]);
-        assert_eq!(reservation.expected_revision(), 0);
+        index
+            .validate_append(&genesis)
+            .expect("valid pre-validation");
         assert_eq!(index.len(), 0);
         assert_eq!(index.get_latest(&fiber_id).unwrap(), None);
-        assert_eq!(index.retained_bytes(), 0);
+        assert_eq!(index.revision(), 0);
 
-        index.commit_append(reservation).unwrap();
+        index.commit_envelope(genesis.clone()).unwrap();
         assert_eq!(index.len(), 1);
         assert_eq!(index.get_latest(&fiber_id).unwrap(), Some(&genesis));
-        assert!(index.retained_bytes() > 0);
         assert_eq!(index.revision(), 1);
 
         let child = EventEnvelope {
@@ -1032,26 +733,9 @@ mod tests {
             },
             payload: vec![],
         };
-        let res2 = index.prepare_append(&child).unwrap();
-        assert_eq!(res2.expected_revision(), 1);
-
-        index.invalidate_fiber(&[0x99; 16]).unwrap();
+        index.validate_append(&child).unwrap();
+        index.commit_envelope(child).unwrap();
         assert_eq!(index.revision(), 2);
-
-        let err_stale = index.commit_append(res2).unwrap_err();
-        assert_eq!(
-            *err_stale.condition(),
-            FailureCondition::InvariantBreakingConfiguration
-        );
-
-        let mut other_index = SessionIndex::new();
-        let foreign_genesis = EventEnvelope::genesis([0x03; 16], [0x77; 16], b"foreign").unwrap();
-        let foreign_res = other_index.prepare_append(&foreign_genesis).unwrap();
-        let err_foreign = index.commit_append(foreign_res).unwrap_err();
-        assert_eq!(
-            *err_foreign.condition(),
-            FailureCondition::InvariantBreakingConfiguration
-        );
     }
 
     #[test]
@@ -1062,7 +746,7 @@ mod tests {
         index.commit_envelope(genesis).unwrap();
 
         let dup = EventEnvelope::genesis([0x02; 16], fiber_id, b"v2").unwrap();
-        let err_dup = index.prepare_append(&dup).unwrap_err();
+        let err_dup = index.validate_append(&dup).unwrap_err();
         assert!(
             !err_dup.diagnostic_detail().message().contains("C5.22"),
             "diagnostic must not cite C5.22"
@@ -1078,7 +762,7 @@ mod tests {
             },
             payload: vec![],
         };
-        let err_stale = index.prepare_append(&stale).unwrap_err();
+        let err_stale = index.validate_append(&stale).unwrap_err();
         assert!(
             !err_stale.diagnostic_detail().message().contains("C5.22"),
             "diagnostic must not cite C5.22"
@@ -1091,7 +775,7 @@ mod tests {
 
     #[test]
     fn test_session_index_zero_event_id_rejection() {
-        let mut index = SessionIndex::new();
+        let index = SessionIndex::new();
         let zero_env = EventEnvelope {
             header: crate::encoding::EnvelopeHeader {
                 event_id: [0u8; 16],
@@ -1102,7 +786,7 @@ mod tests {
             },
             payload: vec![],
         };
-        let err = index.prepare_append(&zero_env).unwrap_err();
+        let err = index.validate_append(&zero_env).unwrap_err();
         assert_eq!(
             *err.condition(),
             FailureCondition::ValueConstraintViolated {
@@ -1114,10 +798,16 @@ mod tests {
     #[test]
     fn test_session_index_resource_bounds_capacity_refusal() {
         let mut index = SessionIndex::new();
-        index.retained_bytes = MAX_INDEX_BYTES;
+        for i in 0..MAX_ACTIVE_FIBERS as u32 {
+            let mut fiber_id = [0u8; 16];
+            fiber_id[0..4].copy_from_slice(&i.to_le_bytes());
+            let env = EventEnvelope::genesis([0x01; 16], fiber_id, b"fiber").unwrap();
+            index.commit_envelope_unchecked(env);
+        }
+        assert_eq!(index.len(), MAX_ACTIVE_FIBERS);
 
-        let env = EventEnvelope::genesis([0x01; 16], [0x80; 16], b"overflow").unwrap();
-        let err = index.prepare_append(&env).unwrap_err();
+        let new_fiber_env = EventEnvelope::genesis([0x02; 16], [0xff; 16], b"overflow").unwrap();
+        let err = index.validate_append(&new_fiber_env).unwrap_err();
         assert_eq!(
             *err.condition(),
             FailureCondition::ValueConstraintViolated {
@@ -1127,16 +817,51 @@ mod tests {
     }
 
     #[test]
+    fn test_session_index_max_events_per_fiber_exhaustion_refusal() {
+        assert_eq!(MAX_EVENTS_PER_FIBER, 100_000);
+        let mut index = SessionIndex::new();
+        let fiber_id = [0x77; 16];
+        let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"genesis").unwrap();
+        index.commit_envelope(genesis.clone()).unwrap();
+
+        let at_limit_env = EventEnvelope {
+            header: crate::encoding::EnvelopeHeader {
+                event_id: [0x02; 16],
+                fiber_id,
+                detached: false,
+                precursor: genesis.header.event_id,
+                precursor_hash: genesis.commitment(),
+            },
+            payload: b"at_limit".to_vec(),
+        };
+
+        if let Some(FiberSlot::Active(tip)) = index.fibers.get_mut(&fiber_id) {
+            tip.event_count = MAX_EVENTS_PER_FIBER - 1;
+        }
+        assert!(index.validate_append(&at_limit_env).is_ok());
+
+        if let Some(FiberSlot::Active(tip)) = index.fibers.get_mut(&fiber_id) {
+            tip.event_count = MAX_EVENTS_PER_FIBER;
+        }
+        let err = index.validate_append(&at_limit_env).unwrap_err();
+        assert_eq!(
+            *err.condition(),
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            }
+        );
+        assert!(err.to_string().contains("MAX_EVENTS_PER_FIBER"));
+    }
+
+    #[test]
     fn test_session_index_seen_event_overhead_grows_monotonically() {
         let mut index = SessionIndex::new();
         let fiber_id = [0x55; 16];
         let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"").unwrap();
-        let r1 = index.prepare_append(&genesis).unwrap();
-        index.commit_append(r1).unwrap();
-        let bytes_1 = index.retained_bytes();
+        index.commit_envelope(genesis.clone()).unwrap();
+        assert_eq!(index.revision(), 1);
 
         let mut prev_env = genesis;
-        let mut prev_bytes = bytes_1;
         for i in 2..=10 {
             let next_env = EventEnvelope {
                 header: crate::encoding::EnvelopeHeader {
@@ -1148,16 +873,9 @@ mod tests {
                 },
                 payload: vec![],
             };
-            let r = index.prepare_append(&next_env).unwrap();
-            index.commit_append(r).unwrap();
-            let current_bytes = index.retained_bytes();
-            assert!(
-                current_bytes > prev_bytes,
-                "event {i}: retained_bytes {current_bytes} must exceed previous {prev_bytes}"
-            );
-            assert_eq!(current_bytes - prev_bytes, SEEN_EVENT_OVERHEAD);
+            index.commit_envelope(next_env.clone()).unwrap();
+            assert_eq!(index.revision(), i as u64);
             prev_env = next_env;
-            prev_bytes = current_bytes;
         }
     }
 
@@ -1172,19 +890,29 @@ mod tests {
             .unwrap();
 
         match index.fibers.get(&fiber_id) {
-            Some(FiberSlot::Broken(r)) => {
-                assert_eq!(r.len(), 256);
+            Some(FiberSlot::Broken { reason, .. }) => {
+                assert_eq!(reason.len(), 256);
             }
             _ => panic!("expected broken slot"),
         }
 
-        let mut max_bytes_index = SessionIndex::new();
-        max_bytes_index.retained_bytes = MAX_INDEX_BYTES;
-        let err_bytes = max_bytes_index
+        let mut max_index = SessionIndex::new();
+        for i in 0..MAX_ACTIVE_FIBERS as u32 {
+            let mut fid = [0u8; 16];
+            fid[0..4].copy_from_slice(&i.to_le_bytes());
+            max_index.fibers.insert(
+                fid,
+                FiberSlot::Broken {
+                    reason: "b".into(),
+                    event_count: 0,
+                },
+            );
+        }
+        let err_cap = max_index
             .mark_fiber_broken([0x88; 16], "overflow".to_string())
             .unwrap_err();
         assert_eq!(
-            *err_bytes.condition(),
+            *err_cap.condition(),
             FailureCondition::ValueConstraintViolated {
                 constraint: ValueConstraint::TooLong,
             }
@@ -1199,9 +927,9 @@ mod tests {
         index.mark_fiber_broken(fiber_id, emoji_reason).unwrap();
 
         match index.fibers.get(&fiber_id) {
-            Some(FiberSlot::Broken(r)) => {
-                assert_eq!(r.chars().count(), 256);
-                assert_eq!(r.len(), 1024);
+            Some(FiberSlot::Broken { reason, .. }) => {
+                assert_eq!(reason.chars().count(), 256);
+                assert_eq!(reason.len(), 1024);
             }
             _ => panic!("expected broken slot"),
         }
@@ -1210,167 +938,102 @@ mod tests {
     #[test]
     fn test_session_index_bounded_reservations_limit_1024() {
         let mut index = SessionIndex::new();
-        let fiber_id = [0x42; 16];
-        let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"genesis").unwrap();
-        index.commit_envelope(genesis.clone()).unwrap();
-
-        let mut reservations = Vec::new();
-        for i in 0..1024u32 {
-            let mut event_id = [0u8; 16];
-            event_id[0..4].copy_from_slice(&(i + 2).to_le_bytes());
-            let env = EventEnvelope {
-                header: crate::encoding::EnvelopeHeader {
-                    event_id,
-                    fiber_id,
-                    detached: false,
-                    precursor: genesis.header.event_id,
-                    precursor_hash: genesis.commitment(),
-                },
-                payload: vec![],
-            };
-            let res = index.prepare_append(&env).expect("reservation under limit");
-            reservations.push(res);
+        for i in 0..MAX_ACTIVE_FIBERS as u32 {
+            let mut fiber_id = [0u8; 16];
+            fiber_id[0..4].copy_from_slice(&i.to_le_bytes());
+            let env = EventEnvelope::genesis([0x01; 16], fiber_id, b"count-based-bound").unwrap();
+            index.commit_envelope_unchecked(env);
         }
-        assert_eq!(index.active_reservations(), 1024);
+        assert_eq!(index.len(), MAX_ACTIVE_FIBERS);
 
-        let over_env = EventEnvelope {
-            header: crate::encoding::EnvelopeHeader {
-                event_id: [0xff; 16],
-                fiber_id,
-                detached: false,
-                precursor: genesis.header.event_id,
-                precursor_hash: genesis.commitment(),
-            },
-            payload: vec![],
-        };
-        let err = index.prepare_append(&over_env).unwrap_err();
+        let over_env = EventEnvelope::genesis([0x02; 16], [0xfe; 16], b"over").unwrap();
+        let err = index.validate_append(&over_env).unwrap_err();
         assert_eq!(
             *err.condition(),
             FailureCondition::ValueConstraintViolated {
                 constraint: ValueConstraint::TooLong,
             }
         );
-
-        drop(reservations.pop());
-        assert_eq!(index.active_reservations(), 1023);
-
-        let res = index
-            .prepare_append(&over_env)
-            .expect("reservation after drop");
-        assert_eq!(index.active_reservations(), 1024);
-        drop(res);
-        assert_eq!(index.active_reservations(), 1023);
     }
 
     #[test]
     fn test_session_index_pending_reservation_bytes_capacity_and_drop_release() {
         let mut index = SessionIndex::new();
-        assert_eq!(index.pending_reservation_bytes(), 0);
-        assert!(!index.has_raw_frames());
-
         let fiber_id = [0x99; 16];
-        let half_cap = 32 * 1024 * 1024;
-        let env1 = EventEnvelope::genesis([0x01; 16], fiber_id, vec![0xaa; half_cap]).unwrap();
-        let res1 = index.prepare_append(&env1).unwrap();
-        let expected_bytes = FIBER_ENTRY_OVERHEAD + 85 + half_cap + SEEN_EVENT_OVERHEAD;
-        assert_eq!(index.pending_reservation_bytes(), expected_bytes);
+        let env1 = EventEnvelope::genesis([0x01; 16], fiber_id, vec![0xaa; 100]).unwrap();
+        index.commit_envelope(env1.clone()).unwrap();
+        assert_eq!(index.len(), 1);
 
-        let env2 =
-            EventEnvelope::genesis([0x02; 16], [0xaa; 16], vec![0xbb; half_cap + 1024]).unwrap();
-        let err = index.prepare_append(&env2).unwrap_err();
-        assert_eq!(
-            *err.condition(),
-            FailureCondition::ValueConstraintViolated {
-                constraint: ValueConstraint::TooLong,
-            }
-        );
-
-        drop(res1);
-        assert_eq!(index.pending_reservation_bytes(), 0);
-
-        let res2 = index.prepare_append(&env2).unwrap();
-        assert_eq!(
-            index.pending_reservation_bytes(),
-            FIBER_ENTRY_OVERHEAD + 85 + half_cap + 1024 + SEEN_EVENT_OVERHEAD
-        );
-        index.commit_append(res2).unwrap();
-        assert_eq!(index.pending_reservation_bytes(), 0);
-        assert!(index.retained_bytes() >= half_cap);
+        let env2 = EventEnvelope {
+            header: crate::encoding::EnvelopeHeader {
+                event_id: [0x02; 16],
+                fiber_id,
+                detached: false,
+                precursor: [0x01; 16],
+                precursor_hash: env1.commitment(),
+            },
+            payload: vec![0xbb; 200],
+        };
+        index.commit_envelope(env2).unwrap();
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.event_count(&fiber_id).unwrap(), 2);
     }
 
     #[test]
     fn test_mark_fiber_broken_respects_pending_reservation_bytes() {
         let mut index = SessionIndex::new();
         let fiber_id = [0x99; 16];
-        let near_cap = MAX_INDEX_BYTES - 100;
-        let env1 = EventEnvelope::genesis(
-            [0x01; 16],
-            fiber_id,
-            vec![0xaa; near_cap - (FIBER_ENTRY_OVERHEAD + 85 + SEEN_EVENT_OVERHEAD)],
-        )
-        .unwrap();
-        let res1 = index.prepare_append(&env1).unwrap();
-        assert!(index.pending_reservation_bytes() > 0);
-
-        let err = index
-            .mark_fiber_broken([0xaa; 16], "exceeds capacity with pending".to_string())
-            .unwrap_err();
-        assert_eq!(
-            *err.condition(),
-            FailureCondition::ValueConstraintViolated {
-                constraint: ValueConstraint::TooLong,
-            }
-        );
-
-        drop(res1);
-        assert_eq!(index.pending_reservation_bytes(), 0);
+        let env1 = EventEnvelope::genesis([0x01; 16], fiber_id, vec![0xaa; 100]).unwrap();
+        index.commit_envelope(env1).unwrap();
 
         index
-            .mark_fiber_broken([0xaa; 16], "succeeds after pending dropped".to_string())
+            .mark_fiber_broken(fiber_id, "broken fiber".to_string())
             .unwrap();
+        assert!(index.has_broken_fibers());
+        assert_eq!(index.len(), 0);
     }
 
     #[test]
     fn test_mark_fiber_broken_active_replacement_capacity_refusal() {
         let mut index = SessionIndex::new();
-        let fiber_id = [0x55; 16];
-        let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"p").unwrap();
-        let res = index.prepare_append(&genesis).unwrap();
-        index.commit_append(res).unwrap();
+        for i in 0..MAX_ACTIVE_FIBERS as u32 {
+            let mut fid = [0u8; 16];
+            fid[0..4].copy_from_slice(&i.to_le_bytes());
+            let env = EventEnvelope::genesis([0x01; 16], fid, b"p").unwrap();
+            index.commit_envelope_unchecked(env);
+        }
+        assert_eq!(index.len(), MAX_ACTIVE_FIBERS);
 
-        index.retained_bytes = MAX_INDEX_BYTES - 10;
-        let err = index
-            .mark_fiber_broken(fiber_id, "broken reason pushing over capacity".to_string())
-            .unwrap_err();
-        assert_eq!(
-            *err.condition(),
-            FailureCondition::ValueConstraintViolated {
-                constraint: ValueConstraint::TooLong,
-            }
-        );
+        let mut existing_fid = [0u8; 16];
+        existing_fid[0..4].copy_from_slice(&0u32.to_le_bytes());
+        index
+            .mark_fiber_broken(existing_fid, "replacement succeeds at limit".to_string())
+            .expect("replacing existing active slot succeeds at limit");
     }
 
     #[test]
     fn test_mark_fiber_broken_broken_replacement_capacity_refusal() {
         let mut index = SessionIndex::new();
-        let fiber_id = [0x66; 16];
-        index
-            .mark_fiber_broken(fiber_id, "short".to_string())
-            .unwrap();
+        for i in 0..MAX_ACTIVE_FIBERS as u32 {
+            let mut fid = [0u8; 16];
+            fid[0..4].copy_from_slice(&i.to_le_bytes());
+            index.fibers.insert(
+                fid,
+                FiberSlot::Broken {
+                    reason: "short".into(),
+                    event_count: 0,
+                },
+            );
+        }
 
-        index.retained_bytes = MAX_INDEX_BYTES - 10;
-        let err = index
+        let mut existing_fid = [0u8; 16];
+        existing_fid[0..4].copy_from_slice(&0u32.to_le_bytes());
+        index
             .mark_fiber_broken(
-                fiber_id,
-                "much longer reason pushing over capacity".to_string(),
+                existing_fid,
+                "much longer reason replacing existing broken slot".to_string(),
             )
-            .unwrap_err();
-        assert_eq!(
-            *err.condition(),
-            FailureCondition::ValueConstraintViolated {
-                constraint: ValueConstraint::TooLong,
-            }
-        );
+            .expect("replacing existing broken slot succeeds at limit");
     }
 
     #[test]
@@ -1379,27 +1042,17 @@ mod tests {
         let fiber_id = [0x88; 16];
         let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"payload").unwrap();
 
-        let reservation = index.prepare_append(&genesis).expect("reservation valid");
-        assert_eq!(reservation.expected_revision(), 0);
+        index.validate_append(&genesis).expect("validation valid");
 
         index.mark_has_raw_frames();
         assert!(index.has_raw_frames());
 
         let next_env = EventEnvelope::genesis([0x02; 16], [0x99; 16], b"payload2").unwrap();
-        let err_prepare = index.prepare_append(&next_env).unwrap_err();
+        let err_prepare = index.validate_append(&next_env).unwrap_err();
         assert_eq!(*err_prepare.condition(), FailureCondition::EnvelopeMismatch);
         assert!(err_prepare
             .to_string()
             .contains("session contains unindexed raw frames; append unavailable"));
-
-        let err_commit = index.commit_append(reservation).unwrap_err();
-        assert_eq!(
-            *err_commit.condition(),
-            FailureCondition::InvariantBreakingConfiguration
-        );
-        assert!(err_commit
-            .to_string()
-            .contains("session index revision mismatch"));
     }
 
     #[test]
@@ -1420,16 +1073,7 @@ mod tests {
 
         let index1 = SessionIndex::build_from_frames([frame1.as_slice()])
             .expect("build with single broken frame");
-        let initial_retained = index1.retained_bytes();
-        let expected_reason_len =
-            "initial envelope on fiber must carry genesis precursor zeroes per C4.19 and C5.40"
-                .len();
-        let expected_marker_bytes =
-            FIBER_ENTRY_OVERHEAD + BROKEN_MARKER_OVERHEAD + expected_reason_len;
-        assert_eq!(
-            initial_retained,
-            expected_marker_bytes + SEEN_EVENT_OVERHEAD
-        );
+        assert!(index1.has_broken_fibers());
 
         let broken_env2 = EventEnvelope {
             header: crate::encoding::EnvelopeHeader {
@@ -1446,50 +1090,61 @@ mod tests {
 
         let index2 = SessionIndex::build_from_frames([frame1.as_slice(), frame2.as_slice()])
             .expect("build with two broken frames");
-        assert_eq!(
-            index2.retained_bytes(),
-            initial_retained + SEEN_EVENT_OVERHEAD
-        );
-
-        let f_large = [0x72; 16];
-        let near_cap = MAX_INDEX_BYTES - initial_retained - (SEEN_EVENT_OVERHEAD / 2);
-        let large_payload_len = near_cap - (FIBER_ENTRY_OVERHEAD + 85 + SEEN_EVENT_OVERHEAD);
-        let large_env =
-            EventEnvelope::genesis([0x20; 16], f_large, vec![0xcc; large_payload_len]).unwrap();
-        let mut large_frame = Vec::new();
-        large_env.encode(&mut large_frame);
-
-        let err_cap = SessionIndex::build_from_frames([
-            large_frame.as_slice(),
-            frame1.as_slice(),
-            frame2.as_slice(),
-        ])
-        .unwrap_err();
-        assert_eq!(
-            *err_cap.condition(),
-            FailureCondition::ValueConstraintViolated {
-                constraint: ValueConstraint::TooLong,
-            }
-        );
-        assert!(err_cap
-            .to_string()
-            .contains("session index memory capacity exceeded (MAX_INDEX_BYTES)"));
+        assert!(index2.has_broken_fibers());
     }
 
     #[test]
     fn test_record_broken_event_id_capacity_exhaustion_refusal() {
-        let mut index_at_limit = SessionIndex::new();
-        index_at_limit.retained_bytes = MAX_INDEX_BYTES - SEEN_EVENT_OVERHEAD;
-        index_at_limit
-            .record_broken_event_id([0x91; 16])
-            .expect("at-limit insertion must succeed");
-        assert_eq!(index_at_limit.retained_bytes, MAX_INDEX_BYTES);
+        let mut index = SessionIndex::new();
+        let fiber_id = [0x88; 16];
+        index
+            .mark_fiber_broken(fiber_id, "broken".to_string())
+            .unwrap();
+        index
+            .record_broken_event_id(fiber_id, [0x91; 16])
+            .expect("recording broken event id succeeds");
+        assert!(index.seen_event_ids.contains(&[0x91; 16]));
 
-        let mut index_over_limit = SessionIndex::new();
-        index_over_limit.retained_bytes = MAX_INDEX_BYTES - SEEN_EVENT_OVERHEAD + 1;
-        let err = index_over_limit
-            .record_broken_event_id([0x92; 16])
-            .unwrap_err();
+        let dup_env = EventEnvelope::genesis([0x91; 16], [0x88; 16], b"dup").unwrap();
+        let err = index.validate_append(&dup_env).unwrap_err();
+        assert_eq!(
+            *err.condition(),
+            FailureCondition::PrecursorChainBroken(None)
+        );
+    }
+
+    #[test]
+    fn test_build_from_frames_broken_fiber_event_count_limit_exhaustion() {
+        assert_eq!(MAX_EVENTS_PER_FIBER, 100_000);
+        let fiber_id = [0x42; 16];
+        let count = (MAX_EVENTS_PER_FIBER + 1) as usize;
+        let mut frame_data = Vec::with_capacity(count * 85);
+        for i in 1..=count {
+            let mut event_id = [0u8; 16];
+            event_id[0..4].copy_from_slice(&(i as u32).to_le_bytes());
+            let env = EventEnvelope {
+                header: crate::encoding::EnvelopeHeader {
+                    event_id,
+                    fiber_id,
+                    detached: false,
+                    precursor: [0xee; 16],
+                    precursor_hash: [0xff; 32],
+                },
+                payload: Vec::new(),
+            };
+            env.encode(&mut frame_data);
+        }
+
+        let frames: Vec<&[u8]> = frame_data.chunks_exact(85).collect();
+        assert_eq!(frames.len(), count);
+
+        let index = SessionIndex::build_from_frames(
+            frames[..MAX_EVENTS_PER_FIBER as usize].iter().copied(),
+        )
+        .expect("up to MAX_EVENTS_PER_FIBER on broken fiber succeeds");
+        assert!(index.has_broken_fibers());
+
+        let err = SessionIndex::build_from_frames(frames.iter().copied()).unwrap_err();
         assert_eq!(
             *err.condition(),
             FailureCondition::ValueConstraintViolated {
@@ -1498,6 +1153,6 @@ mod tests {
         );
         assert!(err
             .to_string()
-            .contains("session index memory capacity exceeded (MAX_INDEX_BYTES)"));
+            .contains("broken fiber event count limit exceeded"));
     }
 }

@@ -6,10 +6,14 @@ use crate::encoding::{
 use crate::schema::{SchemaDescriptor, SchemaIdentity};
 use std::fmt;
 
+mod engine;
 mod fiber_handle;
+mod pipeline;
 mod session_index;
-pub use fiber_handle::{FiberHandle, MAX_EVENTS_PER_FIBER};
-pub use session_index::{AppendReservation, SessionIndex};
+pub use engine::StorageEngine;
+pub use fiber_handle::FiberHandle;
+pub use pipeline::Store;
+pub use session_index::{SessionIndex, MAX_EVENTS_PER_FIBER};
 
 /// State of a fiber within Pardosa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,8 +363,8 @@ impl<'brand> ResumeCursor<'brand> {
     }
 }
 
-/// Maximum active tracked fibers per reader session per C5.22 and C6.7.
-pub const MAX_ACTIVE_FIBERS: usize = 65_536;
+/// Maximum active tracked fibers per session per C5.22, C6.7, and 0.5.4 unified capacity.
+pub const MAX_ACTIVE_FIBERS: usize = 100_000;
 
 /// Maximum stream items ingested per reader session per C5.22.
 pub const MAX_STREAM_ITEMS: usize = 65_536;

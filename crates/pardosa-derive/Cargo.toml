@@ -1,6 +1,6 @@
 [package]
 name = "pardosa-derive"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2021"
 description = "Procedural macro deriving PardosaSchema AST descriptors and codecs for Pardosa"
 license = "MIT OR Apache-2.0"

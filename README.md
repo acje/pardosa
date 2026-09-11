@@ -15,11 +15,11 @@ scale**. Per-aggregate linearizability is non-negotiable.
 
 The **canonical home of pardosa**, in two stages:
 
-1. **Now — the specification.** The 1.0 spec is written here.
-2. **Later — the code.** Once published, this is the repository crates.io
+1. **Now — the specification and working 0.5.x implementations.** The 1.0 spec is authored here alongside working 0.5.x implementations under `crates/`. Version 0.5.4 introduces the extracted `StorageEngine` I/O driver trait, unified `Store` pipeline, and synchronous `FileWriterSession`/`FileReaderSession` and `NatsWriterSession`/`NatsReaderSession` frontends.
+2. **Later — the published code.** Once published, this is the repository crates.io
    points at.
 
-No code is built from this repo yet.
+Active implementation code and integration test suites are maintained under `crates/`.
 
 ## pardosa 1.0 is a rewrite, not an extraction
 

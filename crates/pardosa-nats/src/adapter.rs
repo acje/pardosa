@@ -1,7 +1,6 @@
 //! JetStream storage adapter implementation for Pardosa.
 
 use pardosa::prelude::*;
-use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -512,24 +511,30 @@ impl NatsStorageAdapter {
                     }
                 })?;
 
-            Ok(NatsWriterSession {
+            let meta_records = NatsMetaRecords {
+                latest_claim: Some(claim.clone()),
+                ..Default::default()
+            };
+            let engine = NatsEngine {
+                client,
+                js,
+                runtime,
                 stem,
                 meta_stream_name: meta_name,
                 data_stream_name: data_name,
                 carried_epoch: claim.epoch,
-                claim,
-                rolling_commitment: RollingCommitment::new(),
+                claim: Some(claim),
+                meta_records,
+                admission: OpenAdmission::Ready,
                 last_data_seq: data_ack.sequence,
-                client,
-                js,
-                runtime,
+                initial_frames: Some(Vec::new()),
                 publish_timeout: Duration::from_secs(5),
                 simulate_indeterminate: false,
-                fiber_index: SessionIndex::new(),
-                seen_events: HashSet::new(),
                 uncertain: false,
                 uncertain_diagnostic: None,
-            })
+            };
+            let store = Store::open_writer(engine)?;
+            Ok(NatsWriterSession { store })
         })
     }
 
@@ -679,6 +684,20 @@ impl NatsStorageAdapter {
         let runtime = self.runtime.clone();
 
         run_future(&handle, async move {
+            let meta_records = read_meta_records_async(&js, &meta_name).await?;
+            let durable_claim = meta_records.latest_claim.as_ref().ok_or_else(|| {
+                OperationFailure::new(
+                    FailureCondition::OwnershipRecordUnreadable,
+                    "no ownership claim found in meta stream per C5.12",
+                )
+            })?;
+            if durable_claim != &claim_clone {
+                return Err(OperationFailure::new(
+                    FailureCondition::OwnershipUnestablished,
+                    "supplied claim does not match durable claim in meta stream per C5.10",
+                ));
+            }
+
             js.create_stream(async_nats::jetstream::stream::Config {
                 name: data_name.clone(),
                 subjects: vec![data_name.clone()],
@@ -734,24 +753,26 @@ impl NatsStorageAdapter {
                     }
                 })?;
 
-            Ok(NatsWriterSession {
+            let engine = NatsEngine {
+                client,
+                js,
+                runtime,
                 stem,
                 meta_stream_name: meta_name,
                 data_stream_name: data_name,
                 carried_epoch: claim_clone.epoch,
-                claim: claim_clone,
-                rolling_commitment: RollingCommitment::new(),
+                claim: Some(claim_clone),
+                meta_records,
+                admission: OpenAdmission::Ready,
                 last_data_seq: data_ack.sequence,
-                client,
-                js,
-                runtime,
+                initial_frames: Some(Vec::new()),
                 publish_timeout: Duration::from_secs(5),
                 simulate_indeterminate: false,
-                fiber_index: SessionIndex::new(),
-                seen_events: HashSet::new(),
                 uncertain: false,
                 uncertain_diagnostic: None,
-            })
+            };
+            let store = Store::open_writer(engine)?;
+            Ok(NatsWriterSession { store })
         })
     }
 
@@ -788,7 +809,7 @@ impl NatsStorageAdapter {
                         "artefact append authority permanently retired via outbound pointer per C5.63",
                     ));
                 }
-                let claim = meta.latest_claim.ok_or_else(|| {
+                let claim = meta.latest_claim.clone().ok_or_else(|| {
                     OperationFailure::new(
                         FailureCondition::OwnershipUnestablished,
                         "ownership record unseeded; cannot open writer session without established claim per C5.10",
@@ -816,7 +837,7 @@ impl NatsStorageAdapter {
                 "artefact append authority permanently retired via outbound pointer per C5.63",
             ));
         }
-        let claim = meta.latest_claim.ok_or_else(|| {
+        let claim = meta.latest_claim.clone().ok_or_else(|| {
             OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
                 "no ownership claim found in meta stream per C5.12",
@@ -831,39 +852,31 @@ impl NatsStorageAdapter {
 
         let js_data = self.js.clone();
         let data_name = self.data_stream_name.clone();
-        let (_, frames, rolling, last_data_seq) = run_future(&handle, async move {
+        let (_, frames, _, last_data_seq) = run_future(&handle, async move {
             read_data_frames_async(&js_data, &data_name).await
         })?;
-        let fiber_index = SessionIndex::build_from_frames(frames.iter().map(|f| f.as_slice()))?;
-        let mut seen_events = HashSet::new();
-        for frame in &frames {
-            if frame.len() >= 85 {
-                if let Ok((env, consumed)) = EventEnvelope::decode(frame) {
-                    if consumed == frame.len() {
-                        seen_events.insert(env.header.event_id);
-                    }
-                }
-            }
-        }
 
-        Ok(NatsWriterSession {
+        let engine = NatsEngine {
+            client: self.client.clone(),
+            js: self.js.clone(),
+            runtime: self.runtime.clone(),
             stem: self.stem.clone(),
             meta_stream_name: self.meta_stream_name.clone(),
             data_stream_name: self.data_stream_name.clone(),
             carried_epoch,
-            claim,
-            rolling_commitment: rolling,
+            claim: Some(claim),
+            meta_records: meta,
+            admission: OpenAdmission::Ready,
             last_data_seq,
-            client: self.client.clone(),
-            js: self.js.clone(),
-            runtime: self.runtime.clone(),
+            initial_frames: Some(frames),
             publish_timeout: Duration::from_secs(5),
             simulate_indeterminate: false,
-            fiber_index,
-            seen_events,
             uncertain: false,
             uncertain_diagnostic: None,
-        })
+        };
+
+        let store = Store::open_writer(engine)?;
+        Ok(NatsWriterSession { store })
     }
 
     /// Opens the artefact strictly for reading per C5.6, C5.11, C5.62, and C6.14.
@@ -890,32 +903,27 @@ impl NatsStorageAdapter {
 
         let admission = admit_open(presence, meta_records.latest_claim.clone(), false)?;
 
-        let mut fiber_index = SessionIndex::new();
-        let mut failed = None;
-        if presence == ArtefactPresence::Both || presence == ArtefactPresence::EventDataOnly {
-            let js_data = self.js.clone();
-            let data_name = self.data_stream_name.clone();
-            let (_, frames, _, _) = run_future(&handle, async move {
-                read_data_frames_async(&js_data, &data_name).await
-            })?;
-            match SessionIndex::build_from_frames(frames.iter().map(|f| f.as_slice())) {
-                Ok(idx) => fiber_index = idx,
-                Err(err) => failed = Some(err.condition().clone()),
-            }
-        }
-
-        Ok(NatsReaderSession {
+        let engine = NatsEngine {
+            client: self.client.clone(),
+            js: self.js.clone(),
+            runtime: self.runtime.clone(),
             stem: self.stem.clone(),
             meta_stream_name: self.meta_stream_name.clone(),
             data_stream_name: self.data_stream_name.clone(),
-            admission,
+            carried_epoch: meta_records.latest_claim.as_ref().map_or(0, |c| c.epoch),
+            claim: meta_records.latest_claim.clone(),
             meta_records,
-            rolling_commitment: RollingCommitment::new(),
-            js: self.js.clone(),
-            runtime: self.runtime.clone(),
-            fiber_index,
-            failed,
-        })
+            admission,
+            last_data_seq: 0,
+            initial_frames: None,
+            publish_timeout: Duration::from_secs(5),
+            simulate_indeterminate: false,
+            uncertain: false,
+            uncertain_diagnostic: None,
+        };
+
+        let store = Store::open_reader(engine);
+        Ok(NatsReaderSession { store })
     }
 
     /// Reads all ownership records from the meta stream.
@@ -1078,64 +1086,28 @@ impl NatsStorageAdapter {
     }
 }
 
-/// Active JetStream writer session holding append authority with OCC sequence checks per C5.5 and C5.7.
-pub struct NatsWriterSession {
-    stem: String,
-    meta_stream_name: String,
-    data_stream_name: String,
-    carried_epoch: u64,
-    claim: OwnershipClaimRecord,
-    rolling_commitment: RollingCommitment,
-    last_data_seq: u64,
-    client: async_nats::Client,
-    js: async_nats::jetstream::Context,
-    runtime: Arc<tokio::runtime::Runtime>,
-    publish_timeout: Duration,
-    simulate_indeterminate: bool,
-    fiber_index: SessionIndex,
-    seen_events: HashSet<[u8; 16]>,
-    uncertain: bool,
-    uncertain_diagnostic: Option<String>,
+/// Pure JetStream storage driver implementing [`StorageEngine`].
+#[derive(Debug)]
+pub struct NatsEngine {
+    pub(crate) client: async_nats::Client,
+    pub(crate) js: async_nats::jetstream::Context,
+    pub(crate) runtime: Arc<tokio::runtime::Runtime>,
+    pub(crate) stem: String,
+    pub(crate) meta_stream_name: String,
+    pub(crate) data_stream_name: String,
+    pub(crate) carried_epoch: u64,
+    pub(crate) claim: Option<OwnershipClaimRecord>,
+    pub(crate) meta_records: NatsMetaRecords,
+    pub(crate) admission: OpenAdmission,
+    pub(crate) last_data_seq: u64,
+    pub(crate) initial_frames: Option<Vec<Vec<u8>>>,
+    pub(crate) publish_timeout: Duration,
+    pub(crate) simulate_indeterminate: bool,
+    pub(crate) uncertain: bool,
+    pub(crate) uncertain_diagnostic: Option<String>,
 }
 
-impl fmt::Debug for NatsWriterSession {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("NatsWriterSession")
-            .field("stem", &self.stem)
-            .field("meta_stream_name", &self.meta_stream_name)
-            .field("data_stream_name", &self.data_stream_name)
-            .field("carried_epoch", &self.carried_epoch)
-            .field("claim", &self.claim)
-            .field("last_data_seq", &self.last_data_seq)
-            .finish()
-    }
-}
-
-impl NatsWriterSession {
-    /// Returns the monotonic epoch carried by this writer session.
-    #[must_use]
-    pub fn carried_epoch(&self) -> u64 {
-        self.carried_epoch
-    }
-
-    /// Returns the diagnostic detail if the writer entered an uncertain state.
-    #[must_use]
-    pub fn uncertain_diagnostic(&self) -> Option<&str> {
-        self.uncertain_diagnostic.as_deref()
-    }
-
-    /// Returns the ownership claim record held by this writer session.
-    #[must_use]
-    pub fn claim(&self) -> &OwnershipClaimRecord {
-        &self.claim
-    }
-
-    /// Returns the current running physical rolling commitment per C5.26.
-    #[must_use]
-    pub fn rolling_commitment(&self) -> &RollingCommitment {
-        &self.rolling_commitment
-    }
-
+impl NatsEngine {
     /// Returns the common artefact stem.
     #[must_use]
     pub fn stem(&self) -> &str {
@@ -1154,24 +1126,16 @@ impl NatsWriterSession {
         &self.data_stream_name
     }
 
-    /// Returns the last sequence recorded in the data stream.
+    /// Returns the last consumed message sequence in the event data stream.
     #[must_use]
     pub fn last_sequence(&self) -> u64 {
         self.last_data_seq
     }
 
-    /// Configures the timeout for publish operations.
+    /// Returns all meta records decoded from the meta stream.
     #[must_use]
-    pub fn with_publish_timeout(mut self, timeout: Duration) -> Self {
-        self.publish_timeout = timeout;
-        self
-    }
-
-    /// Configures whether to simulate an indeterminate write landing per C5.16.
-    #[must_use]
-    pub fn with_simulate_indeterminate(mut self, simulate: bool) -> Self {
-        self.simulate_indeterminate = simulate;
-        self
+    pub fn meta_records(&self) -> &NatsMetaRecords {
+        &self.meta_records
     }
 
     fn check_authority(&self) -> Result<(), OperationFailure> {
@@ -1208,68 +1172,19 @@ impl NatsWriterSession {
         }
         Ok(())
     }
+}
 
-    /// Appends a framed payload byte slice to the data stream with per-landing epoch verification and OCC sequence checks.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::StaleEpoch`] if epoch is superseded.
-    /// Returns [`OperationFailure`] with [`FailureCondition::ConcurrencyConflict`] if OCC expected sequence mismatches.
-    pub fn append_frame(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
-        match self.append_frame_verdict(payload)? {
-            WriteLandingVerdict::Landed(frame_count) => Ok(frame_count),
-            WriteLandingVerdict::Undetermined { carried_epoch } => {
-                self.uncertain = true;
-                let diagnostic = format!(
-                    "write landing undetermined for carried epoch {carried_epoch} per C5.16"
-                );
-                if self.uncertain_diagnostic.is_none() {
-                    self.uncertain_diagnostic = Some(diagnostic.clone());
-                }
-                Err(OperationFailure::new(
-                    FailureCondition::OwnershipRecordUnreadable,
-                    diagnostic,
-                ))
-            }
-        }
+impl StorageEngine for NatsEngine {
+    fn carried_epoch(&self) -> u64 {
+        self.carried_epoch
     }
 
-    /// Appends a framed payload byte slice, returning a [`WriteLandingVerdict`] explicitly handling indeterminate landings per C5.16.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::StaleEpoch`] if epoch is superseded.
-    /// Returns [`OperationFailure`] with [`FailureCondition::ConcurrencyConflict`] if OCC sequence check fails.
-    pub fn append_frame_verdict(
-        &mut self,
-        payload: &[u8],
-    ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-        self.check_authority()?;
+    fn check_authority(&self) -> Result<(), OperationFailure> {
+        self.check_authority()
+    }
 
-        if payload.len() < 85 {
-            return Err(OperationFailure::new(
-                FailureCondition::EnvelopeMismatch,
-                format!("payload too short for event envelope: {}", payload.len()),
-            ));
-        }
-        let (env, consumed) = EventEnvelope::decode(payload).map_err(|err| {
-            OperationFailure::new(
-                FailureCondition::EnvelopeMismatch,
-                format!("failed to decode envelope: {err}"),
-            )
-        })?;
-        if consumed != payload.len() {
-            return Err(OperationFailure::new(
-                FailureCondition::EnvelopeMismatch,
-                format!(
-                    "frame decode error: {}",
-                    DecodeError::TruncatedPayload {
-                        expected: payload.len(),
-                        available: consumed,
-                    }
-                ),
-            ));
-        }
-        let reservation = self.fiber_index.prepare_append(&env)?;
-        let event_id = env.header.event_id;
+    fn append_block(&mut self, block: &[u8]) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
+        self.check_authority()?;
 
         if self.simulate_indeterminate {
             self.uncertain = true;
@@ -1281,33 +1196,7 @@ impl NatsWriterSession {
             });
         }
 
-        let verdict = self.append_frame_verdict_raw(payload)?;
-        match verdict {
-            WriteLandingVerdict::Landed(_) => {
-                self.fiber_index.commit_append(reservation)?;
-                self.seen_events.insert(event_id);
-            }
-            WriteLandingVerdict::Undetermined { carried_epoch } => {
-                self.uncertain = true;
-                if self.uncertain_diagnostic.is_none() {
-                    self.uncertain_diagnostic = Some(format!(
-                        "write landing undetermined for carried epoch {carried_epoch} per C5.16"
-                    ));
-                }
-            }
-        }
-        Ok(verdict)
-    }
-
-    fn append_frame_verdict_raw(
-        &mut self,
-        payload: &[u8],
-    ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
         let handle = self.runtime.handle().clone();
-
-        let mut frame_buf = Vec::new();
-        ContainerFrame::encode_payload(payload, &mut frame_buf);
-
         let mut headers = async_nats::HeaderMap::new();
         headers.insert(
             async_nats::header::NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
@@ -1318,11 +1207,11 @@ impl NatsWriterSession {
         let data_name = self.data_stream_name.clone();
         let timeout = self.publish_timeout;
         let carried_epoch = self.carried_epoch;
-        let payload_bytes = frame_buf.clone();
+        let block_bytes = block.to_vec();
 
         let (ack, diagnostic) = run_future(&handle, async move {
             let pub_future = js
-                .publish_with_headers(data_name.clone(), headers, payload_bytes.into())
+                .publish_with_headers(data_name.clone(), headers, block_bytes.into())
                 .await
                 .map_err(|err| {
                     if is_wrong_last_sequence(&err) {
@@ -1367,10 +1256,7 @@ impl NatsWriterSession {
         match ack {
             WriteLandingVerdict::Landed(pub_ack) => {
                 self.last_data_seq = pub_ack.sequence;
-                self.rolling_commitment.update_frame(&frame_buf);
-                Ok(WriteLandingVerdict::Landed(
-                    self.rolling_commitment.frame_count(),
-                ))
+                Ok(WriteLandingVerdict::Landed(pub_ack.sequence))
             }
             WriteLandingVerdict::Undetermined { carried_epoch } => {
                 self.uncertain = true;
@@ -1384,340 +1270,38 @@ impl NatsWriterSession {
         }
     }
 
-    /// Appends an event envelope to the data stream.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if append or epoch verification fails.
-    pub fn append_envelope(&mut self, envelope: &EventEnvelope) -> Result<u64, OperationFailure> {
-        let mut env_buf = Vec::new();
-        envelope.encode(&mut env_buf);
-        self.append_frame(&env_buf)
-    }
-
-    /// Appends an event envelope returning a [`WriteLandingVerdict`].
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if epoch or sequence check fails.
-    pub fn append_envelope_verdict(
-        &mut self,
-        envelope: &EventEnvelope,
-    ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-        let mut env_buf = Vec::new();
-        envelope.encode(&mut env_buf);
-        self.append_frame_verdict(&env_buf)
-    }
-
-    /// Appends a raw frame payload to the data stream.
-    ///
-    /// If the payload decodes to an exact [`EventEnvelope`], it undergoes session index pre-admission validation.
-    /// Otherwise, the raw frame is appended and unindexes point lookups.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if authority check fails, pre-admission validation fails, or publish fails.
-    pub fn append_raw_frame(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
-        self.check_authority()?;
-
-        if self.simulate_indeterminate {
-            self.uncertain = true;
-            let diagnostic = format!(
-                "write landing undetermined for carried epoch {} per C5.16",
-                self.carried_epoch
-            );
-            self.uncertain_diagnostic = Some(diagnostic.clone());
-            return Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                diagnostic,
-            ));
+    fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
+        if let Some(frames) = self.initial_frames.take() {
+            return Ok(frames);
         }
-
-        if payload.len() >= 85 {
-            if let Ok((env, consumed)) = EventEnvelope::decode(payload) {
-                if consumed == payload.len() {
-                    let reservation = self.fiber_index.prepare_append(&env)?;
-                    let verdict = self.append_frame_verdict_raw(payload)?;
-                    return match verdict {
-                        WriteLandingVerdict::Landed(seq) => {
-                            self.fiber_index.commit_append(reservation)?;
-                            self.seen_events.insert(env.header.event_id);
-                            Ok(seq)
-                        }
-                        WriteLandingVerdict::Undetermined { carried_epoch } => {
-                            self.uncertain = true;
-                            let diagnostic = format!(
-                                "write landing undetermined for carried epoch {carried_epoch} per C5.16"
-                            );
-                            if self.uncertain_diagnostic.is_none() {
-                                self.uncertain_diagnostic = Some(diagnostic.clone());
-                            }
-                            Err(OperationFailure::new(
-                                FailureCondition::OwnershipRecordUnreadable,
-                                diagnostic,
-                            ))
-                        }
-                    };
-                }
-            }
-        }
-
-        let verdict = self.append_frame_verdict_raw(payload)?;
-        match verdict {
-            WriteLandingVerdict::Landed(seq) => {
-                self.fiber_index.mark_has_raw_frames();
-                Ok(seq)
-            }
-            WriteLandingVerdict::Undetermined { carried_epoch } => {
-                self.uncertain = true;
-                let diagnostic = format!(
-                    "write landing undetermined for carried epoch {carried_epoch} per C5.16"
-                );
-                if self.uncertain_diagnostic.is_none() {
-                    self.uncertain_diagnostic = Some(diagnostic.clone());
-                }
-                Err(OperationFailure::new(
-                    FailureCondition::OwnershipRecordUnreadable,
-                    diagnostic,
-                ))
-            }
-        }
-    }
-
-    /// Appends an unvalidated raw frame directly to the data stream for testing or migration recovery.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if authority check fails, session is uncertain, or publish fails.
-    #[doc(hidden)]
-    pub fn append_unvalidated_frame(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
-        self.check_authority()?;
-        let verdict = self.append_frame_verdict_raw(payload)?;
-        match verdict {
-            WriteLandingVerdict::Landed(seq) => {
-                self.fiber_index.mark_has_raw_frames();
-                Ok(seq)
-            }
-            WriteLandingVerdict::Undetermined { carried_epoch } => {
-                self.uncertain = true;
-                let diagnostic = format!(
-                    "write landing undetermined for carried epoch {carried_epoch} per C5.16"
-                );
-                if self.uncertain_diagnostic.is_none() {
-                    self.uncertain_diagnostic = Some(diagnostic.clone());
-                }
-                Err(OperationFailure::new(
-                    FailureCondition::OwnershipRecordUnreadable,
-                    diagnostic,
-                ))
-            }
-        }
-    }
-
-    /// Returns a [`FiberHandle`] for the specified fiber identifier.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if the fiber is broken.
-    pub fn fiber(&self, fiber_id: [u8; 16]) -> Result<FiberHandle, OperationFailure> {
-        if self.uncertain {
-            return Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                "writer session in uncertain state; reconciliation required",
-            ));
-        }
-        self.fiber_index.fiber(fiber_id)
-    }
-
-    /// Returns a [`FiberHandle`] derived from a domain key string.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if the fiber is broken.
-    pub fn fiber_with_key(&self, domain_key: &str) -> Result<FiberHandle, OperationFailure> {
-        self.fiber(derive_fiber_id(domain_key))
-    }
-
-    /// Returns the latest event envelope recorded for the specified fiber identifier.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if the fiber is broken.
-    pub fn get_latest(
-        &self,
-        fiber_id: [u8; 16],
-    ) -> Result<Option<&EventEnvelope>, OperationFailure> {
-        if self.uncertain {
-            return Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                "writer session in uncertain state; reconciliation required",
-            ));
-        }
-        self.fiber_index.get_latest(&fiber_id)
-    }
-
-    /// Returns the latest event envelope recorded for the specified domain key.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if the fiber is broken.
-    pub fn get_latest_with_key(
-        &self,
-        domain_key: &str,
-    ) -> Result<Option<&EventEnvelope>, OperationFailure> {
-        self.get_latest(derive_fiber_id(domain_key))
-    }
-
-    /// Appends an event to the specified fiber, minting an envelope and advancing fiber state.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if append is rejected by fiber lifecycle or underlying JetStream storage fails.
-    pub fn append_to_fiber(
-        &mut self,
-        fiber_id: [u8; 16],
-        event_id: [u8; 16],
-        payload: impl Into<Vec<u8>>,
-    ) -> Result<WriteLandingVerdict<EventEnvelope>, OperationFailure> {
-        self.check_authority()?;
-        if self.seen_events.contains(&event_id) {
-            return Err(OperationFailure::new(
-                FailureCondition::PrecursorChainBroken(None),
-                "duplicate event ID observed across writer session per C5.61",
-            ));
-        }
-        let mut handle = self.fiber(fiber_id)?;
-        let envelope = handle.append(event_id, payload)?;
-        let mut env_buf = Vec::new();
-        envelope.encode(&mut env_buf);
-        let verdict = self.append_frame_verdict(&env_buf)?;
-        match verdict {
-            WriteLandingVerdict::Landed(_) => Ok(WriteLandingVerdict::Landed(envelope)),
-            WriteLandingVerdict::Undetermined { carried_epoch } => {
-                Ok(WriteLandingVerdict::Undetermined { carried_epoch })
-            }
-        }
-    }
-
-    /// Detaches the specified fiber, minting a detached envelope and recording soft deletion.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if detach is rejected by fiber lifecycle or underlying JetStream storage fails.
-    pub fn detach_fiber(
-        &mut self,
-        fiber_id: [u8; 16],
-        event_id: [u8; 16],
-        payload: impl Into<Vec<u8>>,
-    ) -> Result<WriteLandingVerdict<EventEnvelope>, OperationFailure> {
-        self.check_authority()?;
-        if self.seen_events.contains(&event_id) {
-            return Err(OperationFailure::new(
-                FailureCondition::PrecursorChainBroken(None),
-                "duplicate event ID observed across writer session per C5.61",
-            ));
-        }
-        let mut handle = self.fiber(fiber_id)?;
-        let envelope = handle.detach(event_id, payload)?;
-        let mut env_buf = Vec::new();
-        envelope.encode(&mut env_buf);
-        let verdict = self.append_frame_verdict(&env_buf)?;
-        match verdict {
-            WriteLandingVerdict::Landed(_) => Ok(WriteLandingVerdict::Landed(envelope)),
-            WriteLandingVerdict::Undetermined { carried_epoch } => {
-                Ok(WriteLandingVerdict::Undetermined { carried_epoch })
-            }
-        }
-    }
-
-    /// Rescues the specified detached or locked fiber, returning it to active state.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if rescue is rejected by fiber lifecycle or underlying JetStream storage fails.
-    pub fn rescue_fiber(
-        &mut self,
-        fiber_id: [u8; 16],
-        event_id: [u8; 16],
-        payload: impl Into<Vec<u8>>,
-    ) -> Result<WriteLandingVerdict<EventEnvelope>, OperationFailure> {
-        self.check_authority()?;
-        if self.seen_events.contains(&event_id) {
-            return Err(OperationFailure::new(
-                FailureCondition::PrecursorChainBroken(None),
-                "duplicate event ID observed across writer session per C5.61",
-            ));
-        }
-        let mut handle = self.fiber(fiber_id)?;
-        let envelope = handle.rescue(event_id, payload)?;
-        let mut env_buf = Vec::new();
-        envelope.encode(&mut env_buf);
-        let verdict = self.append_frame_verdict(&env_buf)?;
-        match verdict {
-            WriteLandingVerdict::Landed(_) => Ok(WriteLandingVerdict::Landed(envelope)),
-            WriteLandingVerdict::Undetermined { carried_epoch } => {
-                Ok(WriteLandingVerdict::Undetermined { carried_epoch })
-            }
-        }
-    }
-
-    /// Attaches and validates a schema descriptor to the artefact per C8.2.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if schema descriptor is structurally incomplete or write fails.
-    pub fn set_schema_descriptor(
-        &mut self,
-        descriptor: &SchemaDescriptor,
-    ) -> Result<(), OperationFailure> {
-        self.check_authority()?;
-        descriptor.validate_structural_completeness()?;
-        let mut desc_bytes = Vec::new();
-        descriptor.root.encode(&mut desc_bytes);
-        let record = OwnershipRecord::SchemaDescriptor {
-            schema_version: descriptor.version,
-            descriptor_bytes: desc_bytes,
-        };
-
-        let mut rec_buf = Vec::new();
-        record.encode(&mut rec_buf);
-        let mut frame_buf = Vec::new();
-        ContainerFrame::encode_payload(&rec_buf, &mut frame_buf);
-
+        let handle = self.runtime.handle().clone();
         let js = self.js.clone();
+        let data_name = self.data_stream_name.clone();
+        let (_, frames, _, _seq) = run_future(&handle, async move {
+            read_data_frames_async(&js, &data_name).await
+        })?;
+        Ok(frames)
+    }
+
+    fn set_publish_timeout(&mut self, timeout: std::time::Duration) {
+        self.publish_timeout = timeout;
+    }
+
+    fn set_simulate_indeterminate(&mut self, simulate: bool) {
+        self.simulate_indeterminate = simulate;
+    }
+
+    fn is_retired(&self) -> Result<bool, OperationFailure> {
+        let js_meta = self.js.clone();
         let meta_name = self.meta_stream_name.clone();
         let handle = self.runtime.handle().clone();
-        let timeout = self.publish_timeout;
-
-        let ack_result = run_future(&handle, async move {
-            let pub_future = js
-                .publish(meta_name.clone(), frame_buf.into())
-                .await
-                .map_err(|err| {
-                    OperationFailure::new(
-                        FailureCondition::OwnershipRecordUnreadable,
-                        format!("failed to publish schema descriptor to meta stream: {err}"),
-                    )
-                })?;
-
-            match tokio::time::timeout(timeout, pub_future).await {
-                Ok(Ok(_ack)) => Ok(None),
-                Ok(Err(err)) => Ok(Some(format!(
-                    "failed to ack schema descriptor on meta stream: {err}"
-                ))),
-                Err(_) => Ok(Some(format!(
-                    "schema descriptor ack timed out after {timeout:?} on meta stream"
-                ))),
-            }
+        let meta = run_future(&handle, async move {
+            read_meta_records_async(&js_meta, &meta_name).await
         })?;
-
-        if let Some(diagnostic) = ack_result {
-            self.uncertain = true;
-            self.uncertain_diagnostic = Some(format!(
-                "schema descriptor write failed; write landing undetermined: {diagnostic}"
-            ));
-            return Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                diagnostic,
-            ));
-        }
-
-        Ok(())
+        Ok(meta.outbound_pointer.is_some())
     }
 
-    /// Flushes client connection to ensure broker receipt.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if flush fails.
-    pub fn sync(&mut self) -> Result<(), OperationFailure> {
+    fn sync(&mut self) -> Result<(), OperationFailure> {
         self.check_authority()?;
         let client = self.client.clone();
         let handle = self.runtime.handle().clone();
@@ -1737,22 +1321,52 @@ impl NatsWriterSession {
         })
     }
 
-    /// Appends an arbitrary ownership record to the meta stream.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_ownership_record(
+    fn uncertain_diagnostic(&self) -> Option<&str> {
+        self.uncertain_diagnostic.as_deref()
+    }
+
+    fn claim(&self) -> Option<&OwnershipClaimRecord> {
+        self.claim.as_ref()
+    }
+
+    fn admission(&self) -> &OpenAdmission {
+        &self.admission
+    }
+
+    fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
+        self.meta_records.schema_descriptor.as_ref()
+    }
+
+    fn set_schema_descriptor(
         &mut self,
-        record: &OwnershipRecord,
+        descriptor: &SchemaDescriptor,
     ) -> Result<(), OperationFailure> {
+        let mut descriptor_bytes = Vec::new();
+        descriptor.root.encode(&mut descriptor_bytes);
+        let record = OwnershipRecord::SchemaDescriptor {
+            schema_version: descriptor.version,
+            descriptor_bytes,
+        };
+        self.record_meta_record(&record)
+    }
+
+    fn record_meta_record(&mut self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
         self.check_authority()?;
+        if self.uncertain {
+            return Err(OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                format!(
+                    "writer session is uncertain: {}",
+                    self.uncertain_diagnostic.as_deref().unwrap_or("unknown")
+                ),
+            ));
+        }
         let js = self.js.clone();
         let meta_name = self.meta_stream_name.clone();
-        let record_clone = record.clone();
         let handle = self.runtime.handle().clone();
         let timeout = self.publish_timeout;
-
-        let ack_result = run_future(&handle, async move {
+        let record_clone = record.clone();
+        let (ack, diagnostic) = run_future(&handle, async move {
             let mut record_bytes = Vec::new();
             record_clone.encode(&mut record_bytes);
             let mut record_frame = Vec::new();
@@ -1764,112 +1378,194 @@ impl NatsWriterSession {
                 .map_err(|err| {
                     OperationFailure::new(
                         FailureCondition::OwnershipRecordUnreadable,
-                        format!("failed to publish meta frame: {err}"),
+                        format!("failed to initiate publish to meta stream: {err}"),
                     )
                 })?;
 
             match tokio::time::timeout(timeout, pub_future).await {
-                Ok(Ok(_ack)) => Ok(None),
-                Ok(Err(err)) => Ok(Some(format!("failed to ack meta frame: {err}"))),
-                Err(_) => Ok(Some(format!(
-                    "meta frame ack timed out after {timeout:?} on meta stream"
-                ))),
+                Ok(Ok(ack)) => Ok((WriteLandingVerdict::Landed(ack), None)),
+                Ok(Err(err)) => Ok((
+                    WriteLandingVerdict::Undetermined { carried_epoch: 0 },
+                    Some(format!(
+                        "metadata publish ack failed; write landing undetermined: {err}"
+                    )),
+                )),
+                Err(_) => Ok((
+                    WriteLandingVerdict::Undetermined { carried_epoch: 0 },
+                    Some(format!(
+                        "metadata publish ack timed out after {timeout:?}; write landing undetermined"
+                    )),
+                )),
             }
         })?;
 
-        if let Some(diagnostic) = ack_result {
-            self.uncertain = true;
-            self.uncertain_diagnostic = Some(format!(
-                "ownership record write failed; write landing undetermined: {diagnostic}"
-            ));
-            return Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                diagnostic,
-            ));
+        match ack {
+            WriteLandingVerdict::Landed(_) => {}
+            WriteLandingVerdict::Undetermined { .. } => {
+                self.uncertain = true;
+                let detail = diagnostic
+                    .unwrap_or_else(|| "metadata write landing undetermined per C5.16".to_string());
+                self.uncertain_diagnostic = Some(detail.clone());
+                return Err(OperationFailure::new(
+                    FailureCondition::OwnershipRecordUnreadable,
+                    detail,
+                ));
+            }
         }
 
+        match record {
+            OwnershipRecord::OwnershipClaim(claim) => {
+                self.meta_records.latest_claim = Some(claim.clone());
+            }
+            OwnershipRecord::SchemaDescriptor {
+                schema_version,
+                descriptor_bytes,
+            } => {
+                let (root, _) = DescriptorNode::decode(descriptor_bytes).map_err(|err| {
+                    OperationFailure::new(
+                        FailureCondition::OwnershipRecordUnreadable,
+                        format!("failed to decode schema descriptor in meta stream: {err}"),
+                    )
+                })?;
+                self.meta_records.schema_descriptor =
+                    Some(SchemaDescriptor::new(*schema_version, root));
+            }
+            OwnershipRecord::OutboundPointer(pointer) => {
+                self.meta_records.outbound_pointer = Some(pointer.clone());
+            }
+            OwnershipRecord::InboundPointer(pointer) => {
+                self.meta_records.inbound_pointer = Some(pointer.clone());
+            }
+            OwnershipRecord::MigrationStart(start) => {
+                self.meta_records.migration_start = Some(start.clone());
+            }
+            OwnershipRecord::MigrationEnd(end) => {
+                self.meta_records.migration_end = Some(end.clone());
+            }
+            OwnershipRecord::RescuePolicyChoice(choice) => {
+                self.meta_records.rescue_policy_choice = Some(choice.clone());
+            }
+            OwnershipRecord::IdentityStructure(_) | OwnershipRecord::CleanRelease(_) => {}
+        }
         Ok(())
     }
 
-    /// Appends an outbound generation pointer record to the meta stream per C6.17 and C5.63.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_outbound_pointer(
-        &mut self,
-        pointer: &OutboundPointerRecord,
-    ) -> Result<(), OperationFailure> {
-        self.record_ownership_record(&OwnershipRecord::OutboundPointer(pointer.clone()))
+    fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
+        self.meta_records.outbound_pointer.as_ref()
     }
 
-    /// Appends an inbound generation pointer record to the meta stream per C6.16.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_inbound_pointer(
-        &mut self,
-        pointer: &InboundPointerRecord,
-    ) -> Result<(), OperationFailure> {
-        self.record_ownership_record(&OwnershipRecord::InboundPointer(pointer.clone()))
+    fn inbound_pointer(&self) -> Option<&InboundPointerRecord> {
+        self.meta_records.inbound_pointer.as_ref()
     }
 
-    /// Appends a migration start record to the meta stream per C4.13.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_migration_start(
-        &mut self,
-        start: &MigrationStartRecord,
-    ) -> Result<(), OperationFailure> {
-        self.record_ownership_record(&OwnershipRecord::MigrationStart(start.clone()))
+    fn migration_start(&self) -> Option<&MigrationStartRecord> {
+        self.meta_records.migration_start.as_ref()
     }
 
-    /// Appends a migration end record to the meta stream per C4.13.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_migration_end(
-        &mut self,
-        end: &MigrationEndRecord,
-    ) -> Result<(), OperationFailure> {
-        self.record_ownership_record(&OwnershipRecord::MigrationEnd(end.clone()))
+    fn migration_end(&self) -> Option<&MigrationEndRecord> {
+        self.meta_records.migration_end.as_ref()
     }
 
-    /// Appends a rescue policy choice record to the meta stream per C4.13.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_rescue_policy_choice(
-        &mut self,
-        choice: &RescuePolicyChoiceRecord,
-    ) -> Result<(), OperationFailure> {
-        self.record_ownership_record(&OwnershipRecord::RescuePolicyChoice(choice.clone()))
+    fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
+        self.meta_records.rescue_policy_choice.as_ref()
     }
 }
 
-/// Reader session providing non-exclusive read-only access to an artefact container in JetStream per C5.6, C5.11, and C6.14.
+/// Active JetStream writer session holding append authority with OCC sequence checks.
+#[derive(Debug)]
+pub struct NatsWriterSession {
+    store: Store<NatsEngine>,
+}
+
+impl std::ops::Deref for NatsWriterSession {
+    type Target = Store<NatsEngine>;
+    fn deref(&self) -> &Self::Target {
+        &self.store
+    }
+}
+
+impl std::ops::DerefMut for NatsWriterSession {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.store
+    }
+}
+
+impl NatsWriterSession {
+    /// Returns the active ownership claim record.
+    #[must_use]
+    pub fn claim(&self) -> &OwnershipClaimRecord {
+        self.store
+            .engine()
+            .claim()
+            .expect("writer session must have admitted claim")
+    }
+
+    /// Returns the common artefact stem.
+    #[must_use]
+    pub fn stem(&self) -> &str {
+        self.store.engine().stem()
+    }
+
+    /// Returns the ownership record stream name (`{stem}_meta`).
+    #[must_use]
+    pub fn meta_stream_name(&self) -> &str {
+        self.store.engine().meta_stream_name()
+    }
+
+    /// Returns the event data stream name (`{stem}_data`).
+    #[must_use]
+    pub fn data_stream_name(&self) -> &str {
+        self.store.engine().data_stream_name()
+    }
+
+    /// Returns the last consumed message sequence in the event data stream.
+    #[must_use]
+    pub fn last_sequence(&self) -> u64 {
+        self.store.engine().last_sequence()
+    }
+
+    /// Returns all meta records decoded from the meta stream.
+    #[must_use]
+    pub fn meta_records(&self) -> &NatsMetaRecords {
+        self.store.engine().meta_records()
+    }
+
+    /// Configures the publish timeout duration.
+    #[must_use]
+    pub fn with_publish_timeout(mut self, timeout: Duration) -> Self {
+        self.store.set_publish_timeout(timeout);
+        self
+    }
+
+    /// Configures whether to simulate an indeterminate write landing per C5.16.
+    #[must_use]
+    pub fn with_simulate_indeterminate(mut self, simulate: bool) -> Self {
+        self.store.set_simulate_indeterminate(simulate);
+        self
+    }
+
+    /// Records an arbitrary ownership record into metadata.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if recording fails.
+    pub fn record_ownership_record(
+        &mut self,
+        record: &OwnershipRecord,
+    ) -> Result<(), OperationFailure> {
+        self.store.record_meta_record(record)
+    }
+}
+
+/// Reader session providing non-exclusive read-only access to an artefact container in JetStream.
+#[derive(Debug)]
 pub struct NatsReaderSession {
-    stem: String,
-    meta_stream_name: String,
-    data_stream_name: String,
-    admission: OpenAdmission,
-    meta_records: NatsMetaRecords,
-    rolling_commitment: RollingCommitment,
-    js: async_nats::jetstream::Context,
-    runtime: Arc<tokio::runtime::Runtime>,
-    fiber_index: SessionIndex,
-    failed: Option<FailureCondition>,
+    store: Store<NatsEngine>,
 }
 
-impl fmt::Debug for NatsReaderSession {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("NatsReaderSession")
-            .field("stem", &self.stem)
-            .field("meta_stream_name", &self.meta_stream_name)
-            .field("data_stream_name", &self.data_stream_name)
-            .field("admission", &self.admission)
-            .field("meta_records", &self.meta_records)
-            .finish()
+impl std::ops::Deref for NatsReaderSession {
+    type Target = Store<NatsEngine>;
+    fn deref(&self) -> &Self::Target {
+        &self.store
     }
 }
 
@@ -1877,235 +1573,51 @@ impl NatsReaderSession {
     /// Returns the common artefact stem.
     #[must_use]
     pub fn stem(&self) -> &str {
-        &self.stem
+        self.store.engine().stem()
     }
 
     /// Returns the ownership record stream name (`{stem}_meta`).
     #[must_use]
     pub fn meta_stream_name(&self) -> &str {
-        &self.meta_stream_name
+        self.store.engine().meta_stream_name()
     }
 
     /// Returns the event data stream name (`{stem}_data`).
     #[must_use]
     pub fn data_stream_name(&self) -> &str {
-        &self.data_stream_name
-    }
-
-    /// Returns the open admission status for this reader session.
-    #[must_use]
-    pub fn admission(&self) -> &OpenAdmission {
-        &self.admission
+        self.store.engine().data_stream_name()
     }
 
     /// Returns all meta records decoded from the meta stream.
     #[must_use]
     pub fn meta_records(&self) -> &NatsMetaRecords {
-        &self.meta_records
-    }
-
-    /// Returns the recorded ownership claim if present.
-    #[must_use]
-    pub fn claim(&self) -> Option<&OwnershipClaimRecord> {
-        self.meta_records.latest_claim.as_ref()
-    }
-
-    /// Returns the recorded schema descriptor if present.
-    #[must_use]
-    pub fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
-        self.meta_records.schema_descriptor.as_ref()
-    }
-
-    /// Returns the outbound generation pointer if present.
-    #[must_use]
-    pub fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
-        self.meta_records.outbound_pointer.as_ref()
-    }
-
-    /// Returns the inbound generation pointer if present.
-    #[must_use]
-    pub fn inbound_pointer(&self) -> Option<&InboundPointerRecord> {
-        self.meta_records.inbound_pointer.as_ref()
-    }
-
-    /// Returns the migration start record if present.
-    #[must_use]
-    pub fn migration_start(&self) -> Option<&MigrationStartRecord> {
-        self.meta_records.migration_start.as_ref()
-    }
-
-    /// Returns the migration end record if present.
-    #[must_use]
-    pub fn migration_end(&self) -> Option<&MigrationEndRecord> {
-        self.meta_records.migration_end.as_ref()
-    }
-
-    /// Returns the rescue policy choice record if present.
-    #[must_use]
-    pub fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
-        self.meta_records.rescue_policy_choice.as_ref()
-    }
-
-    /// Returns true if this artefact is a retired migration source per C5.63.
-    #[must_use]
-    pub fn is_retired_source(&self) -> bool {
-        self.meta_records.outbound_pointer.is_some()
-    }
-
-    /// Returns the running physical rolling commitment computed across read frames.
-    #[must_use]
-    pub fn rolling_commitment(&self) -> &RollingCommitment {
-        &self.rolling_commitment
+        self.store.engine().meta_records()
     }
 
     /// Reads all framed payloads from the data stream, validating CRC32C on each frame.
     ///
     /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::PrecursorChainBroken`] if checksum fails or stream corrupted.
+    /// Returns [`OperationFailure`] if reading fails or frame checksum fails.
     pub fn read_all_frames(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
-        let js = self.js.clone();
-        let data_name = self.data_stream_name.clone();
-        let handle = self.runtime.handle().clone();
-        let res = run_future(&handle, async move {
-            read_data_frames_async(&js, &data_name).await
-        });
-        match res {
-            Ok((_, frames, rolling, _)) => {
-                self.rolling_commitment = rolling;
-                Ok(frames)
-            }
-            Err(err) => {
-                self.failed = Some(err.condition().clone());
-                Err(err)
-            }
-        }
+        self.store.read_all_frames()
     }
 
-    fn read_all_envelopes_inner(
-        &mut self,
-        for_migration: bool,
-    ) -> Result<Vec<EventEnvelope>, OperationFailure> {
-        let res = (|| {
-            let frames = self.read_all_frames()?;
-            for frame in &frames {
-                if frame.len() < 85 {
-                    return Err(OperationFailure::new(
-                        FailureCondition::EnvelopeMismatch,
-                        format!(
-                            "frame decode error: {}",
-                            DecodeError::TruncatedPayload {
-                                expected: 85,
-                                available: frame.len(),
-                            }
-                        ),
-                    ));
-                }
-            }
-            let session_index =
-                SessionIndex::build_from_frames(frames.iter().map(|f| f.as_slice()))?;
-            if !for_migration && session_index.has_broken_fibers() {
-                self.fiber_index = session_index;
-                return Err(OperationFailure::new(
-                    FailureCondition::PrecursorChainBroken(None),
-                    "discovered break in precursor chain",
-                ));
-            }
-            let envelopes = frames
-                .iter()
-                .map(|frame| SessionIndex::decode_and_validate_frame(frame))
-                .collect::<Result<Vec<_>, _>>()?;
-            self.fiber_index = session_index;
-            Ok(envelopes)
-        })();
-
-        if let Err(ref err) = res {
-            self.failed = Some(err.condition().clone());
-        }
-        res
-    }
-
-    /// Reads and decodes all event envelopes from the data stream.
+    /// Reads and decodes all event envelopes from the container.
     ///
     /// # Errors
-    /// Returns [`OperationFailure`] if frame checksum fails, frame is shorter than 85 bytes,
-    /// envelope decode fails, or precursor chain is broken.
+    /// Returns [`OperationFailure`] if any frame is invalid or history contains broken fibers.
     pub fn read_all_envelopes(&mut self) -> Result<Vec<EventEnvelope>, OperationFailure> {
-        self.read_all_envelopes_inner(false)
+        self.store.read_all_envelopes()
     }
 
-    /// Reads and decodes all event envelopes for migration, permitting broken history per C5.28.
+    /// Reads all event envelopes for migration, tolerating broken fiber history.
     ///
     /// # Errors
-    /// Returns [`OperationFailure`] if frame checksum fails or envelope decode fails.
+    /// Returns [`OperationFailure`] if reading frames fails or frame decoding fails.
     pub fn read_all_envelopes_for_migration(
         &mut self,
     ) -> Result<Vec<EventEnvelope>, OperationFailure> {
-        self.read_all_envelopes_inner(true)
-    }
-
-    /// Returns the latest event envelope recorded for the specified fiber identifier.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if the fiber is broken or reader session has failed.
-    pub fn get_latest(
-        &self,
-        fiber_id: [u8; 16],
-    ) -> Result<Option<&EventEnvelope>, OperationFailure> {
-        if let Some(cond) = &self.failed {
-            return Err(OperationFailure::new(
-                cond.clone(),
-                "reader in failed state",
-            ));
-        }
-        self.fiber_index.get_latest(&fiber_id)
-    }
-
-    /// Returns the latest event envelope recorded for the specified domain key.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if the fiber is broken or reader session has failed.
-    pub fn get_latest_with_key(
-        &self,
-        domain_key: &str,
-    ) -> Result<Option<&EventEnvelope>, OperationFailure> {
-        self.get_latest(derive_fiber_id(domain_key))
-    }
-
-    /// Returns a [`FiberHandle`] for the specified fiber identifier.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if the fiber is broken or reader session has failed.
-    pub fn fiber(&self, fiber_id: [u8; 16]) -> Result<FiberHandle, OperationFailure> {
-        if let Some(cond) = &self.failed {
-            return Err(OperationFailure::new(
-                cond.clone(),
-                "reader in failed state",
-            ));
-        }
-        self.fiber_index.fiber(fiber_id)
-    }
-
-    /// Returns a [`FiberHandle`] derived from a domain key string.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if the fiber is broken.
-    pub fn fiber_with_key(&self, domain_key: &str) -> Result<FiberHandle, OperationFailure> {
-        self.fiber(derive_fiber_id(domain_key))
-    }
-
-    /// Validates structural completeness of the artefact's schema descriptor per C8.2.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::MissingSchemaDescriptor`] if descriptor is absent.
-    /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] if descriptor is invalid.
-    pub fn validate_schema_completeness(&self) -> Result<(), OperationFailure> {
-        match self.schema_descriptor() {
-            Some(descriptor) => descriptor.validate_structural_completeness(),
-            None => Err(OperationFailure::new(
-                FailureCondition::MissingSchemaDescriptor,
-                "artefact schema descriptor is absent per C8.2",
-            )),
-        }
+        self.store.read_all_envelopes_for_migration()
     }
 }
 

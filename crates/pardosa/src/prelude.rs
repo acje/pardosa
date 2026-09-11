@@ -30,7 +30,7 @@ pub use crate::store::{
     MigrationDisagreement, MigrationMode, OpenAdmission, OperationFailure, OwnershipFence,
     OwnershipStatus, PrecursorLink, QualifiedOpenResult, QualifiedOpenResultBuilder,
     ReaderObservation, RecordedOwnership, ReopenedFiberState, ReopenedStoreBoundary, ResumeCursor,
-    SessionIndex, SupersessionStatus, TakeoverProof, TakeoverVerdict, WriteLandingVerdict,
-    MAX_ACTIVE_FIBERS, MAX_STREAM_BYTES, MAX_STREAM_ITEMS,
+    SessionIndex, StorageEngine, Store, SupersessionStatus, TakeoverProof, TakeoverVerdict,
+    WriteLandingVerdict, MAX_ACTIVE_FIBERS, MAX_STREAM_BYTES, MAX_STREAM_ITEMS,
 };
 pub use pardosa_derive::PardosaSchema;

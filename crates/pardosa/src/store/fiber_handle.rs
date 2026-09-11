@@ -4,7 +4,7 @@ use crate::encoding::{EnvelopeHeader, EventEnvelope, ValueConstraint};
 use crate::store::{CausalChainError, FailureCondition, FiberState, OperationFailure};
 
 /// Maximum number of events allowed per fiber.
-pub const MAX_EVENTS_PER_FIBER: u64 = u64::MAX - 1;
+pub const MAX_EVENTS_PER_FIBER: u64 = 100_000;
 
 /// Active entity handle encapsulating fiber state, precursor tracking, and event counts.
 #[derive(Debug, Clone, PartialEq, Eq)]

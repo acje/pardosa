@@ -382,6 +382,286 @@ fn test_nats_incomplete_creation_c5_10() {
 }
 
 #[test]
+fn test_nats_complete_creation_validation_and_error_propagation() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("complete_creation_val");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
+    let claim_a = sample_claim(1);
+
+    adapter
+        .create_incomplete_meta_only(&claim_a)
+        .expect("create incomplete meta");
+    assert_eq!(adapter.presence(), ArtefactPresence::OwnershipRecordOnly);
+
+    let inbound = InboundPointerRecord {
+        prior_generation_locator_id: [0x55; 16],
+        prior_generation_epoch: 0,
+    };
+    adapter
+        .record_inbound_pointer(&inbound)
+        .expect("record inbound pointer on incomplete meta");
+
+    let mut claim_b = claim_a.clone();
+    claim_b.epoch = 2;
+    claim_b.operator_label = "operator-b".to_string();
+
+    let err_mismatch = adapter
+        .complete_creation(&claim_b)
+        .expect_err("complete creation with mismatched claim must be refused");
+    assert_eq!(
+        *err_mismatch.condition(),
+        FailureCondition::OwnershipUnestablished
+    );
+
+    let reader_after_err = adapter.open_read().expect("open reader after error");
+    assert_eq!(reader_after_err.claim(), Some(&claim_a));
+    assert_eq!(
+        reader_after_err.meta_records().inbound_pointer.as_ref(),
+        Some(&inbound)
+    );
+
+    let writer = adapter
+        .complete_creation(&claim_a)
+        .expect("complete creation with matching claim must succeed");
+    assert_eq!(writer.claim(), &claim_a);
+    assert_eq!(
+        writer.meta_records().inbound_pointer.as_ref(),
+        Some(&inbound)
+    );
+    assert_eq!(adapter.presence(), ArtefactPresence::Both);
+
+    adapter.delete_streams().expect("cleanup");
+}
+
+#[test]
+fn test_nats_complete_creation_corrupt_metadata_refusal() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("complete_creation_corrupt");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
+    let claim_a = sample_claim(1);
+
+    adapter
+        .create_incomplete_meta_only(&claim_a)
+        .expect("create incomplete meta");
+    assert_eq!(adapter.presence(), ArtefactPresence::OwnershipRecordOnly);
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        let client = async_nats::connect(server.url())
+            .await
+            .expect("connect async_nats");
+        client
+            .publish(
+                adapter.meta_stream_name().to_string(),
+                bytes::Bytes::from_static(b"corrupt_unreadable_metadata_frame_payload"),
+            )
+            .await
+            .expect("publish corrupt frame");
+        client.flush().await.expect("flush");
+    });
+
+    let err = adapter
+        .complete_creation(&claim_a)
+        .expect_err("complete creation must refuse when metadata is corrupt or unreadable");
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::OwnershipRecordUnreadable
+    );
+    assert!(err
+        .to_string()
+        .contains("failed to decode frame in meta stream"));
+    assert_eq!(adapter.presence(), ArtefactPresence::OwnershipRecordOnly);
+
+    let claim_b = sample_claim(2);
+    let err_b = adapter
+        .complete_creation(&claim_b)
+        .expect_err("complete creation must propagate read error with ? before claim evaluation");
+    assert_eq!(
+        *err_b.condition(),
+        FailureCondition::OwnershipRecordUnreadable
+    );
+    assert_eq!(adapter.presence(), ArtefactPresence::OwnershipRecordOnly);
+
+    adapter.delete_streams().expect("cleanup");
+}
+
+#[test]
+fn test_nats_interleaved_open_coherent_snapshot() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("interleaved_open");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
+    let claim = sample_claim(1);
+
+    let mut writer1 = adapter.create(&claim).expect("create writer 1");
+    let fiber_id = [0x99; 16];
+    let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"first").unwrap();
+    writer1.append_envelope(&genesis).expect("append 1");
+
+    let mut writer2 = adapter.open_write(1).expect("open writer 2");
+    assert_eq!(writer2.last_sequence(), 2);
+    let frames2 = writer2.read_all_envelopes().expect("read envelopes");
+    assert_eq!(frames2.len(), 1);
+
+    let second = EventEnvelope {
+        header: EnvelopeHeader {
+            event_id: [0x02; 16],
+            fiber_id,
+            detached: false,
+            precursor: genesis.header.event_id,
+            precursor_hash: genesis.commitment(),
+        },
+        payload: b"second".to_vec(),
+    };
+    writer1
+        .append_envelope(&second)
+        .expect("writer 1 appends second event");
+    assert_eq!(writer1.last_sequence(), 3);
+
+    let third = EventEnvelope {
+        header: EnvelopeHeader {
+            event_id: [0x03; 16],
+            fiber_id,
+            detached: false,
+            precursor: genesis.header.event_id,
+            precursor_hash: genesis.commitment(),
+        },
+        payload: b"third_from_writer2".to_vec(),
+    };
+    let occ_err = writer2
+        .append_envelope(&third)
+        .expect_err("writer 2 must be rejected by OCC conflict due to interleaved append");
+    assert_eq!(
+        *occ_err.condition(),
+        FailureCondition::ConcurrencyConflict,
+        "OCC collision must be detected: {:?}",
+        occ_err.condition()
+    );
+
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let adapter_clone = adapter.clone();
+
+    let env_a = EventEnvelope {
+        header: EnvelopeHeader {
+            event_id: [0x10; 16],
+            fiber_id,
+            detached: false,
+            precursor: second.header.event_id,
+            precursor_hash: second.commitment(),
+        },
+        payload: b"concurrent_a".to_vec(),
+    };
+
+    let env_b = EventEnvelope {
+        header: EnvelopeHeader {
+            event_id: [0x20; 16],
+            fiber_id,
+            detached: false,
+            precursor: second.header.event_id,
+            precursor_hash: second.commitment(),
+        },
+        payload: b"concurrent_b".to_vec(),
+    };
+
+    let handle_a = {
+        let barrier = barrier.clone();
+        let adapter = adapter_clone.clone();
+        let env_a = env_a.clone();
+        thread::spawn(move || {
+            let mut writer = adapter.open_write(1).expect("thread a open_write");
+            assert_eq!(writer.last_sequence(), 3);
+            barrier.wait();
+            writer.append_envelope(&env_a)
+        })
+    };
+
+    let handle_b = {
+        let barrier = barrier.clone();
+        let adapter = adapter_clone;
+        let env_b = env_b.clone();
+        thread::spawn(move || {
+            let mut writer = adapter.open_write(1).expect("thread b open_write");
+            assert_eq!(writer.last_sequence(), 3);
+            barrier.wait();
+            writer.append_envelope(&env_b)
+        })
+    };
+
+    let res_a = handle_a.join().expect("join thread a");
+    let res_b = handle_b.join().expect("join thread b");
+
+    let winner_env = match (res_a, res_b) {
+        (Ok(seq_a), Err(err_b))
+            if seq_a == 3 && *err_b.condition() == FailureCondition::ConcurrencyConflict =>
+        {
+            env_a
+        }
+        (Err(err_a), Ok(seq_b))
+            if seq_b == 3 && *err_a.condition() == FailureCondition::ConcurrencyConflict =>
+        {
+            env_b
+        }
+        (a, b) => panic!(
+            "expected exactly one thread to succeed with Ok(3) and the other to fail with ConcurrencyConflict, got a={:?}, b={:?}",
+            a, b
+        ),
+    };
+
+    let mut writer_reopen = adapter.open_write(1).expect("reopen after concurrent race");
+    assert_eq!(writer_reopen.last_sequence(), 4);
+    let envelopes_reopen = writer_reopen
+        .read_all_envelopes()
+        .expect("read envelopes reopen");
+    assert_eq!(envelopes_reopen.len(), 3);
+    assert_eq!(
+        envelopes_reopen[2].header.event_id,
+        winner_env.header.event_id
+    );
+    assert_eq!(envelopes_reopen[2].commitment(), winner_env.commitment());
+
+    let env_reopen = EventEnvelope {
+        header: EnvelopeHeader {
+            event_id: [0x21; 16],
+            fiber_id,
+            detached: false,
+            precursor: winner_env.header.event_id,
+            precursor_hash: winner_env.commitment(),
+        },
+        payload: b"reopened_after_occ_conflict".to_vec(),
+    };
+    let verdict_reopen = writer_reopen
+        .append_envelope(&env_reopen)
+        .expect("append after reopen");
+    assert_eq!(verdict_reopen, 4);
+    assert_eq!(writer_reopen.last_sequence(), 5);
+
+    let mut final_reader = adapter.open_read().expect("final read");
+    let final_envelopes = final_reader.read_all_envelopes().expect("final envelopes");
+    assert_eq!(final_envelopes.len(), 4);
+
+    adapter.delete_streams().expect("cleanup");
+}
+
+#[test]
+fn test_nats_reader_capability_no_transport_escape() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("reader_no_escape");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
+    let claim = sample_claim(1);
+
+    let mut writer = adapter.create(&claim).expect("create writer");
+    let fiber_id = [0x55; 16];
+    let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"first").unwrap();
+    writer.append_envelope(&genesis).expect("append");
+
+    let reader = adapter.open_read().expect("open reader");
+    assert_eq!(reader.stem(), &stem);
+    assert_eq!(reader.meta_stream_name(), format!("{stem}_meta"));
+    assert_eq!(reader.data_stream_name(), format!("{stem}_data"));
+
+    adapter.delete_streams().expect("cleanup");
+}
+
+#[test]
 fn test_nats_c8_2_schema_completeness() {
     let valid_schema = SchemaDescriptor::new(
         1,
@@ -529,7 +809,7 @@ fn test_nats_adapter_retirement_and_generation_records() {
     );
 
     let mut reader = adapter.open_read().expect("historical read must succeed");
-    assert!(reader.is_retired_source());
+    assert!(reader.is_retired_source().expect("query retired source"));
     assert_eq!(reader.outbound_pointer(), Some(&outbound));
     let frames = reader.read_all_envelopes().expect("read frames");
     assert_eq!(frames.len(), 1);
@@ -1106,6 +1386,92 @@ fn test_nats_metadata_presend_refusal_does_not_poison_session() {
         .expect("subsequent small valid append must succeed after pre-send metadata refusal");
     assert!(matches!(verdict2, WriteLandingVerdict::Landed(_)));
     assert_eq!(writer.uncertain_diagnostic(), None);
+
+    adapter.delete_streams().expect("cleanup");
+}
+
+#[test]
+fn test_nats_metadata_authority_checks_and_borrowed_claim() {
+    let server = LiveNatsServer::acquire();
+    let stem = format!("meta_auth_nats_{}", std::process::id());
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
+    let claim = sample_claim(1);
+    let mut writer = adapter.create(&claim).expect("create writer");
+
+    let borrowed_claim: &OwnershipClaimRecord = writer.claim();
+    assert_eq!(borrowed_claim.epoch, 1);
+    assert_eq!(
+        writer.meta_records().latest_claim.as_ref().map(|c| c.epoch),
+        Some(1)
+    );
+
+    let claim2 = sample_claim(2);
+    adapter
+        .record_ownership_record(&OwnershipRecord::OwnershipClaim(claim2))
+        .expect("append epoch 2");
+
+    let choice = RescuePolicyChoiceRecord {
+        policy_tag: 0,
+        parameter_payload: vec![],
+    };
+    let err_meta = writer
+        .record_ownership_record(&OwnershipRecord::RescuePolicyChoice(choice))
+        .unwrap_err();
+    assert_eq!(*err_meta.condition(), FailureCondition::StaleEpoch);
+
+    let descriptor = SchemaDescriptor::new(1, DescriptorNode::U64);
+    let err_schema = writer.set_schema_descriptor(&descriptor).unwrap_err();
+    assert_eq!(*err_schema.condition(), FailureCondition::StaleEpoch);
+
+    let sync_err = writer.sync().unwrap_err();
+    assert_eq!(*sync_err.condition(), FailureCondition::StaleEpoch);
+
+    let reader = adapter.open_read().expect("open reader");
+    let claim_opt: Option<&OwnershipClaimRecord> = reader.claim();
+    assert_eq!(claim_opt.map(|c| c.epoch), Some(2));
+
+    adapter.delete_streams().expect("cleanup");
+}
+
+#[test]
+fn test_nats_read_all_frames_does_not_advance_occ_watermark() {
+    let server = LiveNatsServer::acquire();
+    let stem = format!("occ_sync_nats_{}", std::process::id());
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
+    let claim = sample_claim(1);
+    let mut writer_a = adapter.create(&claim).expect("create writer A");
+    let mut writer_b = adapter.open_write(1).expect("open writer B");
+
+    let fiber_id = [0xbb; 16];
+    let genesis_a = EventEnvelope::genesis([0x01; 16], fiber_id, b"genesis_a").unwrap();
+    writer_a
+        .append_envelope(&genesis_a)
+        .expect("writer A appends genesis");
+
+    let frames = writer_b.read_all_frames().expect("writer B reads frames");
+    assert_eq!(frames.len(), 1);
+
+    let genesis_b = EventEnvelope::genesis([0x02; 16], fiber_id, b"genesis_b").unwrap();
+    let err_b = writer_b.append_envelope(&genesis_b).unwrap_err();
+    assert_eq!(*err_b.condition(), FailureCondition::ConcurrencyConflict);
+
+    adapter.delete_streams().expect("cleanup");
+}
+
+#[test]
+fn test_nats_migration_read_rejects_malformed_envelope() {
+    let server = LiveNatsServer::acquire();
+    let stem = format!("migration_malformed_nats_{}", std::process::id());
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
+    let claim = sample_claim(1);
+    let mut writer = adapter.create(&claim).expect("create writer");
+    writer
+        .append_unvalidated_frame(b"short-payload")
+        .expect("append short frame");
+
+    let mut reader = adapter.open_read().expect("open reader");
+    let err = reader.read_all_envelopes_for_migration().unwrap_err();
+    assert_eq!(*err.condition(), FailureCondition::EnvelopeMismatch);
 
     adapter.delete_streams().expect("cleanup");
 }

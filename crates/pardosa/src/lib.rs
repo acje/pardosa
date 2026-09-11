@@ -18,7 +18,7 @@
 //! # Per-Condition Remedies
 //!
 //! When operations fail, Pardosa reports typed error conditions with unambiguous remedies:
-//! - [`store::FailureCondition::UnreadableRecord`]: Frame CRC32C checksum or length check failed.
+//! - [`store::FailureCondition::PrecursorChainBroken`]: Frame CRC32C checksum or length check failed.
 //!   Remedy: Verify storage media integrity; restore from backup or uncorrupted replica.
 //! - [`store::FailureCondition::SchemaMismatch`]: Payload schema descriptor does not match expected schema identity.
 //!   Remedy: Update consumer types to match the artefact's schema version or apply a migration.
@@ -28,7 +28,7 @@
 //!   Remedy: Relinquish writer session; do not retry without re-establishing mutual exclusion.
 //! - [`store::FailureCondition::OwnershipUnestablished`]: Writer session cannot conclusively prove current ownership.
 //!   Remedy: Refresh ownership claim or inspect operator fence state before retrying.
-//! - [`store::FailureCondition::TerminalFailure`]: Unrecoverable protocol or storage violation encountered.
+//! - [`store::FailureCondition::InvariantBreakingConfiguration`]: Unrecoverable protocol or storage violation encountered.
 //!   Remedy: Close the store; inspect error details and execute migration or rescue recovery per C4.7.
 //!
 //! # Truthful Seal Limits (S5)
