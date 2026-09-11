@@ -1135,7 +1135,12 @@ mod tests {
             env.encode(&mut frame_data);
         }
 
-        let frames: Vec<&[u8]> = frame_data.chunks_exact(85).collect();
+        let frames: Vec<&[u8]> = frame_data
+            .as_chunks::<85>()
+            .0
+            .iter()
+            .map(AsRef::as_ref)
+            .collect();
         assert_eq!(frames.len(), count);
 
         let index = SessionIndex::build_from_frames(
