@@ -48,6 +48,7 @@
 #![deny(missing_docs)]
 
 pub mod adapter;
+#[cfg(any(test, feature = "unstable-test-support"))]
 pub mod test_support;
 
 pub use adapter::{NatsReaderSession, NatsStorageAdapter, NatsWriterSession};

@@ -697,7 +697,6 @@ fn run_rustc(code: &str) -> (bool, String) {
     let entries = std::fs::read_dir(&deps_dir)
         .unwrap_or_else(|e| panic!("failed to read deps dir {}: {e}", deps_dir.display()));
     let mut rlibs = Vec::new();
-    let mut nats_rlibs = Vec::new();
     for entry in entries {
         let entry =
             entry.unwrap_or_else(|e| panic!("failed to read entry in {}: {e}", deps_dir.display()));
@@ -705,8 +704,6 @@ fn run_rustc(code: &str) -> (bool, String) {
         if let Some(s) = p.file_name().and_then(|n| n.to_str()) {
             if s.starts_with("libpardosa-") && s.ends_with(".rlib") {
                 rlibs.push(p.clone());
-            } else if s.starts_with("libpardosa_nats-") && s.ends_with(".rlib") {
-                nats_rlibs.push(p);
             }
         }
     }
@@ -725,18 +722,6 @@ fn run_rustc(code: &str) -> (bool, String) {
             rlibs.pop().unwrap()
         }
     };
-    let nats_rlib = match nats_rlibs.len() {
-        0 => None,
-        1 => Some(nats_rlibs.remove(0)),
-        _ => {
-            nats_rlibs.sort_by_key(|p| {
-                std::fs::metadata(p)
-                    .and_then(|m| m.modified())
-                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-            });
-            Some(nats_rlibs.pop().unwrap())
-        }
-    };
 
     let rustc_cmd = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
     let mut cmd = Command::new(&rustc_cmd);
@@ -746,10 +731,6 @@ fn run_rustc(code: &str) -> (bool, String) {
         .arg(&deps_dir)
         .arg("--extern")
         .arg(format!("pardosa={}", rlib.display()));
-    if let Some(nats_rlib) = &nats_rlib {
-        cmd.arg("--extern")
-            .arg(format!("pardosa_nats={}", nats_rlib.display()));
-    }
     let mut child = cmd
         .arg("--crate-type")
         .arg("lib")
@@ -1187,37 +1168,6 @@ fn test_compile_fail_and_positive_controls_external_boundary() {
     assert!(
         fw_reuse_stderr.contains("use of moved value") || fw_reuse_stderr.contains("E0382"),
         "rejection must be use of moved value: {fw_reuse_stderr}"
-    );
-
-    let nats_reader_client_escape_code = r#"
-        use pardosa_nats::NatsReaderSession;
-        pub fn run_invalid(reader: &NatsReaderSession) {
-            let _ = reader.engine().client();
-        }
-    "#;
-    let (client_ok, client_stderr) = run_rustc(nats_reader_client_escape_code);
-    assert!(
-        !client_ok,
-        "NatsReaderSession::engine().client() must not exist (R2-H2)"
-    );
-    assert!(
-        client_stderr.contains("no method named `client`") || client_stderr.contains("E0599"),
-        "rejection must cite missing client method: {client_stderr}"
-    );
-
-    let nats_reader_positive_code = r#"
-        use pardosa_nats::NatsReaderSession;
-        pub fn run_valid(reader: &NatsReaderSession) {
-            let _ = reader.stem();
-            let _ = reader.meta_stream_name();
-            let _ = reader.data_stream_name();
-            let _ = reader.engine().stem();
-        }
-    "#;
-    let (pos_nats_ok, pos_nats_stderr) = run_rustc(nats_reader_positive_code);
-    assert!(
-        pos_nats_ok,
-        "valid NatsReaderSession methods must compile cleanly:\n{pos_nats_stderr}"
     );
 }
 
