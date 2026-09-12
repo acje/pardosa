@@ -613,7 +613,7 @@ fn test_descriptors_conformance_vectors() {
                                 assert_eq!(consumed, bytes.len());
                                 assert_eq!(node, EventF32::descriptor_node());
                                 let mut enc = Vec::new();
-                                node.encode(&mut enc);
+                                node.encode(&mut enc).unwrap();
                                 assert_eq!(enc, bytes);
                             } else {
                                 let err = DescriptorNode::decode(&bytes).unwrap_err();
@@ -626,7 +626,7 @@ fn test_descriptors_conformance_vectors() {
                                 assert_eq!(consumed, bytes.len());
                                 assert_eq!(node, EventF64::descriptor_node());
                                 let mut enc = Vec::new();
-                                node.encode(&mut enc);
+                                node.encode(&mut enc).unwrap();
                                 assert_eq!(enc, bytes);
                             } else {
                                 let err = DescriptorNode::decode(&bytes).unwrap_err();

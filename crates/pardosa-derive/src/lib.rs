@@ -80,6 +80,7 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
 
     let mut has_tombstone = false;
     let mut variant_data = Vec::with_capacity(data_enum.variants.len());
+    let mut seen_discriminants = std::collections::HashSet::new();
 
     for variant in &data_enum.variants {
         let disc_expr = match &variant.discriminant {
@@ -96,6 +97,24 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
         };
 
         let disc_val = parse_discriminant_value(disc_expr)?;
+        if disc_val > 65535 {
+            return Err(syn::Error::new_spanned(
+                disc_expr,
+                format!(
+                    "variant `{}` discriminant {} exceeds maximum allowed value 65535 (per M4)",
+                    variant.ident, disc_val
+                ),
+            ));
+        }
+        if !seen_discriminants.insert(disc_val) {
+            return Err(syn::Error::new_spanned(
+                disc_expr,
+                format!(
+                    "duplicate discriminant {} found on variant `{}` (per M4)",
+                    disc_val, variant.ident
+                ),
+            ));
+        }
 
         let is_tombstone = check_tombstone_attr(&variant.attrs)?;
         if is_tombstone {
@@ -155,6 +174,13 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
 
                 decode_match_arms.push(quote! {
                     #disc_val => {
+                        let consumed = #discriminant_width as usize;
+                        if consumed != buf.len() {
+                            return ::std::result::Result::Err(::pardosa::encoding::DecodeError::TruncatedPayload {
+                                expected: consumed,
+                                available: buf.len(),
+                            });
+                        }
                         ::std::result::Result::Ok(Self::#vident)
                     }
                 });
@@ -187,7 +213,14 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
 
                 decode_match_arms.push(quote! {
                     #disc_val => {
-                        let (val, _) = <#ty as ::pardosa::schema::PardosaType>::decode_type(&buf[#discriminant_width as usize..])?;
+                        let (val, inner_consumed) = <#ty as ::pardosa::schema::PardosaType>::decode_type(&buf[#discriminant_width as usize..])?;
+                        let consumed = (#discriminant_width as usize) + inner_consumed;
+                        if consumed != buf.len() {
+                            return ::std::result::Result::Err(::pardosa::encoding::DecodeError::TruncatedPayload {
+                                expected: consumed,
+                                available: buf.len(),
+                            });
+                        }
                         ::std::result::Result::Ok(Self::#vident(val))
                     }
                 });
@@ -255,6 +288,12 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                     #disc_val => {
                         let mut cursor = #discriminant_width as usize;
                         #(#field_decodes)*
+                        if cursor != buf.len() {
+                            return ::std::result::Result::Err(::pardosa::encoding::DecodeError::TruncatedPayload {
+                                expected: cursor,
+                                available: buf.len(),
+                            });
+                        }
                         ::std::result::Result::Ok(Self::#vident { #(#field_idents),* })
                     }
                 });
@@ -322,6 +361,12 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                     #disc_val => {
                         let mut cursor = #discriminant_width as usize;
                         #(#field_decodes)*
+                        if cursor != buf.len() {
+                            return ::std::result::Result::Err(::pardosa::encoding::DecodeError::TruncatedPayload {
+                                expected: cursor,
+                                available: buf.len(),
+                            });
+                        }
                         ::std::result::Result::Ok(Self::#vident(#(#field_idents),*))
                     }
                 });
@@ -585,5 +630,25 @@ mod tests {
         ).unwrap();
         let res = expand_pardosa_schema(&input);
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_reject_discriminant_overflow() {
+        let input: DeriveInput =
+            parse_str("enum MyEvent { #[pardosa(tombstone)] Tombstone = 0, Big = 65536 }").unwrap();
+        let err = expand_pardosa_schema(&input).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("exceeds maximum allowed value 65535"));
+    }
+
+    #[test]
+    fn test_reject_duplicate_discriminant() {
+        let input: DeriveInput = parse_str(
+            "enum MyEvent { #[pardosa(tombstone)] Tombstone = 0, First = 1, Second = 1 }",
+        )
+        .unwrap();
+        let err = expand_pardosa_schema(&input).unwrap_err();
+        assert!(err.to_string().contains("duplicate discriminant"));
     }
 }

@@ -116,6 +116,31 @@ fn test_user_event_truncated_rejection() {
     assert_eq!(err.error_kind(), "TruncatedPayload");
 }
 
+#[test]
+fn test_derived_payload_trailing_bytes_rejection() {
+    let tombstone_trailing = [0x00, 0xFF];
+    let err = UserEvent::decode_payload(&tombstone_trailing).unwrap_err();
+    assert_eq!(err.error_kind(), "TruncatedPayload");
+
+    let created_trailing = [0x01, 0x2a, 0x00, 0x00, 0x00, 0xAA];
+    let err = UserEvent::decode_payload(&created_trailing).unwrap_err();
+    assert_eq!(err.error_kind(), "TruncatedPayload");
+
+    let mut updated_trailing = Vec::new();
+    let updated = UserEvent::UserUpdated {
+        id: 99,
+        name: EventString::new("Alice").unwrap(),
+    };
+    updated.encode_payload(&mut updated_trailing).unwrap();
+    updated_trailing.push(0xBB);
+    let err = UserEvent::decode_payload(&updated_trailing).unwrap_err();
+    assert_eq!(err.error_kind(), "TruncatedPayload");
+
+    let detached_trailing = [0x03, 0xCC];
+    let err = UserEvent::decode_payload(&detached_trailing).unwrap_err();
+    assert_eq!(err.error_kind(), "TruncatedPayload");
+}
+
 mod f64_ordered_module {
     use pardosa::prelude::*;
 
@@ -202,13 +227,13 @@ fn test_f64_derived_payload_schema_identity_and_admission_mismatch() {
     assert_eq!(schema_desc_b.identity(), id_b);
 
     let mut enc_a = Vec::new();
-    schema_desc_a.encode(&mut enc_a);
+    schema_desc_a.encode(&mut enc_a).unwrap();
     let (dec_desc_a, len_a) = SchemaDescriptor::decode(&enc_a).unwrap();
     assert_eq!(len_a, enc_a.len());
     assert_eq!(dec_desc_a, schema_desc_a);
 
     let mut enc_b = Vec::new();
-    schema_desc_b.encode(&mut enc_b);
+    schema_desc_b.encode(&mut enc_b).unwrap();
     let (dec_desc_b, len_b) = SchemaDescriptor::decode(&enc_b).unwrap();
     assert_eq!(len_b, enc_b.len());
     assert_eq!(dec_desc_b, schema_desc_b);
@@ -282,13 +307,13 @@ fn test_f32_derived_payload_schema_identity_and_admission_mismatch() {
     assert_eq!(schema_desc_b.identity(), id_b);
 
     let mut enc_a = Vec::new();
-    schema_desc_a.encode(&mut enc_a);
+    schema_desc_a.encode(&mut enc_a).unwrap();
     let (dec_desc_a, len_a) = SchemaDescriptor::decode(&enc_a).unwrap();
     assert_eq!(len_a, enc_a.len());
     assert_eq!(dec_desc_a, schema_desc_a);
 
     let mut enc_b = Vec::new();
-    schema_desc_b.encode(&mut enc_b);
+    schema_desc_b.encode(&mut enc_b).unwrap();
     let (dec_desc_b, len_b) = SchemaDescriptor::decode(&enc_b).unwrap();
     assert_eq!(len_b, enc_b.len());
     assert_eq!(dec_desc_b, schema_desc_b);

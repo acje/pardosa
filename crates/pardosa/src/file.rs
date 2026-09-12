@@ -3,7 +3,7 @@
 use crate::encoding::{
     DecodeError, EventEnvelope, EventEnvelopeRef, InboundPointerRecord, MigrationEndRecord,
     MigrationStartRecord, OutboundPointerRecord, OwnershipClaimRecord, OwnershipRecord,
-    RescuePolicyChoiceRecord,
+    RescuePolicyChoiceRecord, ValueConstraint,
 };
 use crate::schema::{DescriptorNode, SchemaDescriptor};
 use crate::store::{
@@ -131,7 +131,17 @@ impl ContainerFrame {
             });
         }
         let payload_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-        let total_frame_len = 4 + payload_len + 4;
+        let total_frame_len = match 4usize
+            .checked_add(payload_len)
+            .and_then(|l| l.checked_add(4))
+        {
+            Some(l) => l,
+            None => {
+                return Err(DecodeError::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                });
+            }
+        };
         if buf.len() < 4 + payload_len {
             return Err(DecodeError::TruncatedPayload {
                 expected: total_frame_len,
@@ -1405,7 +1415,17 @@ impl StorageEngine for FileEngine {
         descriptor: &SchemaDescriptor,
     ) -> Result<(), OperationFailure> {
         let mut descriptor_bytes = Vec::new();
-        descriptor.root.encode(&mut descriptor_bytes);
+        descriptor
+            .root
+            .encode(&mut descriptor_bytes)
+            .map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::ValueConstraintViolated {
+                        constraint: ValueConstraint::TooLong,
+                    },
+                    format!("failed to encode schema descriptor: {err}"),
+                )
+            })?;
         let record = OwnershipRecord::SchemaDescriptor {
             schema_version: descriptor.version,
             descriptor_bytes,

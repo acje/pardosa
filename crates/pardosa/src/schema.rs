@@ -140,7 +140,21 @@ impl DescriptorNode {
     }
 
     /// Serializes this descriptor node into binary AST format per C6.23.
-    pub fn encode(&self, buf: &mut Vec<u8>) {
+    ///
+    /// # Errors
+    /// Returns `EncodeError::DepthExceeded` if recursion depth exceeds `MAX_DESCRIPTOR_DEPTH`.
+    /// Returns `EncodeError::Custom` if a discriminant exceeds its width.
+    pub fn encode(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
+        self.encode_recursive(buf, 0)
+    }
+
+    fn encode_recursive(&self, buf: &mut Vec<u8>, depth: usize) -> Result<(), EncodeError> {
+        if depth > MAX_DESCRIPTOR_DEPTH {
+            return Err(EncodeError::DepthExceeded {
+                depth,
+                max: MAX_DESCRIPTOR_DEPTH,
+            });
+        }
         buf.push(self.constructor_tag());
         match self {
             Self::U8
@@ -155,19 +169,19 @@ impl DescriptorNode {
             | Self::Timestamp
             | Self::Uuid
             | Self::OrderedF32
-            | Self::OrderedF64 => {}
+            | Self::OrderedF64 => Ok(()),
             Self::EventString { max_bytes }
             | Self::NonEmptyEventString { max_bytes }
             | Self::EventBytes { max_bytes } => {
                 buf.extend_from_slice(&max_bytes.to_le_bytes());
+                Ok(())
             }
             Self::EventVec { inner, max_items } => {
-                inner.encode(buf);
+                inner.encode_recursive(buf, depth + 1)?;
                 buf.extend_from_slice(&max_items.to_le_bytes());
+                Ok(())
             }
-            Self::Option { inner } => {
-                inner.encode(buf);
-            }
+            Self::Option { inner } => inner.encode_recursive(buf, depth + 1),
             Self::Struct { name, fields } => {
                 let name_bytes = name.as_bytes();
                 buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
@@ -177,8 +191,9 @@ impl DescriptorNode {
                     let fname_bytes = f.name.as_bytes();
                     buf.extend_from_slice(&(fname_bytes.len() as u32).to_le_bytes());
                     buf.extend_from_slice(fname_bytes);
-                    f.node.encode(buf);
+                    f.node.encode_recursive(buf, depth + 1)?;
                 }
+                Ok(())
             }
             Self::Enum {
                 name,
@@ -192,18 +207,29 @@ impl DescriptorNode {
                 buf.extend_from_slice(&(variants.len() as u32).to_le_bytes());
                 for v in variants {
                     if *discriminant_width == 1 {
+                        if v.discriminant > 255 {
+                            return Err(EncodeError::Custom(
+                                "discriminant exceeds 1-byte width".to_string(),
+                            ));
+                        }
                         buf.push(v.discriminant as u8);
                     } else {
+                        if v.discriminant > 65535 {
+                            return Err(EncodeError::Custom(
+                                "discriminant exceeds 2-byte width".to_string(),
+                            ));
+                        }
                         buf.extend_from_slice(&(v.discriminant as u16).to_le_bytes());
                     }
                     let vname_bytes = v.name.as_bytes();
                     buf.extend_from_slice(&(vname_bytes.len() as u32).to_le_bytes());
                     buf.extend_from_slice(vname_bytes);
                     match &v.payload {
-                        Some(payload) => payload.encode(buf),
+                        Some(payload) => payload.encode_recursive(buf, depth + 1)?,
                         None => buf.push(0x00),
                     }
                 }
+                Ok(())
             }
         }
     }
@@ -341,6 +367,15 @@ impl DescriptorNode {
                     buf[cursor + 3],
                 ]) as usize;
                 cursor += 4;
+                let remaining = buf.len().saturating_sub(cursor);
+                let min_bytes_per_field = 5;
+                if remaining / min_bytes_per_field < field_count {
+                    return Err(DecodeError::TruncatedPayload {
+                        expected: cursor
+                            .saturating_add(field_count.saturating_mul(min_bytes_per_field)),
+                        available: buf.len(),
+                    });
+                }
                 let mut fields = Vec::with_capacity(field_count);
                 for _ in 0..field_count {
                     if buf.len() < cursor + 4 {
@@ -426,6 +461,15 @@ impl DescriptorNode {
                     buf[cursor + 3],
                 ]) as usize;
                 cursor += 4;
+                let remaining = buf.len().saturating_sub(cursor);
+                let min_bytes_per_variant = (discriminant_width as usize).saturating_add(5);
+                if remaining / min_bytes_per_variant < variant_count {
+                    return Err(DecodeError::TruncatedPayload {
+                        expected: cursor
+                            .saturating_add(variant_count.saturating_mul(min_bytes_per_variant)),
+                        available: buf.len(),
+                    });
+                }
                 let mut variants = Vec::with_capacity(variant_count);
                 for _ in 0..variant_count {
                     let disc_width_bytes = discriminant_width as usize;
@@ -522,9 +566,12 @@ impl SchemaDescriptor {
     }
 
     /// Encodes this schema descriptor into wire format (version + AST).
-    pub fn encode(&self, buf: &mut Vec<u8>) {
+    ///
+    /// # Errors
+    /// Returns `EncodeError` on AST encoding failure.
+    pub fn encode(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
         buf.extend_from_slice(&self.version.to_le_bytes());
-        self.root.encode(buf);
+        self.root.encode(buf)
     }
 
     /// Decodes a schema descriptor from wire bytes.
@@ -556,7 +603,7 @@ impl SchemaDescriptor {
     /// Returns [`OperationFailure`] with [`FailureCondition::MissingSchemaDescriptor`]
     /// if version is zero.
     /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`]
-    /// if any variant, field, or bound is invalid.
+    /// if any variant, field, or bound is invalid, or if recursion depth exceeds 64.
     pub fn validate_structural_completeness(&self) -> Result<(), OperationFailure> {
         if self.version == 0 {
             return Err(OperationFailure::new(
@@ -566,15 +613,46 @@ impl SchemaDescriptor {
         }
         self.root.validate_structural_completeness()
     }
+
+    /// Asserts that this schema descriptor is structurally valid and within depth limits.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if validation fails.
+    pub fn validate_structure(&self) -> Result<(), OperationFailure> {
+        self.validate_structural_completeness()
+    }
 }
 
 impl DescriptorNode {
+    /// Asserts that this descriptor AST node is structurally valid and within depth limits.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if validation fails.
+    pub fn validate_structure(&self) -> Result<(), OperationFailure> {
+        self.validate_structural_completeness()
+    }
+
     /// Asserts that this descriptor AST node is structurally complete per C8.2.
     ///
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`]
-    /// if any variant, field, or bound is invalid.
+    /// if any variant, field, or bound is invalid, or if recursion depth exceeds 64.
     pub fn validate_structural_completeness(&self) -> Result<(), OperationFailure> {
+        self.validate_structural_completeness_recursive(0)
+    }
+
+    fn validate_structural_completeness_recursive(
+        &self,
+        depth: usize,
+    ) -> Result<(), OperationFailure> {
+        if depth > MAX_DESCRIPTOR_DEPTH {
+            return Err(OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                },
+                "descriptor nesting depth exceeds maximum depth of 64 per C8.2",
+            ));
+        }
         match self {
             Self::U8
             | Self::U16
@@ -612,10 +690,10 @@ impl DescriptorNode {
                         "collection must carry non-zero max_items per C8.2",
                     ))
                 } else {
-                    inner.validate_structural_completeness()
+                    inner.validate_structural_completeness_recursive(depth + 1)
                 }
             }
-            Self::Option { inner } => inner.validate_structural_completeness(),
+            Self::Option { inner } => inner.validate_structural_completeness_recursive(depth + 1),
             Self::Struct { fields, .. } => {
                 for f in fields {
                     if f.name.is_empty() {
@@ -626,7 +704,8 @@ impl DescriptorNode {
                             "struct field name must be non-empty per C8.2",
                         ));
                     }
-                    f.node.validate_structural_completeness()?;
+                    f.node
+                        .validate_structural_completeness_recursive(depth + 1)?;
                 }
                 Ok(())
             }
@@ -651,6 +730,7 @@ impl DescriptorNode {
                         "enumeration discriminant width must be 1 or 2 bytes per C8.2",
                     ));
                 }
+                let mut seen_discriminants = std::collections::HashSet::new();
                 for v in variants {
                     if v.name.is_empty() {
                         return Err(OperationFailure::new(
@@ -660,8 +740,32 @@ impl DescriptorNode {
                             "enum variant name must be non-empty per C8.2",
                         ));
                     }
+                    if *discriminant_width == 1 && v.discriminant > 255 {
+                        return Err(OperationFailure::new(
+                            FailureCondition::ValueConstraintViolated {
+                                constraint: ValueConstraint::TooLong,
+                            },
+                            "variant discriminant exceeds 1-byte discriminant width per M4",
+                        ));
+                    }
+                    if *discriminant_width == 2 && v.discriminant > 65535 {
+                        return Err(OperationFailure::new(
+                            FailureCondition::ValueConstraintViolated {
+                                constraint: ValueConstraint::TooLong,
+                            },
+                            "variant discriminant exceeds 2-byte discriminant width per M4",
+                        ));
+                    }
+                    if !seen_discriminants.insert(v.discriminant) {
+                        return Err(OperationFailure::new(
+                            FailureCondition::ValueConstraintViolated {
+                                constraint: ValueConstraint::NotReal,
+                            },
+                            "enumeration contains duplicate variant discriminant per M4",
+                        ));
+                    }
                     if let Some(payload) = &v.payload {
-                        payload.validate_structural_completeness()?;
+                        payload.validate_structural_completeness_recursive(depth + 1)?;
                     }
                 }
                 Ok(())
@@ -686,7 +790,7 @@ impl SchemaIdentity {
     pub fn from_descriptor(version: u32, root: &DescriptorNode) -> Self {
         let mut buf = Vec::new();
         buf.extend_from_slice(&version.to_le_bytes());
-        root.encode(&mut buf);
+        let _ = root.encode(&mut buf);
         let hash = blake3::hash(&buf);
         Self(*hash.as_bytes())
     }
@@ -1012,6 +1116,10 @@ impl<T: PardosaType> PardosaType for Option<T> {
 
 impl<const MAX: usize> PardosaType for EventString<MAX> {
     fn descriptor_node() -> DescriptorNode {
+        assert!(
+            MAX <= u32::MAX as usize,
+            "const MAX exceeds u32::MAX wire limit"
+        );
         DescriptorNode::EventString {
             max_bytes: MAX as u32,
         }
@@ -1027,6 +1135,10 @@ impl<const MAX: usize> PardosaType for EventString<MAX> {
 
 impl<const MAX: usize> PardosaType for NonEmptyEventString<MAX> {
     fn descriptor_node() -> DescriptorNode {
+        assert!(
+            MAX <= u32::MAX as usize,
+            "const MAX exceeds u32::MAX wire limit"
+        );
         DescriptorNode::NonEmptyEventString {
             max_bytes: MAX as u32,
         }
@@ -1042,6 +1154,10 @@ impl<const MAX: usize> PardosaType for NonEmptyEventString<MAX> {
 
 impl<const MAX: usize> PardosaType for EventBytes<MAX> {
     fn descriptor_node() -> DescriptorNode {
+        assert!(
+            MAX <= u32::MAX as usize,
+            "const MAX exceeds u32::MAX wire limit"
+        );
         DescriptorNode::EventBytes {
             max_bytes: MAX as u32,
         }
@@ -1057,6 +1173,10 @@ impl<const MAX: usize> PardosaType for EventBytes<MAX> {
 
 impl<T: PardosaType, const MAX: usize> PardosaType for EventVec<T, MAX> {
     fn descriptor_node() -> DescriptorNode {
+        assert!(
+            MAX <= u32::MAX as usize,
+            "const MAX exceeds u32::MAX wire limit"
+        );
         DescriptorNode::EventVec {
             inner: Box::new(T::descriptor_node()),
             max_items: MAX as u32,
@@ -1074,6 +1194,11 @@ impl<T: PardosaType, const MAX: usize> PardosaType for EventVec<T, MAX> {
         Ok(())
     }
     fn decode_type(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        if MAX > u32::MAX as usize {
+            return Err(DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            });
+        }
         if buf.len() < 4 {
             return Err(DecodeError::TruncatedPayload {
                 expected: 4,
@@ -1129,7 +1254,7 @@ mod tests {
 
         for node in primitives {
             let mut buf = Vec::new();
-            node.encode(&mut buf);
+            node.encode(&mut buf).unwrap();
             let (decoded, consumed) = DescriptorNode::decode(&buf).expect("decode primitive");
             assert_eq!(consumed, buf.len());
             assert_eq!(decoded, node);
@@ -1159,7 +1284,7 @@ mod tests {
         };
 
         let mut buf = Vec::new();
-        node.encode(&mut buf);
+        node.encode(&mut buf).unwrap();
         let (decoded, consumed) = DescriptorNode::decode(&buf).expect("decode struct");
         assert_eq!(consumed, buf.len());
         assert_eq!(decoded, node);
@@ -1185,7 +1310,7 @@ mod tests {
         };
 
         let mut buf = Vec::new();
-        node.encode(&mut buf);
+        node.encode(&mut buf).unwrap();
         let (decoded, consumed) = DescriptorNode::decode(&buf).expect("decode enum");
         assert_eq!(consumed, buf.len());
         assert_eq!(decoded, node);
@@ -1219,14 +1344,14 @@ mod tests {
     #[test]
     fn test_ordered_float_descriptor_roundtrip() {
         let mut buf = Vec::new();
-        DescriptorNode::OrderedF32.encode(&mut buf);
+        DescriptorNode::OrderedF32.encode(&mut buf).unwrap();
         assert_eq!(buf, vec![0x13]);
         let (node32, consumed32) = DescriptorNode::decode(&buf).unwrap();
         assert_eq!(consumed32, 1);
         assert_eq!(node32, DescriptorNode::OrderedF32);
 
         let mut buf64 = Vec::new();
-        DescriptorNode::OrderedF64.encode(&mut buf64);
+        DescriptorNode::OrderedF64.encode(&mut buf64).unwrap();
         assert_eq!(buf64, vec![0x14]);
         let (node64, consumed64) = DescriptorNode::decode(&buf64).unwrap();
         assert_eq!(consumed64, 1);
@@ -1244,7 +1369,7 @@ mod tests {
         assert_eq!(desc1.identity(), desc1.identity());
 
         let mut buf = Vec::new();
-        desc1.encode(&mut buf);
+        desc1.encode(&mut buf).unwrap();
         let (decoded, consumed) = SchemaDescriptor::decode(&buf).unwrap();
         assert_eq!(consumed, buf.len());
         assert_eq!(decoded, desc1);
@@ -1258,6 +1383,93 @@ mod tests {
 
         let err = DescriptorNode::decode(&buf).unwrap_err();
         assert_eq!(err.error_kind(), "CycleDetected");
+    }
+
+    #[test]
+    fn test_encode_and_validate_structure_reject_depth_exceeding_64() {
+        let mut deep_node = DescriptorNode::U32;
+        for _ in 0..65 {
+            deep_node = DescriptorNode::Option {
+                inner: Box::new(deep_node),
+            };
+        }
+        let mut buf = Vec::new();
+        let err_encode = deep_node.encode(&mut buf).unwrap_err();
+        match err_encode {
+            EncodeError::DepthExceeded { depth, max } => {
+                assert_eq!(depth, 65);
+                assert_eq!(max, 64);
+            }
+            other => panic!("expected DepthExceeded, got {other:?}"),
+        }
+
+        let err_validate = deep_node.validate_structure().unwrap_err();
+        assert_eq!(
+            *err_validate.condition(),
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            }
+        );
+
+        let desc = SchemaDescriptor::new(1, deep_node);
+        let err_desc_validate = desc.validate_structure().unwrap_err();
+        assert_eq!(
+            *err_desc_validate.condition(),
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            }
+        );
+
+        let mut desc_buf = Vec::new();
+        assert!(desc.encode(&mut desc_buf).is_err());
+    }
+
+    #[test]
+    fn test_validate_structure_discriminant_bounds_and_duplicates() {
+        let width1_overflow = DescriptorNode::Enum {
+            name: "Overflow".to_string(),
+            discriminant_width: 1,
+            variants: vec![VariantDescriptor {
+                discriminant: 256,
+                name: "Bad".to_string(),
+                payload: None,
+            }],
+        };
+        assert!(width1_overflow.validate_structure().is_err());
+
+        let duplicate = DescriptorNode::Enum {
+            name: "Duplicate".to_string(),
+            discriminant_width: 1,
+            variants: vec![
+                VariantDescriptor {
+                    discriminant: 1,
+                    name: "A".to_string(),
+                    payload: None,
+                },
+                VariantDescriptor {
+                    discriminant: 1,
+                    name: "B".to_string(),
+                    payload: None,
+                },
+            ],
+        };
+        assert!(duplicate.validate_structure().is_err());
+    }
+
+    #[test]
+    fn test_allocation_bomb_rejection() {
+        let mut struct_bomb = vec![0x0F];
+        struct_bomb.extend_from_slice(&0u32.to_le_bytes());
+        struct_bomb.extend_from_slice(&u32::MAX.to_le_bytes());
+        let err_struct = DescriptorNode::decode(&struct_bomb).unwrap_err();
+        assert_eq!(err_struct.error_kind(), "TruncatedPayload");
+
+        let mut enum_bomb = vec![0x10];
+        enum_bomb.extend_from_slice(&0u32.to_le_bytes());
+        enum_bomb.push(1);
+        enum_bomb.extend_from_slice(&u32::MAX.to_le_bytes());
+        let err_enum = DescriptorNode::decode(&enum_bomb).unwrap_err();
+        assert_eq!(err_enum.error_kind(), "TruncatedPayload");
     }
 
     #[test]

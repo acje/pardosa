@@ -203,6 +203,13 @@ pub enum EncodeError {
         /// Maximum allowed bound.
         max: usize,
     },
+    /// Nesting depth exceeds maximum allowed bound.
+    DepthExceeded {
+        /// Actual depth.
+        depth: usize,
+        /// Maximum allowed depth.
+        max: usize,
+    },
     /// Custom error message.
     Custom(String),
 }
@@ -225,6 +232,11 @@ impl<const MAX: usize> EventString<MAX> {
     /// # Errors
     /// Returns `DecodeError::LengthExceeded` if length exceeds `MAX`.
     pub fn new(s: impl Into<String>) -> Result<Self, DecodeError> {
+        if MAX > u32::MAX as usize {
+            return Err(DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            });
+        }
         let s = s.into();
         if s.len() > MAX {
             return Err(DecodeError::LengthExceeded {
@@ -255,6 +267,11 @@ impl<const MAX: usize> EventString<MAX> {
     /// Returns `DecodeError::LengthExceeded` if declared length exceeds `MAX`.
     /// Returns `DecodeError::InvalidUtf8` if payload is not valid UTF-8.
     pub fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        if MAX > u32::MAX as usize {
+            return Err(DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            });
+        }
         if buf.len() < 4 {
             return Err(DecodeError::TruncatedPayload {
                 expected: 4,
@@ -303,6 +320,11 @@ impl<const MAX: usize> NonEmptyEventString<MAX> {
     /// Returns `DecodeError::EmptyNonEmptyString` if length is 0.
     /// Returns `DecodeError::LengthExceeded` if length exceeds `MAX`.
     pub fn new(s: impl Into<String>) -> Result<Self, DecodeError> {
+        if MAX > u32::MAX as usize {
+            return Err(DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            });
+        }
         let s = s.into();
         if s.is_empty() {
             return Err(DecodeError::EmptyNonEmptyString);
@@ -337,6 +359,11 @@ impl<const MAX: usize> NonEmptyEventString<MAX> {
     /// Returns `DecodeError::LengthExceeded` if length exceeds `MAX`.
     /// Returns `DecodeError::InvalidUtf8` if payload is not valid UTF-8.
     pub fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        if MAX > u32::MAX as usize {
+            return Err(DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            });
+        }
         if buf.len() < 4 {
             return Err(DecodeError::TruncatedPayload {
                 expected: 4,
@@ -387,6 +414,11 @@ impl<const MAX: usize> EventBytes<MAX> {
     /// # Errors
     /// Returns `DecodeError::LengthExceeded` if length exceeds `MAX`.
     pub fn new(b: impl Into<Vec<u8>>) -> Result<Self, DecodeError> {
+        if MAX > u32::MAX as usize {
+            return Err(DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            });
+        }
         let b = b.into();
         if b.len() > MAX {
             return Err(DecodeError::LengthExceeded {
@@ -416,6 +448,11 @@ impl<const MAX: usize> EventBytes<MAX> {
     /// Returns `DecodeError::TruncatedPayload` if bytes are truncated.
     /// Returns `DecodeError::LengthExceeded` if length exceeds `MAX`.
     pub fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        if MAX > u32::MAX as usize {
+            return Err(DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            });
+        }
         if buf.len() < 4 {
             return Err(DecodeError::TruncatedPayload {
                 expected: 4,
@@ -456,6 +493,11 @@ impl<T, const MAX: usize> EventVec<T, MAX> {
     /// # Errors
     /// Returns `DecodeError::ItemCountExceeded` if count exceeds `MAX`.
     pub fn new(items: Vec<T>) -> Result<Self, DecodeError> {
+        if MAX > u32::MAX as usize {
+            return Err(DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            });
+        }
         if items.len() > MAX {
             return Err(DecodeError::ItemCountExceeded {
                 count: items.len(),
@@ -730,9 +772,8 @@ impl<'a> EventEnvelopeRef<'a> {
         {
             Some(c) => c,
             None => {
-                return Err(DecodeError::TruncatedPayload {
-                    expected: usize::MAX,
-                    available: buf.len(),
+                return Err(DecodeError::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
                 });
             }
         };
@@ -806,6 +847,16 @@ impl EventEnvelope {
                 constraint: ValueConstraint::Empty,
             });
         }
+        let payload = payload.into();
+        if payload
+            .len()
+            .checked_add(85)
+            .is_none_or(|len| len > u32::MAX as usize)
+        {
+            return Err(DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            });
+        }
         Ok(Self {
             header: EnvelopeHeader {
                 event_id,
@@ -814,7 +865,7 @@ impl EventEnvelope {
                 precursor: [0u8; 16],
                 precursor_hash: [0u8; 32],
             },
-            payload: payload.into(),
+            payload,
         })
     }
 
@@ -833,6 +884,16 @@ impl EventEnvelope {
                 constraint: ValueConstraint::Empty,
             });
         }
+        let payload = payload.into();
+        if payload
+            .len()
+            .checked_add(85)
+            .is_none_or(|len| len > u32::MAX as usize)
+        {
+            return Err(DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            });
+        }
         Ok(Self {
             header: EnvelopeHeader {
                 event_id,
@@ -841,7 +902,7 @@ impl EventEnvelope {
                 precursor: predecessor.header.event_id,
                 precursor_hash: predecessor.commitment(),
             },
-            payload: payload.into(),
+            payload,
         })
     }
 
@@ -860,6 +921,16 @@ impl EventEnvelope {
                 constraint: ValueConstraint::Empty,
             });
         }
+        let payload = payload.into();
+        if payload
+            .len()
+            .checked_add(85)
+            .is_none_or(|len| len > u32::MAX as usize)
+        {
+            return Err(DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            });
+        }
         Ok(Self {
             header: EnvelopeHeader {
                 event_id,
@@ -868,7 +939,7 @@ impl EventEnvelope {
                 precursor: predecessor.header.event_id,
                 precursor_hash: predecessor.commitment(),
             },
-            payload: payload.into(),
+            payload,
         })
     }
 }
@@ -939,7 +1010,14 @@ impl PartitioningRule {
         }
         let tag = buf[0];
         let param_len = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
-        let total_consumed = 5 + param_len;
+        let total_consumed = match 5usize.checked_add(param_len) {
+            Some(t) => t,
+            None => {
+                return Err(DecodeError::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                });
+            }
+        };
         if buf.len() < total_consumed {
             return Err(DecodeError::TruncatedPayload {
                 expected: total_consumed,
@@ -1305,7 +1383,17 @@ impl OwnershipRecord {
                     buf[57], buf[58], buf[59], buf[60], buf[61], buf[62], buf[63], buf[64],
                 ]);
                 let label_len = u32::from_le_bytes([buf[65], buf[66], buf[67], buf[68]]) as usize;
-                let total_len = fixed_prefix + 4 + label_len;
+                let total_len = match fixed_prefix
+                    .checked_add(4)
+                    .and_then(|l| l.checked_add(label_len))
+                {
+                    Some(l) => l,
+                    None => {
+                        return Err(DecodeError::ValueConstraintViolated {
+                            constraint: ValueConstraint::TooLong,
+                        });
+                    }
+                };
                 if buf.len() < total_len {
                     return Err(DecodeError::TruncatedPayload {
                         expected: total_len,
@@ -1449,7 +1537,14 @@ impl OwnershipRecord {
                 }
                 let policy_tag = buf[1];
                 let param_len = u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]) as usize;
-                let total_len = 6 + param_len;
+                let total_len = match 6usize.checked_add(param_len) {
+                    Some(l) => l,
+                    None => {
+                        return Err(DecodeError::ValueConstraintViolated {
+                            constraint: ValueConstraint::TooLong,
+                        });
+                    }
+                };
                 if buf.len() < total_len {
                     return Err(DecodeError::TruncatedPayload {
                         expected: total_len,
@@ -1479,7 +1574,14 @@ impl OwnershipRecord {
                 let dragline_id = u32::from_le_bytes([buf[21], buf[22], buf[23], buf[24]]);
                 let (partitioning_rule, rule_consumed) =
                     PartitioningRule::decode(&buf[prefix_len..])?;
-                let total_len = prefix_len + rule_consumed;
+                let total_len = match prefix_len.checked_add(rule_consumed) {
+                    Some(l) => l,
+                    None => {
+                        return Err(DecodeError::ValueConstraintViolated {
+                            constraint: ValueConstraint::TooLong,
+                        });
+                    }
+                };
                 Ok((
                     Self::IdentityStructure(IdentityStructureRecord {
                         dataset_id,
@@ -1784,5 +1886,83 @@ mod tests {
         let detached_link =
             crate::store::PrecursorLink::classify(&detached).expect("valid detached must classify");
         assert!(!detached_link.is_genesis());
+    }
+
+    #[test]
+    fn test_const_max_exceeding_u32_max_rejected() {
+        const TOO_BIG: usize = (u32::MAX as usize) + 1;
+        let err_str = EventString::<TOO_BIG>::new("hello").unwrap_err();
+        assert_eq!(
+            err_str,
+            DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            }
+        );
+
+        let err_non_empty = NonEmptyEventString::<TOO_BIG>::new("hello").unwrap_err();
+        assert_eq!(
+            err_non_empty,
+            DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            }
+        );
+
+        let err_bytes = EventBytes::<TOO_BIG>::new(vec![1, 2, 3]).unwrap_err();
+        assert_eq!(
+            err_bytes,
+            DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            }
+        );
+
+        let err_vec = EventVec::<u8, TOO_BIG>::new(vec![1, 2, 3]).unwrap_err();
+        assert_eq!(
+            err_vec,
+            DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            }
+        );
+
+        let dummy_wire = [0x00, 0x00, 0x00, 0x00];
+        let err_decode_str = EventString::<TOO_BIG>::decode(&dummy_wire).unwrap_err();
+        assert_eq!(
+            err_decode_str,
+            DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            }
+        );
+    }
+
+    #[test]
+    fn test_checked_length_arithmetic_rejects_too_long() {
+        let mut malformed_claim = vec![0x01];
+        malformed_claim.extend_from_slice(&0u64.to_le_bytes());
+        malformed_claim.extend_from_slice(&[0u8; 16]);
+        malformed_claim.extend_from_slice(&[0u8; 16]);
+        malformed_claim.extend_from_slice(&0u64.to_le_bytes());
+        malformed_claim.extend_from_slice(&0u64.to_le_bytes());
+        malformed_claim.extend_from_slice(&0u64.to_le_bytes());
+        malformed_claim.extend_from_slice(&u32::MAX.to_le_bytes());
+        let err = OwnershipRecord::decode(&malformed_claim).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DecodeError::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong
+                }
+            ) || matches!(err, DecodeError::TruncatedPayload { .. })
+        );
+
+        let mut malformed_policy = vec![0x07, 0x01];
+        malformed_policy.extend_from_slice(&u32::MAX.to_le_bytes());
+        let err_policy = OwnershipRecord::decode(&malformed_policy).unwrap_err();
+        assert!(
+            matches!(
+                err_policy,
+                DecodeError::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong
+                }
+            ) || matches!(err_policy, DecodeError::TruncatedPayload { .. })
+        );
     }
 }

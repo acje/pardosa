@@ -1799,7 +1799,17 @@ impl StorageEngine for NatsEngine {
         descriptor: &SchemaDescriptor,
     ) -> Result<(), OperationFailure> {
         let mut descriptor_bytes = Vec::new();
-        descriptor.root.encode(&mut descriptor_bytes);
+        descriptor
+            .root
+            .encode(&mut descriptor_bytes)
+            .map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::ValueConstraintViolated {
+                        constraint: ValueConstraint::TooLong,
+                    },
+                    format!("failed to encode schema descriptor: {err}"),
+                )
+            })?;
         let record = OwnershipRecord::SchemaDescriptor {
             schema_version: descriptor.version,
             descriptor_bytes,
