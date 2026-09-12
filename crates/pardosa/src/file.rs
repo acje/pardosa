@@ -257,13 +257,29 @@ fn read_container_frames(
             format!("failed to seek container file: {err}"),
         )
     })?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf).map_err(|err| {
-        OperationFailure::new(
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if file_len < 12 {
+        return Err(OperationFailure::new(
             FailureCondition::PrecursorChainBroken(None),
-            format!("failed to read container file: {err}"),
-        )
-    })?;
+            "container file too short for header",
+        ));
+    }
+    let mut buf = Vec::with_capacity(file_len as usize);
+    (&mut *file)
+        .take(file_len)
+        .read_to_end(&mut buf)
+        .map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::PrecursorChainBroken(None),
+                format!("failed to read container file: {err}"),
+            )
+        })?;
+    if (buf.len() as u64) != file_len {
+        return Err(OperationFailure::new(
+            FailureCondition::PrecursorChainBroken(None),
+            "container file truncated during initial horizon read",
+        ));
+    }
     let (header, mut cursor) = ContainerHeader::decode(&buf).map_err(|err| {
         OperationFailure::new(
             FailureCondition::PrecursorChainBroken(None),

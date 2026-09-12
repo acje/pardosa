@@ -153,19 +153,20 @@ fn map_nats_info_error(stream_name: &str, err: impl std::fmt::Display) -> Operat
 
 fn map_nats_raw_message_error(seq: u64, err: impl std::fmt::Display) -> OperationFailure {
     let msg = err.to_string();
-    if msg.contains("timed out")
-        || msg.contains("timeout")
-        || msg.contains("connection")
-        || msg.contains("unavailable")
+    if msg.contains("10037")
+        || msg.contains("10070")
+        || msg.contains("message not found")
+        || msg.contains("sequence not found")
+        || msg.contains("no message found")
     {
         OperationFailure::new(
-            FailureCondition::TransportUnavailable,
-            format!("transport unavailable reading raw message at seq {seq}: {msg}"),
+            FailureCondition::PrecursorChainBroken(None),
+            format!("missing message in data stream at seq {seq}: {msg}"),
         )
     } else {
         OperationFailure::new(
-            FailureCondition::PrecursorChainBroken(None),
-            format!("failed to read raw message from data stream at seq {seq}: {msg}"),
+            FailureCondition::TransportUnavailable,
+            format!("transport unavailable reading raw message at seq {seq}: {msg}"),
         )
     }
 }
@@ -348,6 +349,55 @@ async fn read_chunk_async(
         frames.push(payload);
     }
 
+    Ok(frames)
+}
+
+async fn read_range_async(
+    js: &async_nats::jetstream::Context,
+    data_stream_name: &str,
+    from_seq: u64,
+    to_seq: u64,
+) -> Result<Vec<Vec<u8>>, OperationFailure> {
+    if from_seq > to_seq {
+        return Ok(Vec::new());
+    }
+    let stream = js
+        .get_stream(data_stream_name)
+        .await
+        .map_err(|err| map_nats_stream_open_error(data_stream_name, err))?;
+
+    use futures_util::StreamExt;
+    let stream_ref = &stream;
+    let mut msg_stream = futures_util::stream::iter(from_seq..=to_seq)
+        .map(|seq| async move {
+            let raw = stream_ref
+                .get_raw_message(seq)
+                .await
+                .map_err(|err| map_nats_raw_message_error(seq, err))?;
+            let (payload, consumed) = ContainerFrame::decode(&raw.payload).map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    format!("corrupted container frame in data stream at seq {seq}: {err}"),
+                )
+            })?;
+            if consumed != raw.payload.len() {
+                return Err(OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    format!("corrupted container frame in data stream at seq {seq}: trailing unconsumed bytes"),
+                ));
+            }
+            Ok(payload)
+        })
+        .buffered(REPLAY_CONCURRENCY);
+
+    let count = match usize::try_from(to_seq.saturating_sub(from_seq).saturating_add(1)) {
+        Ok(c) => c,
+        Err(_) => usize::MAX,
+    };
+    let mut frames = Vec::with_capacity(count.min(1024));
+    while let Some(res) = msg_stream.next().await {
+        frames.push(res?);
+    }
     Ok(frames)
 }
 
@@ -1048,19 +1098,15 @@ impl NatsStorageAdapter {
         let js_data = self.js.clone();
         let data_name = self.data_stream_name.clone();
         let last_data_seq = run_future(&handle, async move {
-            let mut stream = js_data.get_stream(&data_name).await.map_err(|err| {
-                OperationFailure::new(
-                    FailureCondition::NoArtefactExists,
-                    format!("failed to open data stream {data_name}: {err}"),
-                )
-            })?;
+            let mut stream = js_data
+                .get_stream(&data_name)
+                .await
+                .map_err(|err| map_nats_stream_open_error(&data_name, err))?;
             let (messages, first_seq, last_seq) = {
-                let info = stream.info().await.map_err(|err| {
-                    OperationFailure::new(
-                        FailureCondition::PrecursorChainBroken(None),
-                        format!("failed to get info for data stream {data_name}: {err}"),
-                    )
-                })?;
+                let info = stream
+                    .info()
+                    .await
+                    .map_err(|err| map_nats_info_error(&data_name, err))?;
                 (
                     info.state.messages,
                     info.state.first_sequence,
@@ -1073,18 +1119,23 @@ impl NatsStorageAdapter {
                     "data stream is empty; missing container header per C10.3",
                 ));
             }
-            let header_raw = stream.get_raw_message(first_seq).await.map_err(|err| {
-                OperationFailure::new(
+            let header_raw = stream
+                .get_raw_message(first_seq)
+                .await
+                .map_err(|err| map_nats_raw_message_error(first_seq, err))?;
+            let (_header, consumed) =
+                ContainerHeader::decode(&header_raw.payload).map_err(|err| {
+                    OperationFailure::new(
+                        FailureCondition::PrecursorChainBroken(None),
+                        format!("invalid container header in data stream: {err}"),
+                    )
+                })?;
+            if consumed != header_raw.payload.len() {
+                return Err(OperationFailure::new(
                     FailureCondition::PrecursorChainBroken(None),
-                    format!("failed to read container header from data stream: {err}"),
-                )
-            })?;
-            let (_header, _) = ContainerHeader::decode(&header_raw.payload).map_err(|err| {
-                OperationFailure::new(
-                    FailureCondition::PrecursorChainBroken(None),
-                    format!("invalid container header in data stream: {err}"),
-                )
-            })?;
+                    "trailing unconsumed bytes in container header",
+                ));
+            }
             Ok(last_seq)
         })?;
 
@@ -1607,34 +1658,56 @@ impl StorageEngine for NatsEngine {
 
         let data_start_seq = match first.checked_add(1) {
             Some(s) => s,
-            None => return Ok(0),
+            None => {
+                self.last_data_seq = last;
+                return Ok(0);
+            }
         };
         if data_start_seq > last {
+            self.last_data_seq = last;
             return Ok(0);
         }
 
+        let chunk_step = chunk_size.max(1) as u64;
         let mut current_seq = data_start_seq;
         let mut total_recovered = 0u64;
 
         while current_seq <= last {
-            let chunk_limit = (chunk_size as u64).min(last - current_seq + 1) as usize;
-            let start_idx = current_seq - data_start_seq;
+            let chunk_end = match current_seq.checked_add(chunk_step.saturating_sub(1)) {
+                Some(end) => end.min(last),
+                None => last,
+            };
             let js = self.js.clone();
             let data_name = self.data_stream_name.clone();
             let frames = run_future(&handle, async move {
-                read_chunk_async(&js, &data_name, start_idx, chunk_limit, Some(last)).await
+                read_range_async(&js, &data_name, current_seq, chunk_end).await
             })?;
-            if frames.is_empty() {
+            let expected_count =
+                match usize::try_from(chunk_end.saturating_sub(current_seq).saturating_add(1)) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        return Err(OperationFailure::new(
+                            FailureCondition::ValueConstraintViolated {
+                                constraint: ValueConstraint::TooLong,
+                            },
+                            "chunk size exceeds pointer width",
+                        ));
+                    }
+                };
+            if frames.len() != expected_count {
                 return Err(OperationFailure::new(
                     FailureCondition::PrecursorChainBroken(None),
-                    format!("unexpected missing messages between {current_seq} and {last} in data stream"),
+                    format!("unexpected missing messages between {current_seq} and {chunk_end} in data stream"),
                 ));
             }
             for frame in frames {
                 on_frame(total_recovered, &frame)?;
                 total_recovered += 1;
-                current_seq += 1;
             }
+            if chunk_end == u64::MAX || chunk_end >= last {
+                break;
+            }
+            current_seq = chunk_end + 1;
         }
 
         self.last_data_seq = last;

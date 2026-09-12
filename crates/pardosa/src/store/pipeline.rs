@@ -71,29 +71,28 @@ impl<E: StorageEngine> Store<E> {
             if broken_cause.is_none() {
                 if let Err(err) = fiber_index.process_frame(frame) {
                     broken_cause = Some(err.condition().clone());
+                    return Err(err);
                 }
             }
             Ok(())
         });
 
+        if let Some(cause) = broken_cause {
+            return Self {
+                engine,
+                rolling_commitment: rolling,
+                fiber_index: SessionIndex::new(),
+                broken_reader_cause: Some(cause),
+            };
+        }
+
         match res {
-            Ok(_) => {
-                if let Some(cause) = broken_cause {
-                    Self {
-                        engine,
-                        rolling_commitment: rolling,
-                        fiber_index: SessionIndex::new(),
-                        broken_reader_cause: Some(cause),
-                    }
-                } else {
-                    Self {
-                        engine,
-                        rolling_commitment: rolling,
-                        fiber_index,
-                        broken_reader_cause: None,
-                    }
-                }
-            }
+            Ok(_) => Self {
+                engine,
+                rolling_commitment: rolling,
+                fiber_index,
+                broken_reader_cause: None,
+            },
             Err(err) => Self {
                 engine,
                 rolling_commitment: RollingCommitment::new(),
