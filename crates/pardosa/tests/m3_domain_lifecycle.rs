@@ -2182,3 +2182,203 @@ fn test_h1_open_reader_with_transport_unavailable_refuses_point_lookups_and_reco
 
     assert_eq!(store.rolling_commitment().frame_count(), 1);
 }
+
+#[test]
+fn test_m4_inconsistent_landed_all_count_is_refused_and_preserves_projection() {
+    use pardosa::encoding::{
+        EventEnvelope, InboundPointerRecord, MigrationEndRecord, MigrationStartRecord,
+        OutboundPointerRecord, OwnershipClaimRecord, OwnershipRecord, RescuePolicyChoiceRecord,
+    };
+    use pardosa::schema::SchemaDescriptor;
+    use pardosa::store::{
+        BatchLandingVerdict, FailureCondition, OperationFailure, StorageEngine, Store,
+        WriteLandingVerdict,
+    };
+
+    struct LandedAllRogueEngine {
+        epoch: u64,
+    }
+    impl StorageEngine for LandedAllRogueEngine {
+        fn carried_epoch(&self) -> u64 {
+            self.epoch
+        }
+        fn append_block(
+            &mut self,
+            _b: &[u8],
+        ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
+            Ok(WriteLandingVerdict::Landed(1))
+        }
+        fn append_batch_detailed(&mut self, _blocks: &[&[u8]]) -> BatchLandingVerdict<u64> {
+            BatchLandingVerdict::LandedAll {
+                final_position: 1,
+                landed_count: 0,
+            }
+        }
+        fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
+            Ok(Vec::new())
+        }
+        fn is_retired(&self) -> Result<bool, OperationFailure> {
+            Ok(false)
+        }
+        fn sync(&mut self) -> Result<(), OperationFailure> {
+            Ok(())
+        }
+        fn uncertain_diagnostic(&self) -> Option<&str> {
+            None
+        }
+        fn claim(&self) -> Option<&OwnershipClaimRecord> {
+            None
+        }
+        fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
+            None
+        }
+        fn set_schema_descriptor(&mut self, _d: &SchemaDescriptor) -> Result<(), OperationFailure> {
+            Ok(())
+        }
+        fn record_meta_record(&mut self, _r: &OwnershipRecord) -> Result<(), OperationFailure> {
+            Ok(())
+        }
+        fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
+            None
+        }
+        fn inbound_pointer(&self) -> Option<&InboundPointerRecord> {
+            None
+        }
+        fn migration_start(&self) -> Option<&MigrationStartRecord> {
+            None
+        }
+        fn migration_end(&self) -> Option<&MigrationEndRecord> {
+            None
+        }
+        fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
+            None
+        }
+    }
+
+    let fiber = [0x55; 16];
+    let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"valid-1").unwrap();
+    let mut e1_buf = Vec::new();
+    e1.encode(&mut e1_buf);
+
+    let mut store = Store::open_writer(LandedAllRogueEngine { epoch: 1 }).unwrap();
+    let initial_frame_count = store.rolling_commitment().frame_count();
+    let err = store.append_batch_detailed(&[&e1_buf]).unwrap_err();
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::PrecursorChainBroken(None)
+    );
+    assert!(err
+        .diagnostic_detail()
+        .message()
+        .contains("engine reported inconsistent LandedAll count: landed 0 != batch length 1"));
+    assert_eq!(
+        store.rolling_commitment().frame_count(),
+        initial_frame_count
+    );
+    let idx = store.session_index().expect("session index must be valid");
+    assert_eq!(idx.len(), 0);
+}
+
+#[test]
+fn test_m4_inconsistent_refusal_count_is_refused() {
+    use pardosa::encoding::{
+        EventEnvelope, InboundPointerRecord, MigrationEndRecord, MigrationStartRecord,
+        OutboundPointerRecord, OwnershipClaimRecord, OwnershipRecord, RescuePolicyChoiceRecord,
+    };
+    use pardosa::schema::SchemaDescriptor;
+    use pardosa::store::{
+        BatchLandingVerdict, FailureCondition, OperationFailure, StorageEngine, Store,
+        WriteLandingVerdict,
+    };
+
+    struct RefusalRogueEngine {
+        epoch: u64,
+    }
+    impl StorageEngine for RefusalRogueEngine {
+        fn carried_epoch(&self) -> u64 {
+            self.epoch
+        }
+        fn append_block(
+            &mut self,
+            _b: &[u8],
+        ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
+            Ok(WriteLandingVerdict::Landed(1))
+        }
+        fn append_batch_detailed(&mut self, _blocks: &[&[u8]]) -> BatchLandingVerdict<u64> {
+            BatchLandingVerdict::PreAttemptRefusal {
+                error: OperationFailure::new(
+                    FailureCondition::TransportUnavailable,
+                    "mock refusal",
+                ),
+                unattempted_count: 99,
+            }
+        }
+        fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
+            Ok(Vec::new())
+        }
+        fn is_retired(&self) -> Result<bool, OperationFailure> {
+            Ok(false)
+        }
+        fn sync(&mut self) -> Result<(), OperationFailure> {
+            Ok(())
+        }
+        fn uncertain_diagnostic(&self) -> Option<&str> {
+            None
+        }
+        fn claim(&self) -> Option<&OwnershipClaimRecord> {
+            None
+        }
+        fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
+            None
+        }
+        fn set_schema_descriptor(&mut self, _d: &SchemaDescriptor) -> Result<(), OperationFailure> {
+            Ok(())
+        }
+        fn record_meta_record(&mut self, _r: &OwnershipRecord) -> Result<(), OperationFailure> {
+            Ok(())
+        }
+        fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
+            None
+        }
+        fn inbound_pointer(&self) -> Option<&InboundPointerRecord> {
+            None
+        }
+        fn migration_start(&self) -> Option<&MigrationStartRecord> {
+            None
+        }
+        fn migration_end(&self) -> Option<&MigrationEndRecord> {
+            None
+        }
+        fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
+            None
+        }
+    }
+
+    let fiber = [0x55; 16];
+    let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"valid-1").unwrap();
+    let mut e1_buf = Vec::new();
+    e1.encode(&mut e1_buf);
+
+    let mut store = Store::open_writer(RefusalRogueEngine { epoch: 1 }).unwrap();
+    let err = store.append_batch_detailed(&[&e1_buf]).unwrap_err();
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::PrecursorChainBroken(None)
+    );
+    assert!(err.diagnostic_detail().message().contains(
+        "engine reported inconsistent PreAttemptRefusal count: unattempted 99 != batch length 1"
+    ));
+}
+
+#[test]
+fn test_m4_batch_landing_verdict_total_count_checked_arithmetic_overflow() {
+    use pardosa::store::{BatchLandingVerdict, NextAttemptStatus};
+
+    let verdict: BatchLandingVerdict<u64> = BatchLandingVerdict::PartialProgress {
+        landed_count: usize::MAX,
+        next_attempt: NextAttemptStatus::Undetermined { carried_epoch: 1 },
+        unattempted_count: 0,
+    };
+    assert_eq!(verdict.total_count(), usize::MAX);
+    assert_eq!(verdict.checked_total_count(), None);
+}

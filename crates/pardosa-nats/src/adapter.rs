@@ -32,8 +32,6 @@ fn is_wrong_last_sequence(err: &async_nats::jetstream::context::PublishError) ->
             let code = api_err.error_code();
             if code == ErrorCode::STREAM_WRONG_LAST_SEQUENCE
                 || code == ErrorCode::STREAM_WRONG_LAST_SEQUENCE_CONSTANT
-                || code == ErrorCode(10071)
-                || code == ErrorCode(10164)
             {
                 return true;
             }
@@ -128,17 +126,26 @@ async fn read_meta_records_async(
 
 const REPLAY_CONCURRENCY: usize = 16;
 
-fn map_nats_stream_open_error(stream_name: &str, err: impl std::fmt::Display) -> OperationFailure {
-    let msg = err.to_string();
-    if msg.contains("stream not found") || msg.contains("404") || msg.contains("not found") {
+fn map_nats_stream_open_error(
+    stream_name: &str,
+    err: &async_nats::jetstream::context::GetStreamError,
+) -> OperationFailure {
+    use async_nats::jetstream::context::GetStreamErrorKind;
+    use async_nats::jetstream::ErrorCode;
+    let is_not_found = match err.kind() {
+        GetStreamErrorKind::JetStream(js_err) => js_err.error_code() == ErrorCode::STREAM_NOT_FOUND,
+        _ => false,
+    };
+
+    if is_not_found {
         OperationFailure::new(
             FailureCondition::NoArtefactExists,
-            format!("stream {stream_name} not found: {msg}"),
+            format!("stream {stream_name} not found: {err}"),
         )
     } else {
         OperationFailure::new(
             FailureCondition::TransportUnavailable,
-            format!("transport unavailable opening stream {stream_name}: {msg}"),
+            format!("transport unavailable opening stream {stream_name}: {err}"),
         )
     }
 }
@@ -152,27 +159,17 @@ fn map_nats_info_error(stream_name: &str, err: impl std::fmt::Display) -> Operat
 
 fn map_nats_raw_message_error(
     seq: u64,
-    err: &(dyn std::error::Error + 'static),
+    err: &async_nats::jetstream::stream::RawMessageError,
 ) -> OperationFailure {
+    use async_nats::jetstream::stream::RawMessageErrorKind;
     use async_nats::jetstream::ErrorCode;
-    let is_missing = if let Some(source) = err.source() {
-        if let Some(api_err) = source.downcast_ref::<async_nats::jetstream::Error>() {
-            let code = api_err.error_code();
-            code == ErrorCode::NO_MESSAGE_FOUND
-                || code == ErrorCode::SEQUENCE_NOT_FOUND
-                || code == ErrorCode(10037)
-                || code == ErrorCode(10043)
-        } else {
-            false
+    let is_missing = match err.kind() {
+        RawMessageErrorKind::NoMessageFound => true,
+        RawMessageErrorKind::JetStream(js_err) => {
+            let code = js_err.error_code();
+            code == ErrorCode::NO_MESSAGE_FOUND || code == ErrorCode::SEQUENCE_NOT_FOUND
         }
-    } else if let Some(api_err) = err.downcast_ref::<async_nats::jetstream::Error>() {
-        let code = api_err.error_code();
-        code == ErrorCode::NO_MESSAGE_FOUND
-            || code == ErrorCode::SEQUENCE_NOT_FOUND
-            || code == ErrorCode(10037)
-            || code == ErrorCode(10043)
-    } else {
-        false
+        _ => false,
     };
 
     if is_missing {
@@ -195,7 +192,7 @@ async fn read_data_frames_async(
     let mut stream = js
         .get_stream(data_stream_name)
         .await
-        .map_err(|err| map_nats_stream_open_error(data_stream_name, err))?;
+        .map_err(|err| map_nats_stream_open_error(data_stream_name, &err))?;
     let (messages, first, last) = {
         let info = stream
             .info()
@@ -281,7 +278,7 @@ async fn read_chunk_async(
     let mut stream = js
         .get_stream(data_stream_name)
         .await
-        .map_err(|err| map_nats_stream_open_error(data_stream_name, err))?;
+        .map_err(|err| map_nats_stream_open_error(data_stream_name, &err))?;
     let (messages, first, mut last) = {
         let info = stream
             .info()
@@ -384,7 +381,7 @@ async fn read_range_async(
     let stream = js
         .get_stream(data_stream_name)
         .await
-        .map_err(|err| map_nats_stream_open_error(data_stream_name, err))?;
+        .map_err(|err| map_nats_stream_open_error(data_stream_name, &err))?;
 
     use futures_util::StreamExt;
     let stream_ref = &stream;
@@ -1121,7 +1118,7 @@ impl NatsStorageAdapter {
             let mut stream = js_data
                 .get_stream(&data_name)
                 .await
-                .map_err(|err| map_nats_stream_open_error(&data_name, err))?;
+                .map_err(|err| map_nats_stream_open_error(&data_name, &err))?;
             let (messages, first_seq, last_seq) = {
                 let info = stream
                     .info()
@@ -1802,7 +1799,7 @@ impl StorageEngine for NatsEngine {
             let mut stream = js
                 .get_stream(&data_name)
                 .await
-                .map_err(|err| map_nats_stream_open_error(&data_name, err))?;
+                .map_err(|err| map_nats_stream_open_error(&data_name, &err))?;
             let (messages, first_seq, last_seq) = {
                 let info = stream
                     .info()
@@ -2344,5 +2341,48 @@ impl MigrationTarget for NatsStorageAdapter {
         let epoch = self.current_epoch()?;
         let mut writer = self.open_write(epoch)?;
         writer.set_schema_descriptor(descriptor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_nats::jetstream::context::{GetStreamError, GetStreamErrorKind};
+    use async_nats::jetstream::stream::{RawMessageError, RawMessageErrorKind};
+    use pardosa::store::FailureCondition;
+
+    #[test]
+    fn test_map_nats_raw_message_error_no_message_found_is_broken_chain() {
+        let err = RawMessageError::new(RawMessageErrorKind::NoMessageFound);
+        let failure = map_nats_raw_message_error(42, &err);
+        assert_eq!(
+            *failure.condition(),
+            FailureCondition::PrecursorChainBroken(None)
+        );
+        assert!(failure.diagnostic_detail().message().contains("seq 42"));
+    }
+
+    #[test]
+    fn test_map_nats_raw_message_error_other_is_transport_unavailable() {
+        let err = RawMessageError::new(RawMessageErrorKind::Other);
+        let failure = map_nats_raw_message_error(42, &err);
+        assert_eq!(*failure.condition(), FailureCondition::TransportUnavailable);
+    }
+
+    #[test]
+    fn test_map_nats_stream_open_error_empty_name_is_transport_unavailable() {
+        let err = GetStreamError::new(GetStreamErrorKind::EmptyName);
+        let failure = map_nats_stream_open_error("test_stream", &err);
+        assert_eq!(*failure.condition(), FailureCondition::TransportUnavailable);
+    }
+
+    #[test]
+    fn test_map_nats_stream_open_error_request_error_does_not_use_display_substring() {
+        let err = GetStreamError::with_source(
+            GetStreamErrorKind::Request,
+            std::io::Error::new(std::io::ErrorKind::NotFound, "stream not found 404"),
+        );
+        let failure = map_nats_stream_open_error("test_stream", &err);
+        assert_eq!(*failure.condition(), FailureCondition::TransportUnavailable);
     }
 }

@@ -1182,12 +1182,23 @@ impl<T> BatchLandingVerdict<T> {
     }
 
     /// Returns the total number of items accounted for in this batch outcome.
+    ///
+    /// Uses saturating addition to prevent arithmetic overflow on untrusted external values.
     #[must_use]
     pub fn total_count(&self) -> usize {
         self.landed_count()
-            + self.unresolved_count()
-            + self.rejected_count()
-            + self.unattempted_count()
+            .saturating_add(self.unresolved_count())
+            .saturating_add(self.rejected_count())
+            .saturating_add(self.unattempted_count())
+    }
+
+    /// Checked total item count. Returns `None` if counts overflow `usize`.
+    #[must_use]
+    pub fn checked_total_count(&self) -> Option<usize> {
+        self.landed_count()
+            .checked_add(self.unresolved_count())
+            .and_then(|sum| sum.checked_add(self.rejected_count()))
+            .and_then(|sum| sum.checked_add(self.unattempted_count()))
     }
 
     /// Returns true if any item in the batch has an ambiguous/undetermined outcome.

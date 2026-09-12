@@ -583,6 +583,15 @@ impl<E: StorageEngine> Store<E> {
                 final_position: _,
                 landed_count,
             } => {
+                if landed_count != payloads.len() {
+                    return Err(OperationFailure::new(
+                        FailureCondition::PrecursorChainBroken(None),
+                        format!(
+                            "engine reported inconsistent LandedAll count: landed {landed_count} != batch length {}",
+                            payloads.len()
+                        ),
+                    ));
+                }
                 for frame_buf in &frame_buffers {
                     self.rolling_commitment.update_frame(frame_buf);
                 }
@@ -595,10 +604,21 @@ impl<E: StorageEngine> Store<E> {
             BatchLandingVerdict::PreAttemptRefusal {
                 error,
                 unattempted_count,
-            } => Ok(BatchLandingVerdict::PreAttemptRefusal {
-                error,
-                unattempted_count,
-            }),
+            } => {
+                if unattempted_count != payloads.len() {
+                    return Err(OperationFailure::new(
+                        FailureCondition::PrecursorChainBroken(None),
+                        format!(
+                            "engine reported inconsistent PreAttemptRefusal count: unattempted {unattempted_count} != batch length {}",
+                            payloads.len()
+                        ),
+                    ));
+                }
+                Ok(BatchLandingVerdict::PreAttemptRefusal {
+                    error,
+                    unattempted_count,
+                })
+            }
             BatchLandingVerdict::PartialProgress {
                 landed_count,
                 next_attempt,
