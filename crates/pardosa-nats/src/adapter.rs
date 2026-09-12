@@ -39,8 +39,7 @@ fn is_wrong_last_sequence(err: &async_nats::jetstream::context::PublishError) ->
             }
         }
     }
-    let msg = err.to_string();
-    msg.contains("wrong last sequence") || msg.contains("10071") || msg.contains("10164")
+    false
 }
 
 /// All decoded ownership records found in an artefact's meta stream.
@@ -151,22 +150,40 @@ fn map_nats_info_error(stream_name: &str, err: impl std::fmt::Display) -> Operat
     )
 }
 
-fn map_nats_raw_message_error(seq: u64, err: impl std::fmt::Display) -> OperationFailure {
-    let msg = err.to_string();
-    if msg.contains("10037")
-        || msg.contains("10043")
-        || msg.contains("message not found")
-        || msg.contains("sequence not found")
-        || msg.contains("no message found")
-    {
+fn map_nats_raw_message_error(
+    seq: u64,
+    err: &(dyn std::error::Error + 'static),
+) -> OperationFailure {
+    use async_nats::jetstream::ErrorCode;
+    let is_missing = if let Some(source) = err.source() {
+        if let Some(api_err) = source.downcast_ref::<async_nats::jetstream::Error>() {
+            let code = api_err.error_code();
+            code == ErrorCode::NO_MESSAGE_FOUND
+                || code == ErrorCode::SEQUENCE_NOT_FOUND
+                || code == ErrorCode(10037)
+                || code == ErrorCode(10043)
+        } else {
+            false
+        }
+    } else if let Some(api_err) = err.downcast_ref::<async_nats::jetstream::Error>() {
+        let code = api_err.error_code();
+        code == ErrorCode::NO_MESSAGE_FOUND
+            || code == ErrorCode::SEQUENCE_NOT_FOUND
+            || code == ErrorCode(10037)
+            || code == ErrorCode(10043)
+    } else {
+        false
+    };
+
+    if is_missing {
         OperationFailure::new(
             FailureCondition::PrecursorChainBroken(None),
-            format!("missing message in data stream at seq {seq}: {msg}"),
+            format!("missing message in data stream at seq {seq}: {err}"),
         )
     } else {
         OperationFailure::new(
             FailureCondition::TransportUnavailable,
-            format!("transport unavailable reading raw message at seq {seq}: {msg}"),
+            format!("transport unavailable reading raw message at seq {seq}: {err}"),
         )
     }
 }
@@ -199,7 +216,7 @@ async fn read_data_frames_async(
     let header_raw = stream
         .get_raw_message(first)
         .await
-        .map_err(|err| map_nats_raw_message_error(first, err))?;
+        .map_err(|err| map_nats_raw_message_error(first, &err))?;
     let (header, consumed) = ContainerHeader::decode(&header_raw.payload).map_err(|err| {
         OperationFailure::new(
             FailureCondition::PrecursorChainBroken(None),
@@ -224,7 +241,7 @@ async fn read_data_frames_async(
                 let raw = stream_ref
                     .get_raw_message(seq)
                     .await
-                    .map_err(|err| map_nats_raw_message_error(seq, err))?;
+                    .map_err(|err| map_nats_raw_message_error(seq, &err))?;
                 Ok::<_, OperationFailure>((seq, raw))
             })
             .buffered(REPLAY_CONCURRENCY);
@@ -288,7 +305,7 @@ async fn read_chunk_async(
     let header_raw = stream
         .get_raw_message(first)
         .await
-        .map_err(|err| map_nats_raw_message_error(first, err))?;
+        .map_err(|err| map_nats_raw_message_error(first, &err))?;
     let (_header, consumed) = ContainerHeader::decode(&header_raw.payload).map_err(|err| {
         OperationFailure::new(
             FailureCondition::PrecursorChainBroken(None),
@@ -329,7 +346,7 @@ async fn read_chunk_async(
             let raw = stream_ref
                 .get_raw_message(seq)
                 .await
-                .map_err(|err| map_nats_raw_message_error(seq, err))?;
+                .map_err(|err| map_nats_raw_message_error(seq, &err))?;
             Ok::<_, OperationFailure>((seq, raw))
         })
         .buffered(REPLAY_CONCURRENCY);
@@ -376,7 +393,7 @@ async fn read_range_async(
             let raw = stream_ref
                 .get_raw_message(seq)
                 .await
-                .map_err(|err| map_nats_raw_message_error(seq, err))?;
+                .map_err(|err| map_nats_raw_message_error(seq, &err))?;
             let (payload, consumed) = ContainerFrame::decode(&raw.payload).map_err(|err| {
                 OperationFailure::new(
                     FailureCondition::PrecursorChainBroken(None),
@@ -1125,7 +1142,7 @@ impl NatsStorageAdapter {
             let header_raw = stream
                 .get_raw_message(first_seq)
                 .await
-                .map_err(|err| map_nats_raw_message_error(first_seq, err))?;
+                .map_err(|err| map_nats_raw_message_error(first_seq, &err))?;
             let (_header, consumed) =
                 ContainerHeader::decode(&header_raw.payload).map_err(|err| {
                     OperationFailure::new(
@@ -1806,7 +1823,7 @@ impl StorageEngine for NatsEngine {
             let first_msg = stream
                 .get_raw_message(first_seq)
                 .await
-                .map_err(|err| map_nats_raw_message_error(first_seq, err))?;
+                .map_err(|err| map_nats_raw_message_error(first_seq, &err))?;
             let (_header, consumed) =
                 ContainerHeader::decode(&first_msg.payload).map_err(|err| {
                     OperationFailure::new(
