@@ -433,6 +433,46 @@ impl SessionIndex {
         Ok(())
     }
 
+    /// Processes a single raw frame into the session index during recovery.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if frame is shorter than 85 bytes, frame decode fails,
+    /// or resource limits are breached.
+    pub fn process_frame(&mut self, frame: &[u8]) -> Result<(), OperationFailure> {
+        if frame.len() < 85 {
+            return Err(OperationFailure::new(
+                FailureCondition::EnvelopeMismatch,
+                "frame length < 85 bytes or malformed envelope in ordinary session index",
+            ));
+        }
+        let env = Self::decode_and_validate_frame(frame).map_err(|_| {
+            OperationFailure::new(
+                FailureCondition::EnvelopeMismatch,
+                "frame length < 85 bytes or malformed envelope in ordinary session index",
+            )
+        })?;
+        if let Some(FiberSlot::Broken { .. }) = self.fibers.get(&env.header.fiber_id) {
+            self.record_broken_event_id(env.header.fiber_id, env.header.event_id)?;
+            return Ok(());
+        }
+        match self.validate_append(&env) {
+            Ok(()) => {
+                self.commit_envelope_unchecked(env);
+            }
+            Err(err) => match err.condition() {
+                FailureCondition::PrecursorChainBroken(_) => {
+                    self.mark_fiber_broken(
+                        env.header.fiber_id,
+                        err.diagnostic_detail().message().to_string(),
+                    )?;
+                    self.record_broken_event_id(env.header.fiber_id, env.header.event_id)?;
+                }
+                _ => return Err(err),
+            },
+        }
+        Ok(())
+    }
+
     /// Rebuilds a session index from an ordered sequence of raw container frames.
     ///
     /// # Errors
@@ -443,37 +483,7 @@ impl SessionIndex {
     ) -> Result<Self, OperationFailure> {
         let mut index = Self::new();
         for frame in frames {
-            if frame.len() < 85 {
-                return Err(OperationFailure::new(
-                    FailureCondition::EnvelopeMismatch,
-                    "frame length < 85 bytes or malformed envelope in ordinary session index",
-                ));
-            }
-            let env = Self::decode_and_validate_frame(frame).map_err(|_| {
-                OperationFailure::new(
-                    FailureCondition::EnvelopeMismatch,
-                    "frame length < 85 bytes or malformed envelope in ordinary session index",
-                )
-            })?;
-            if let Some(FiberSlot::Broken { .. }) = index.fibers.get(&env.header.fiber_id) {
-                index.record_broken_event_id(env.header.fiber_id, env.header.event_id)?;
-                continue;
-            }
-            match index.validate_append(&env) {
-                Ok(()) => {
-                    index.commit_envelope_unchecked(env);
-                }
-                Err(err) => match err.condition() {
-                    FailureCondition::PrecursorChainBroken(_) => {
-                        index.mark_fiber_broken(
-                            env.header.fiber_id,
-                            err.diagnostic_detail().message().to_string(),
-                        )?;
-                        index.record_broken_event_id(env.header.fiber_id, env.header.event_id)?;
-                    }
-                    _ => return Err(err),
-                },
-            }
+            index.process_frame(frame)?;
         }
         Ok(index)
     }

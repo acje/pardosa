@@ -694,6 +694,68 @@ impl EnvelopeHeader {
     }
 }
 
+/// Borrowed event envelope view referencing payload bytes directly from wire buffers per C4.19.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventEnvelopeRef<'a> {
+    /// Fixed 81-byte header fields.
+    pub header: EnvelopeHeader,
+    /// Borrowed event payload slice.
+    pub payload: &'a [u8],
+}
+
+impl<'a> EventEnvelopeRef<'a> {
+    /// Decodes a borrowed event envelope from wire bytes without allocating payload memory.
+    ///
+    /// # Errors
+    /// Returns `DecodeError::TruncatedHeader` if header is fewer than 81 bytes.
+    /// Returns `DecodeError::InvalidBooleanDiscriminant` if detached byte is invalid.
+    /// Returns `DecodeError::TruncatedPayload` if declared payload length exceeds available bytes.
+    pub fn decode(buf: &'a [u8]) -> Result<(Self, usize), DecodeError> {
+        let (header, header_consumed) = EnvelopeHeader::decode(buf)?;
+        if buf.len() < header_consumed + 4 {
+            return Err(DecodeError::TruncatedHeader {
+                expected: header_consumed + 4,
+                available: buf.len(),
+            });
+        }
+        let payload_len = u32::from_le_bytes([
+            buf[header_consumed],
+            buf[header_consumed + 1],
+            buf[header_consumed + 2],
+            buf[header_consumed + 3],
+        ]) as usize;
+        let total_consumed = match header_consumed
+            .checked_add(4)
+            .and_then(|h| h.checked_add(payload_len))
+        {
+            Some(c) => c,
+            None => {
+                return Err(DecodeError::TruncatedPayload {
+                    expected: usize::MAX,
+                    available: buf.len(),
+                });
+            }
+        };
+        if buf.len() < total_consumed {
+            return Err(DecodeError::TruncatedPayload {
+                expected: total_consumed,
+                available: buf.len(),
+            });
+        }
+        let payload = &buf[header_consumed + 4..total_consumed];
+        Ok((Self { header, payload }, total_consumed))
+    }
+
+    /// Converts this borrowed view into an owned [`EventEnvelope`].
+    #[must_use]
+    pub fn to_owned(&self) -> EventEnvelope {
+        EventEnvelope {
+            header: self.header.clone(),
+            payload: self.payload.to_vec(),
+        }
+    }
+}
+
 /// Standard 5-field event envelope carrying payload bytes per C4.19.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventEnvelope {
@@ -719,28 +781,8 @@ impl EventEnvelope {
     /// Returns `DecodeError::InvalidBooleanDiscriminant` if detached byte is invalid.
     /// Returns `DecodeError::TruncatedPayload` if declared payload length exceeds available bytes.
     pub fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
-        let (header, header_consumed) = EnvelopeHeader::decode(buf)?;
-        if buf.len() < header_consumed + 4 {
-            return Err(DecodeError::TruncatedHeader {
-                expected: header_consumed + 4,
-                available: buf.len(),
-            });
-        }
-        let payload_len = u32::from_le_bytes([
-            buf[header_consumed],
-            buf[header_consumed + 1],
-            buf[header_consumed + 2],
-            buf[header_consumed + 3],
-        ]) as usize;
-        let total_consumed = header_consumed + 4 + payload_len;
-        if buf.len() < total_consumed {
-            return Err(DecodeError::TruncatedPayload {
-                expected: total_consumed,
-                available: buf.len(),
-            });
-        }
-        let payload = buf[header_consumed + 4..total_consumed].to_vec();
-        Ok((Self { header, payload }, total_consumed))
+        let (env_ref, consumed) = EventEnvelopeRef::decode(buf)?;
+        Ok((env_ref.to_owned(), consumed))
     }
 
     /// Computes the 32-byte BLAKE3 commitment of this envelope per C4.19.

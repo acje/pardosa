@@ -1,3 +1,4 @@
+#![allow(clippy::pedantic)]
 use std::path::Path;
 
 struct Reassignment {

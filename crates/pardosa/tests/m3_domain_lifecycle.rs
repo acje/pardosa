@@ -205,6 +205,7 @@ fn test_c6_7_operation_failure_taxonomy_exhaustive() {
             FailureCondition::MissingSchemaDescriptor => {}
             FailureCondition::TransformationRefused => {}
             FailureCondition::RetiredMigrationSource => {}
+            FailureCondition::TransportUnavailable => {}
         }
     }
 
@@ -235,6 +236,7 @@ fn test_c6_7_operation_failure_taxonomy_exhaustive() {
         FailureCondition::MissingSchemaDescriptor,
         FailureCondition::TransformationRefused,
         FailureCondition::RetiredMigrationSource,
+        FailureCondition::TransportUnavailable,
     ];
 
     for condition in &conditions {
@@ -1523,4 +1525,549 @@ fn test_m1_integration_multi_envelope_capacity_tracking_and_release() {
         assert_eq!(obs2.position(), 1);
         assert!(reader.read_event().is_none());
     });
+}
+
+#[derive(Debug, Default)]
+struct MockEngine {
+    blocks: Vec<Vec<u8>>,
+    fail_at_block: Option<usize>,
+    undetermined_at_block: Option<usize>,
+    read_failure: Option<OperationFailure>,
+    fail_reads_with_transport_unavailable: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl StorageEngine for MockEngine {
+    fn carried_epoch(&self) -> u64 {
+        42
+    }
+
+    fn append_block(&mut self, block: &[u8]) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
+        let idx = self.blocks.len();
+        if self.undetermined_at_block == Some(idx) {
+            return Ok(WriteLandingVerdict::Undetermined { carried_epoch: 42 });
+        }
+        if self.fail_at_block == Some(idx) {
+            return Err(OperationFailure::new(
+                FailureCondition::ConcurrencyConflict,
+                "simulated write conflict",
+            ));
+        }
+        self.blocks.push(block.to_vec());
+        Ok(WriteLandingVerdict::Landed(self.blocks.len() as u64))
+    }
+
+    fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
+        if self
+            .fail_reads_with_transport_unavailable
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(OperationFailure::new(
+                FailureCondition::TransportUnavailable,
+                "transient connection timeout",
+            ));
+        }
+        if let Some(ref err) = self.read_failure {
+            return Err(err.clone());
+        }
+        Ok(self.blocks.clone())
+    }
+
+    fn is_retired(&self) -> Result<bool, OperationFailure> {
+        Ok(false)
+    }
+
+    fn sync(&mut self) -> Result<(), OperationFailure> {
+        Ok(())
+    }
+
+    fn uncertain_diagnostic(&self) -> Option<&str> {
+        None
+    }
+
+    fn claim(&self) -> Option<&OwnershipClaimRecord> {
+        None
+    }
+
+    fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
+        None
+    }
+
+    fn set_schema_descriptor(
+        &mut self,
+        _descriptor: &SchemaDescriptor,
+    ) -> Result<(), OperationFailure> {
+        Ok(())
+    }
+
+    fn record_meta_record(&mut self, _record: &OwnershipRecord) -> Result<(), OperationFailure> {
+        Ok(())
+    }
+
+    fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
+        None
+    }
+
+    fn inbound_pointer(&self) -> Option<&InboundPointerRecord> {
+        None
+    }
+
+    fn migration_start(&self) -> Option<&MigrationStartRecord> {
+        None
+    }
+
+    fn migration_end(&self) -> Option<&MigrationEndRecord> {
+        None
+    }
+
+    fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
+        None
+    }
+}
+
+#[test]
+fn test_c5_12_and_c5_16_bounded_batch_landing_verdicts() {
+    let fiber = [0x99; 16];
+    let e1 = EventEnvelope::genesis([0x01; 16], fiber, b"event-1".to_vec()).expect("genesis");
+    let e2 = EventEnvelope::chain(&e1, [0x02; 16], b"event-2".to_vec()).expect("chain 2");
+    let e3 = EventEnvelope::chain(&e2, [0x03; 16], b"event-3".to_vec()).expect("chain 3");
+    let e4 = EventEnvelope::chain(&e3, [0x04; 16], b"event-4".to_vec()).expect("chain 4");
+    let batch = [e1.clone(), e2.clone(), e3.clone(), e4.clone()];
+
+    let mut store_all = Store::open_writer(MockEngine::default()).expect("store open");
+    let v_all = store_all
+        .append_batch_envelopes_detailed(&batch)
+        .expect("verdict all");
+    assert_eq!(v_all, BatchLandingVerdict::LandedAll { final_position: 4 });
+    assert_eq!(v_all.landed_count(4), 4);
+    assert_eq!(v_all.unattempted_count(4), 0);
+    assert_eq!(store_all.rolling_commitment().frame_count(), 4);
+    assert_eq!(
+        store_all
+            .session_index()
+            .expect("idx")
+            .event_count(&fiber)
+            .unwrap(),
+        4
+    );
+
+    let mut store_undet = Store::open_writer(MockEngine {
+        undetermined_at_block: Some(2),
+        ..Default::default()
+    })
+    .expect("store open");
+    let v_undet = store_undet
+        .append_batch_envelopes_detailed(&batch)
+        .expect("verdict undet");
+    assert_eq!(
+        v_undet,
+        BatchLandingVerdict::Undetermined {
+            landed_count: 2,
+            carried_epoch: 42,
+        }
+    );
+    assert_eq!(v_undet.unattempted_count(4), 1);
+    assert_eq!(store_undet.rolling_commitment().frame_count(), 2);
+    assert_eq!(
+        store_undet
+            .session_index()
+            .expect("idx")
+            .event_count(&fiber)
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        store_undet
+            .session_index()
+            .expect("idx")
+            .get_latest(&fiber)
+            .unwrap()
+            .unwrap()
+            .header
+            .event_id,
+        e2.header.event_id
+    );
+
+    let mut store_fail = Store::open_writer(MockEngine {
+        fail_at_block: Some(1),
+        ..Default::default()
+    })
+    .expect("store open");
+    let v_fail = store_fail
+        .append_batch_envelopes_detailed(&batch)
+        .expect("verdict fail");
+    match &v_fail {
+        BatchLandingVerdict::PartialFailure {
+            landed_count,
+            error,
+        } => {
+            assert_eq!(*landed_count, 1);
+            assert_eq!(v_fail.unattempted_count(4), 2);
+            assert_eq!(*error.condition(), FailureCondition::ConcurrencyConflict);
+        }
+        other => panic!("expected PartialFailure, got {other:?}"),
+    }
+    assert_eq!(store_fail.rolling_commitment().frame_count(), 1);
+    assert_eq!(
+        store_fail
+            .session_index()
+            .expect("idx")
+            .event_count(&fiber)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store_fail
+            .session_index()
+            .expect("idx")
+            .get_latest(&fiber)
+            .unwrap()
+            .unwrap()
+            .header
+            .event_id,
+        e1.header.event_id
+    );
+}
+
+#[test]
+fn test_for_each_envelope_refuses_broken_chain_and_stops_delivery() {
+    let mut engine = MockEngine::default();
+    let fiber = [0x99; 16];
+    let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"payload-1").unwrap();
+    let mut e2_broken = EventEnvelope::genesis([2u8; 16], fiber, b"payload-2").unwrap();
+    e2_broken.header.precursor = [99u8; 16];
+
+    let mut env1_bytes = Vec::new();
+    e1.encode(&mut env1_bytes);
+
+    let mut env2_bytes = Vec::new();
+    e2_broken.encode(&mut env2_bytes);
+
+    engine.append_block(&env1_bytes).unwrap();
+    engine.append_block(&env2_bytes).unwrap();
+
+    let mut store = Store::open_reader(engine);
+    let mut delivered_events = Vec::new();
+
+    let res = store.for_each_envelope(|env_ref| {
+        delivered_events.push(env_ref.header.event_id);
+        Ok(())
+    });
+
+    assert!(res.is_err(), "broken chain must return error");
+    assert_eq!(
+        *res.unwrap_err().condition(),
+        FailureCondition::PrecursorChainBroken(None)
+    );
+    assert_eq!(delivered_events, Vec::<[u8; 16]>::new());
+}
+
+#[test]
+fn test_for_each_envelope_consumer_callback_error_does_not_poison_reader_session() {
+    let mut engine = MockEngine::default();
+    let fiber = [0x88; 16];
+    let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"payload-1").unwrap();
+    let e2 = EventEnvelope::chain(&e1, [2u8; 16], b"payload-2").unwrap();
+
+    let mut env1_bytes = Vec::new();
+    e1.encode(&mut env1_bytes);
+    let mut env2_bytes = Vec::new();
+    e2.encode(&mut env2_bytes);
+
+    engine.append_block(&env1_bytes).unwrap();
+    engine.append_block(&env2_bytes).unwrap();
+
+    let mut store = Store::open_reader(engine);
+
+    let res = store.for_each_envelope(|env| {
+        if env.header.event_id == [2u8; 16] {
+            return Err(OperationFailure::new(
+                FailureCondition::TransformationRefused,
+                "consumer explicitly aborted iteration",
+            ));
+        }
+        Ok(())
+    });
+
+    assert_eq!(
+        *res.unwrap_err().condition(),
+        FailureCondition::TransformationRefused
+    );
+
+    let mut replay_count = 0;
+    let rerun = store.for_each_envelope(|_env| {
+        replay_count += 1;
+        Ok(())
+    });
+    assert!(
+        rerun.is_ok(),
+        "session must remain healthy after consumer callback abort"
+    );
+    assert_eq!(replay_count, 2);
+
+    let fiber_handle = store.fiber(fiber);
+    assert!(
+        fiber_handle.is_ok(),
+        "fiber point lookup must remain available"
+    );
+}
+
+#[test]
+fn test_for_each_envelope_transport_unavailable_does_not_poison_reader_session() {
+    let fail_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut engine = MockEngine {
+        fail_reads_with_transport_unavailable: fail_flag.clone(),
+        ..Default::default()
+    };
+    let fiber = [0x77; 16];
+    let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"payload-1").unwrap();
+    let mut env1_bytes = Vec::new();
+    e1.encode(&mut env1_bytes);
+    engine.append_block(&env1_bytes).unwrap();
+
+    let mut store = Store::open_reader(engine);
+
+    fail_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let res = store.for_each_envelope(|_env| Ok(()));
+    assert_eq!(
+        *res.unwrap_err().condition(),
+        FailureCondition::TransportUnavailable
+    );
+
+    fail_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    let mut count = 0;
+    let rerun = store.for_each_envelope(|_env| {
+        count += 1;
+        Ok(())
+    });
+    assert!(
+        rerun.is_ok(),
+        "session must not be poisoned by transient transport unavailable"
+    );
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn test_for_each_envelope_positive_corruption_poisons_reader_session_terminally() {
+    let mut engine = MockEngine::default();
+    let fiber = [0x66; 16];
+    let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"payload-1").unwrap();
+    let mut env1_bytes = Vec::new();
+    e1.encode(&mut env1_bytes);
+    engine.append_block(&env1_bytes).unwrap();
+    engine.append_block(b"short-corrupt-frame").unwrap();
+
+    let mut store = Store::open_reader(engine);
+
+    let res = store.for_each_envelope(|_env| Ok(()));
+    assert!(res.is_err());
+    assert_eq!(
+        *res.unwrap_err().condition(),
+        FailureCondition::EnvelopeMismatch
+    );
+
+    let subsequent = store.for_each_envelope(|_env| Ok(()));
+    let err = subsequent.unwrap_err();
+    assert_eq!(*err.condition(), FailureCondition::EnvelopeMismatch);
+    assert!(err
+        .diagnostic_detail()
+        .message()
+        .contains("retained broken state"));
+
+    let fiber_res = store.fiber(fiber);
+    let fiber_err = fiber_res.unwrap_err();
+    assert_eq!(*fiber_err.condition(), FailureCondition::EnvelopeMismatch);
+    assert!(fiber_err
+        .diagnostic_detail()
+        .message()
+        .contains("retained broken state"));
+}
+
+#[test]
+fn test_m4_impossible_engine_batch_count_is_refused_by_store() {
+    #[derive(Debug, Default)]
+    struct RogueBatchEngine {
+        epoch: u64,
+    }
+    impl StorageEngine for RogueBatchEngine {
+        fn carried_epoch(&self) -> u64 {
+            self.epoch
+        }
+        fn append_block(
+            &mut self,
+            _b: &[u8],
+        ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
+            Ok(WriteLandingVerdict::Landed(1))
+        }
+        fn append_batch_detailed(&mut self, _b: &[&[u8]]) -> BatchLandingVerdict<u64> {
+            BatchLandingVerdict::Undetermined {
+                landed_count: 1,
+                carried_epoch: self.epoch,
+            }
+        }
+        fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
+            Ok(Vec::new())
+        }
+        fn is_retired(&self) -> Result<bool, OperationFailure> {
+            Ok(false)
+        }
+        fn sync(&mut self) -> Result<(), OperationFailure> {
+            Ok(())
+        }
+        fn uncertain_diagnostic(&self) -> Option<&str> {
+            None
+        }
+        fn claim(&self) -> Option<&OwnershipClaimRecord> {
+            None
+        }
+        fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
+            None
+        }
+        fn set_schema_descriptor(&mut self, _d: &SchemaDescriptor) -> Result<(), OperationFailure> {
+            Ok(())
+        }
+        fn record_meta_record(&mut self, _r: &OwnershipRecord) -> Result<(), OperationFailure> {
+            Ok(())
+        }
+        fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
+            None
+        }
+        fn inbound_pointer(&self) -> Option<&InboundPointerRecord> {
+            None
+        }
+        fn migration_start(&self) -> Option<&MigrationStartRecord> {
+            None
+        }
+        fn migration_end(&self) -> Option<&MigrationEndRecord> {
+            None
+        }
+        fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
+            None
+        }
+    }
+
+    let fiber = [0x55; 16];
+    let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"valid-1").unwrap();
+    let mut e1_buf = Vec::new();
+    e1.encode(&mut e1_buf);
+
+    let mut store = Store::open_writer(RogueBatchEngine { epoch: 1 }).unwrap();
+    let err = store.append_batch_detailed(&[&e1_buf]).unwrap_err();
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::PrecursorChainBroken(None)
+    );
+    assert!(err
+        .diagnostic_detail()
+        .message()
+        .contains("impossible batch landed_count"));
+}
+
+#[test]
+fn test_m3_consumer_callback_returning_precursor_chain_broken_does_not_poison_reader() {
+    let mut engine = MockEngine::default();
+    let fiber = [0x44; 16];
+    let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"payload-1").unwrap();
+    let mut env1_bytes = Vec::new();
+    e1.encode(&mut env1_bytes);
+    engine.append_block(&env1_bytes).unwrap();
+
+    let mut store = Store::open_reader(engine);
+
+    let res = store.for_each_envelope(|_env| {
+        Err(OperationFailure::new(
+            FailureCondition::PrecursorChainBroken(None),
+            "consumer callback returned precursor break for internal domain reason",
+        ))
+    });
+    assert_eq!(
+        *res.unwrap_err().condition(),
+        FailureCondition::PrecursorChainBroken(None)
+    );
+
+    let rerun = store.for_each_envelope(|_env| Ok(()));
+    assert!(
+        rerun.is_ok(),
+        "reader session must not be poisoned when callback returns precursor broken"
+    );
+    assert!(store.fiber(fiber).is_ok());
+}
+
+#[test]
+fn test_m14_session_index_refuses_when_reader_retains_broken_state() {
+    let mut engine = MockEngine::default();
+    let fiber = [0x33; 16];
+    let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"payload-1").unwrap();
+    let mut env1_bytes = Vec::new();
+    e1.encode(&mut env1_bytes);
+    engine.append_block(&env1_bytes).unwrap();
+    engine.append_block(b"broken-frame").unwrap();
+
+    let mut store = Store::open_reader(engine);
+    store
+        .for_each_envelope(|_env| Ok(()))
+        .expect_err("visitor must fail on corrupt frame");
+
+    let idx_err = store.session_index().unwrap_err();
+    assert_eq!(*idx_err.condition(), FailureCondition::EnvelopeMismatch);
+    assert!(idx_err
+        .diagnostic_detail()
+        .message()
+        .contains("retained broken state"));
+}
+
+#[test]
+fn test_h1_open_reader_with_transport_unavailable_refuses_point_lookups_and_recovers_atomically() {
+    let fail_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let fiber = [0x22; 16];
+    let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"payload-h1").unwrap();
+    let mut env1_bytes = Vec::new();
+    e1.encode(&mut env1_bytes);
+
+    let engine = MockEngine {
+        blocks: vec![env1_bytes],
+        fail_reads_with_transport_unavailable: fail_flag.clone(),
+        ..Default::default()
+    };
+
+    let mut store = Store::open_reader(engine);
+
+    let get_err = store.get_latest(fiber).unwrap_err();
+    assert_eq!(*get_err.condition(), FailureCondition::TransportUnavailable);
+
+    let fiber_err = store.fiber(fiber).unwrap_err();
+    assert_eq!(
+        *fiber_err.condition(),
+        FailureCondition::TransportUnavailable
+    );
+
+    let idx_err = store.session_index().unwrap_err();
+    assert_eq!(*idx_err.condition(), FailureCondition::TransportUnavailable);
+
+    fail_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut seen = Vec::new();
+    let res = store.for_each_envelope(|env| {
+        seen.push(env.header.event_id);
+        Ok(())
+    });
+    assert!(
+        res.is_ok(),
+        "for_each_envelope must succeed after transport recovers"
+    );
+    assert_eq!(seen, vec![[1u8; 16]]);
+
+    let latest = store
+        .get_latest(fiber)
+        .expect("get_latest must succeed")
+        .expect("envelope present");
+    assert_eq!(latest.header.event_id, [1u8; 16]);
+
+    let handle = store.fiber(fiber).expect("fiber must succeed");
+    assert_eq!(handle.event_count(), 1);
+
+    let idx = store.session_index().expect("session_index must succeed");
+    assert_eq!(idx.event_count(&fiber).unwrap(), 1);
+
+    assert_eq!(store.rolling_commitment().frame_count(), 1);
 }

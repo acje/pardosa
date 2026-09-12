@@ -4,6 +4,7 @@
 //! Usage: cargo run --bin meadows-check -- [--meadows <tsv>] [--owners <tsv>]
 //! Output: tab-separated ROW / LAYER / TIER / SUMMARY records, plus FAIL records on
 //! any violation. Exits 0 when every check passes, 1 otherwise.
+#![allow(clippy::pedantic)]
 
 use std::collections::BTreeMap;
 use std::fmt;

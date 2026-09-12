@@ -1,8 +1,9 @@
 //! Container format and framing for Pardosa artefacts.
 
 use crate::encoding::{
-    DecodeError, EventEnvelope, InboundPointerRecord, MigrationEndRecord, MigrationStartRecord,
-    OutboundPointerRecord, OwnershipClaimRecord, OwnershipRecord, RescuePolicyChoiceRecord,
+    DecodeError, EventEnvelope, EventEnvelopeRef, InboundPointerRecord, MigrationEndRecord,
+    MigrationStartRecord, OutboundPointerRecord, OwnershipClaimRecord, OwnershipRecord,
+    RescuePolicyChoiceRecord,
 };
 use crate::schema::{DescriptorNode, SchemaDescriptor};
 use crate::store::{
@@ -630,11 +631,14 @@ impl FileStorageAdapter {
             exclusion_policy: self.exclusion_policy,
             locked: true,
             frame_count: 0,
+            read_all_count: 0,
             uncertain: false,
             uncertain_diagnostic: None,
             simulate_indeterminate: false,
             simulate_sync_error: false,
             simulate_write_error: false,
+            fail_after_n_blocks: None,
+            undetermined_after_n_blocks: None,
         };
 
         let store = Store::open_writer(engine)?;
@@ -760,11 +764,14 @@ impl FileStorageAdapter {
             exclusion_policy: self.exclusion_policy,
             locked: true,
             frame_count: 0,
+            read_all_count: 0,
             uncertain: false,
             uncertain_diagnostic: None,
             simulate_indeterminate: false,
             simulate_sync_error: false,
             simulate_write_error: false,
+            fail_after_n_blocks: None,
+            undetermined_after_n_blocks: None,
         };
 
         let store = Store::open_writer(engine)?;
@@ -859,7 +866,6 @@ impl FileStorageAdapter {
             )
         })?;
 
-        let frame_count = frames.len() as u64;
         let engine = FileEngine {
             file: Some(pgno_file),
             meta_path: self.meta_path.clone(),
@@ -870,12 +876,15 @@ impl FileStorageAdapter {
             meta_records: meta,
             exclusion_policy: self.exclusion_policy,
             locked: true,
-            frame_count,
+            frame_count: frames.len() as u64,
+            read_all_count: 0,
             uncertain: false,
             uncertain_diagnostic: None,
             simulate_indeterminate: false,
             simulate_sync_error: false,
             simulate_write_error: false,
+            fail_after_n_blocks: None,
+            undetermined_after_n_blocks: None,
         };
 
         let store = Store::open_writer(engine)?;
@@ -905,7 +914,7 @@ impl FileStorageAdapter {
 
         let admission = admit_open(presence, meta_records.latest_claim.clone(), false)?;
 
-        let (file, frames) = if self.pgno_path.exists() {
+        let (file, frame_count) = if self.pgno_path.exists() {
             let mut f = OpenOptions::new()
                 .read(true)
                 .open(&self.pgno_path)
@@ -922,12 +931,11 @@ impl FileStorageAdapter {
                     format!("failed to seek .pgno to start: {err}"),
                 )
             })?;
-            (Some(f), frames)
+            (Some(f), frames.len() as u64)
         } else {
-            (None, Vec::new())
+            (None, 0)
         };
 
-        let frame_count = frames.len() as u64;
         let engine = FileEngine {
             file,
             meta_path: self.meta_path.clone(),
@@ -939,11 +947,14 @@ impl FileStorageAdapter {
             exclusion_policy: FileExclusionPolicy::Standard,
             locked: false,
             frame_count,
+            read_all_count: 0,
             uncertain: false,
             uncertain_diagnostic: None,
             simulate_indeterminate: false,
             simulate_sync_error: false,
             simulate_write_error: false,
+            fail_after_n_blocks: None,
+            undetermined_after_n_blocks: None,
         };
 
         let store = Store::open_reader(engine);
@@ -1070,14 +1081,24 @@ pub struct FileEngine {
     exclusion_policy: FileExclusionPolicy,
     locked: bool,
     frame_count: u64,
+    read_all_count: usize,
     pub(crate) uncertain: bool,
     pub(crate) uncertain_diagnostic: Option<String>,
     pub(crate) simulate_indeterminate: bool,
     pub(crate) simulate_sync_error: bool,
     pub(crate) simulate_write_error: bool,
+    pub(crate) fail_after_n_blocks: Option<usize>,
+    pub(crate) undetermined_after_n_blocks: Option<usize>,
 }
 
 impl FileEngine {
+    /// Returns the number of times `read_all` was invoked on this engine.
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    #[must_use]
+    pub fn read_all_count(&self) -> usize {
+        self.read_all_count
+    }
+
     /// Returns the path to the ownership record file (.meta).
     #[must_use]
     pub fn meta_path(&self) -> &Path {
@@ -1157,10 +1178,38 @@ impl StorageEngine for FileEngine {
             });
         }
 
+        if let Some(limit) = self.undetermined_after_n_blocks {
+            if (self.frame_count as usize) >= limit {
+                self.uncertain = true;
+                self.uncertain_diagnostic = Some(
+                    "write landing undetermined: simulated indeterminate write landing".to_string(),
+                );
+                return Ok(WriteLandingVerdict::Undetermined {
+                    carried_epoch: self.carried_epoch,
+                });
+            }
+        }
+
+        if let Some(limit) = self.fail_after_n_blocks {
+            if (self.frame_count as usize) >= limit {
+                return Err(OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    "simulated write failure after limit",
+                ));
+            }
+        }
+
         let file = self.file.as_mut().ok_or_else(|| {
             OperationFailure::new(
                 FailureCondition::OwnershipUnestablished,
                 "no file open for writing",
+            )
+        })?;
+
+        file.seek(SeekFrom::End(0)).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::PrecursorChainBroken(None),
+                format!("failed to seek to end of container: {err}"),
             )
         })?;
 
@@ -1200,72 +1249,8 @@ impl StorageEngine for FileEngine {
         Ok(WriteLandingVerdict::Landed(self.frame_count))
     }
 
-    fn append_batch(
-        &mut self,
-        blocks: &[&[u8]],
-    ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-        self.check_authority()?;
-
-        if blocks.is_empty() {
-            return Ok(WriteLandingVerdict::Landed(self.frame_count));
-        }
-
-        if self.simulate_indeterminate {
-            self.uncertain = true;
-            self.uncertain_diagnostic = Some(
-                "write landing undetermined: simulated indeterminate write landing".to_string(),
-            );
-            return Ok(WriteLandingVerdict::Undetermined {
-                carried_epoch: self.carried_epoch,
-            });
-        }
-
-        let file = self.file.as_mut().ok_or_else(|| {
-            OperationFailure::new(
-                FailureCondition::OwnershipUnestablished,
-                "no file open for writing",
-            )
-        })?;
-
-        for block in blocks {
-            let write_res = if self.simulate_write_error {
-                Err(std::io::Error::other("simulated write_all failure"))
-            } else {
-                file.write_all(block)
-            };
-
-            if let Err(err) = write_res {
-                self.uncertain = true;
-                self.uncertain_diagnostic = Some(format!(
-                    "write_all failed; write landing undetermined: {err}"
-                ));
-                return Ok(WriteLandingVerdict::Undetermined {
-                    carried_epoch: self.carried_epoch,
-                });
-            }
-        }
-
-        let sync_res = if self.simulate_sync_error {
-            Err(std::io::Error::other("simulated sync_data failure"))
-        } else {
-            file.sync_data()
-        };
-
-        if let Err(err) = sync_res {
-            self.uncertain = true;
-            self.uncertain_diagnostic = Some(format!(
-                "sync_data failed; write landing undetermined: {err}"
-            ));
-            return Ok(WriteLandingVerdict::Undetermined {
-                carried_epoch: self.carried_epoch,
-            });
-        }
-
-        self.frame_count += blocks.len() as u64;
-        Ok(WriteLandingVerdict::Landed(self.frame_count))
-    }
-
     fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
+        self.read_all_count += 1;
         let Some(file) = &mut self.file else {
             return Ok(Vec::new());
         };
@@ -1283,6 +1268,51 @@ impl StorageEngine for FileEngine {
             )
         })?;
         Ok(frames)
+    }
+
+    fn read_chunk(
+        &mut self,
+        start_index: u64,
+        max_items: usize,
+    ) -> Result<Vec<Vec<u8>>, OperationFailure> {
+        if max_items == 0 {
+            return Ok(Vec::new());
+        }
+        let all = self.read_all()?;
+        let start = usize::try_from(start_index).unwrap_or(usize::MAX);
+        if start >= all.len() {
+            return Ok(Vec::new());
+        }
+        let end = start.saturating_add(max_items).min(all.len());
+        Ok(all[start..end].to_vec())
+    }
+
+    fn recover_frames(
+        &mut self,
+        _chunk_size: usize,
+        on_frame: &mut crate::store::FrameRecoveryCallback<'_>,
+    ) -> Result<u64, OperationFailure> {
+        let Some(file) = &mut self.file else {
+            return Ok(0);
+        };
+        file.seek(SeekFrom::Start(0)).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::NoArtefactExists,
+                format!("failed to seek container file: {err}"),
+            )
+        })?;
+        let (_header, frames, _) = read_container_frames(file)?;
+        file.seek(SeekFrom::End(0)).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::PrecursorChainBroken(None),
+                format!("failed to seek to end of container: {err}"),
+            )
+        })?;
+        self.frame_count = frames.len() as u64;
+        for (pos, frame) in frames.iter().enumerate() {
+            on_frame(pos as u64, frame)?;
+        }
+        Ok(frames.len() as u64)
     }
 
     fn acquire_exclusion(&mut self) -> Result<(), OperationFailure> {
@@ -1548,6 +1578,30 @@ impl FileWriterSession {
         self.store.engine.simulate_write_error = simulate;
         self
     }
+
+    /// Configures whether to simulate an indeterminate write landing after N landed blocks.
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    #[must_use]
+    pub fn with_undetermined_after_n_blocks(mut self, n: usize) -> Self {
+        self.store.engine.undetermined_after_n_blocks = Some(n);
+        self
+    }
+
+    /// Configures whether to simulate a write failure after N landed blocks.
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    #[must_use]
+    pub fn with_fail_after_n_blocks(mut self, n: usize) -> Self {
+        self.store.engine.fail_after_n_blocks = Some(n);
+        self
+    }
+
+    /// Reads a single raw block at the specified sequence or index from the container.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if reading fails or index is out of bounds.
+    pub fn read_block(&mut self, index: u64) -> Result<Vec<u8>, OperationFailure> {
+        self.store.read_block(index)
+    }
 }
 
 /// Reader session providing non-exclusive read-only access to an artefact container per C5.6, C5.11, and C6.14.
@@ -1582,6 +1636,14 @@ impl FileReaderSession {
         self.store.engine().meta_records()
     }
 
+    /// Reads a single raw block at the specified sequence or index from the container.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if reading fails or index is out of bounds.
+    pub fn read_block(&mut self, index: u64) -> Result<Vec<u8>, OperationFailure> {
+        self.store.read_block(index)
+    }
+
     /// Reads all framed payloads from the .pgno container file, validating CRC32C on each frame.
     ///
     /// # Errors
@@ -1606,6 +1668,28 @@ impl FileReaderSession {
         &mut self,
     ) -> Result<Vec<EventEnvelope>, OperationFailure> {
         self.store.read_all_envelopes_for_migration()
+    }
+
+    /// Iterates over all event envelopes sequentially using borrowed views without bulk allocation.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if reading fails, decoding fails, or the reader retained broken state.
+    pub fn for_each_envelope<F>(&mut self, f: F) -> Result<(), OperationFailure>
+    where
+        F: FnMut(EventEnvelopeRef<'_>) -> Result<(), OperationFailure>,
+    {
+        self.store.for_each_envelope(f)
+    }
+
+    /// Incrementally folds all event envelopes through a visitor closure using borrowed views.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if reading fails, decoding fails, or the reader retained broken state.
+    pub fn fold_envelopes<B, F>(&mut self, init: B, f: F) -> Result<B, OperationFailure>
+    where
+        F: FnMut(B, EventEnvelopeRef<'_>) -> Result<B, OperationFailure>,
+    {
+        self.store.fold_envelopes(init, f)
     }
 }
 

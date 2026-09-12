@@ -15,10 +15,10 @@ Procedural macro deriving compile-time `PardosaSchema` AST descriptors and binar
 The derive macro is applied to an `enum` representing domain events.
 
 ```rust
-use pardosa::encoding::EventString;
-use pardosa::schema::PardosaSchema;
+use pardosa::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, PardosaSchema)]
+#[repr(u8)]
 #[pardosa(version = 1)]
 pub enum OrderEvent {
     #[pardosa(tombstone)]
@@ -40,7 +40,7 @@ pub enum OrderEvent {
 ### Attributes
 
 - `#[pardosa(version = N)]`: Container-level attribute declaring the schema version (positive integer).
-- `#[pardosa(tombstone)]`: Variant-level attribute designating the migration tombstone variant. Exactly one variant must be designated.
+- `#[pardosa(tombstone)]`: Variant-level attribute designating the migration tombstone variant. A migration tombstone variant is designated with `#[pardosa(tombstone)]` (at least one tombstone required per C5.49).
 - Explicit integer discriminants: Every variant must declare an explicit integer discriminant (`Variant = 0`).
   - Discriminants `<= 255` use 1-byte wire representation.
   - Discriminants `> 255` use 2-byte little-endian wire representation.
@@ -50,7 +50,7 @@ pub enum OrderEvent {
 Input types are validated at compile time, rejecting unsupported shapes with actionable diagnostics:
 - **Enum Root Only**: Structs and unions are rejected as payload roots per C5.48 and C4.24. Payload data must be wrapped in an enum.
 - **Explicit Discriminants Required**: Every variant must have an explicit discriminant.
-- **Tombstone Required**: Exactly one variant must be marked with `#[pardosa(tombstone)]`.
+- **Tombstone Required**: A tombstone variant must be marked with `#[pardosa(tombstone)]`.
 - **Unbounded Types Rejected**: Raw `String`, unbounded `Vec`, and floating-point types (`f32`, `f64`) are excluded per C6.23. Use bounded alternatives such as `EventString<MAX>`, `NonEmptyEventString<MAX>`, `EventVec<T, MAX>`, `EventBytes<MAX>`, or fixed-width / scaled integers.
 - **Cyclic Types Detected**: Recursive types without indirection are detected and rejected per C6.22 (S4).
 

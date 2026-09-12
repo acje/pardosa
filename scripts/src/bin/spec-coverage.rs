@@ -7,6 +7,7 @@
 //! Output: tab-separated CHECK / SUMMARY records. Exits 0 on overall PASS, 1 on FAIL.
 //! Fail-open guard: an absent or empty spec document, or an empty trace table,
 //! MUST produce verdict FAIL.
+#![allow(clippy::pedantic)]
 
 use std::collections::{BTreeMap, BTreeSet};
 

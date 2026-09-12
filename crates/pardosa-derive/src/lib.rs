@@ -1,4 +1,5 @@
-//! Procedural macro crate for deriving PardosaSchema AST descriptors and codecs.
+//! Procedural macro crate for deriving `PardosaSchema` AST descriptors and codecs.
+#![allow(clippy::pedantic)]
 //!
 //! # Positive Definitions
 //!

@@ -16,21 +16,33 @@ NATS JetStream storage adapter for [Pardosa](https://crates.io/crates/pardosa).
 ## Usage Example
 
 ```rust
+use pardosa::prelude::*;
 use pardosa_nats::NatsStorageAdapter;
-use pardosa::store::Store;
-use pardosa::schema::derive_fiber_id;
 
-// Connect to NATS JetStream with customized subject routing
+// Connect to NATS JetStream with custom subject routing
 let adapter = NatsStorageAdapter::new("nats://127.0.0.1:4222", "tenant_orders")?
     .with_subjects("tenant.orders.meta", "tenant.orders.data");
 
-// Open storage pipeline with single-writer fencing
-let mut store = Store::open_writer(adapter)?;
+// Create writer session with single-writer fencing epoch
+let claim = OwnershipClaimRecord {
+    epoch: 1,
+    machine_id: [1u8; 16],
+    boot_id: [2u8; 16],
+    process_id: std::process::id() as u64,
+    process_start_time_ns: 1_000_000,
+    claim_time_ns: 2_000_000,
+    operator_label: "service-worker".to_string(),
+};
+let mut writer = adapter.create(&claim)?;
 
-// Append to entity fiber
-let fiber_id = derive_fiber_id("Order", "ord-9876");
-let mut fiber = store.fiber(fiber_id)?;
-fiber.append_event(b"{\"status\":\"confirmed\"}")?;
+// Derive deterministic fiber ID and append event
+let fiber_id = derive_fiber_id("order-9876");
+let event_id = [1u8; 16]; // 16-byte UUIDv7
+let payload = b"{\"status\":\"confirmed\"}";
+let verdict = writer.append_to_fiber(fiber_id, event_id, payload)?;
+if let WriteLandingVerdict::Landed(envelope) = verdict {
+    println!("Landed event ID {:?}", envelope.header.event_id);
+}
 ```
 
 ## Error Handling & Remedies

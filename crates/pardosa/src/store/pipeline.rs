@@ -1,8 +1,9 @@
 //! Unified storage pipeline owning fiber handles, caching, and state verification per C5 and C6.
 
 use crate::encoding::{
-    EventEnvelope, InboundPointerRecord, MigrationEndRecord, MigrationStartRecord,
-    OutboundPointerRecord, OwnershipClaimRecord, OwnershipRecord, RescuePolicyChoiceRecord,
+    EventEnvelope, EventEnvelopeRef, InboundPointerRecord, MigrationEndRecord,
+    MigrationStartRecord, OutboundPointerRecord, OwnershipClaimRecord, OwnershipRecord,
+    RescuePolicyChoiceRecord,
 };
 use crate::file::{ContainerFrame, RollingCommitment};
 use crate::schema::{derive_fiber_id, SchemaDescriptor};
@@ -11,6 +12,8 @@ use crate::store::fiber_handle::FiberHandle;
 use crate::store::session_index::SessionIndex;
 use crate::store::{FailureCondition, OpenAdmission, OperationFailure, WriteLandingVerdict};
 use std::fmt;
+
+pub use crate::store::BatchLandingVerdict;
 
 /// Unified storage pipeline owning fiber handles, caching, and state verification per C5 and C6.
 pub struct Store<E: StorageEngine> {
@@ -37,14 +40,14 @@ impl<E: StorageEngine> Store<E> {
     /// # Errors
     /// Returns [`OperationFailure`] if reading existing frames or rebuilding session index fails.
     pub fn open_writer(mut engine: E) -> Result<Self, OperationFailure> {
-        let frames = engine.read_all()?;
-        let fiber_index = SessionIndex::build_from_frames(frames.iter().map(|f| f.as_slice()))?;
         let mut rolling_commitment = RollingCommitment::new();
-        for frame in &frames {
+        let mut fiber_index = SessionIndex::new();
+        engine.recover_frames(64, &mut |_seq, frame| {
             let mut frame_buf = Vec::new();
             ContainerFrame::encode_payload(frame, &mut frame_buf);
             rolling_commitment.update_frame(&frame_buf);
-        }
+            fiber_index.process_frame(frame)
+        })?;
         Ok(Self {
             engine,
             rolling_commitment,
@@ -56,28 +59,39 @@ impl<E: StorageEngine> Store<E> {
     /// Opens a reader storage pipeline by deriving state from the engine.
     #[must_use]
     pub fn open_reader(mut engine: E) -> Self {
-        let frames_res = engine.read_all();
-        match frames_res {
-            Ok(frames) => {
-                let mut rolling = RollingCommitment::new();
-                for frame in &frames {
-                    let mut frame_buf = Vec::new();
-                    ContainerFrame::encode_payload(frame, &mut frame_buf);
-                    rolling.update_frame(&frame_buf);
+        let mut rolling = RollingCommitment::new();
+        let mut fiber_index = SessionIndex::new();
+        let mut broken_cause = None;
+
+        let res = engine.recover_frames(64, &mut |_seq, frame| {
+            let mut frame_buf = Vec::new();
+            ContainerFrame::encode_payload(frame, &mut frame_buf);
+            rolling.update_frame(&frame_buf);
+
+            if broken_cause.is_none() {
+                if let Err(err) = fiber_index.process_frame(frame) {
+                    broken_cause = Some(err.condition().clone());
                 }
-                match SessionIndex::build_from_frames(frames.iter().map(|f| f.as_slice())) {
-                    Ok(fiber_index) => Self {
+            }
+            Ok(())
+        });
+
+        match res {
+            Ok(_) => {
+                if let Some(cause) = broken_cause {
+                    Self {
+                        engine,
+                        rolling_commitment: rolling,
+                        fiber_index: SessionIndex::new(),
+                        broken_reader_cause: Some(cause),
+                    }
+                } else {
+                    Self {
                         engine,
                         rolling_commitment: rolling,
                         fiber_index,
                         broken_reader_cause: None,
-                    },
-                    Err(err) => Self {
-                        engine,
-                        rolling_commitment: rolling,
-                        fiber_index: SessionIndex::new(),
-                        broken_reader_cause: Some(err.condition().clone()),
-                    },
+                    }
                 }
             }
             Err(err) => Self {
@@ -127,6 +141,20 @@ impl<E: StorageEngine> Store<E> {
     #[must_use]
     pub fn rolling_commitment(&self) -> &RollingCommitment {
         &self.rolling_commitment
+    }
+
+    /// Returns a reference to the internal session index.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if the reader session has retained broken or unavailable state.
+    pub fn session_index(&self) -> Result<&SessionIndex, OperationFailure> {
+        if let Some(ref cause) = self.broken_reader_cause {
+            return Err(OperationFailure::new(
+                cause.clone(),
+                format!("reader session retained broken state: {cause}"),
+            ));
+        }
+        Ok(&self.fiber_index)
     }
 
     /// Returns the open admission mode for this session.
@@ -484,23 +512,24 @@ impl<E: StorageEngine> Store<E> {
         }
     }
 
-    /// Appends a batch of framed payload byte slices, returning a [`WriteLandingVerdict`].
+    /// Appends a batch of framed payload byte slices, returning detailed landing progress.
     ///
     /// # Errors
-    /// Returns [`OperationFailure`] if validation or storage write fails.
-    pub fn append_batch_verdict(
+    /// Returns [`OperationFailure`] if authority verification or pre-landing payload validation fails.
+    pub fn append_batch_detailed(
         &mut self,
         payloads: &[&[u8]],
-    ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
+    ) -> Result<BatchLandingVerdict<u64>, OperationFailure> {
         self.engine.check_authority()?;
         if payloads.is_empty() {
-            return Ok(WriteLandingVerdict::Landed(
-                self.rolling_commitment.frame_count(),
-            ));
+            return Ok(BatchLandingVerdict::LandedAll {
+                final_position: self.rolling_commitment.frame_count(),
+            });
         }
 
         let mut scratch_index = self.fiber_index.clone();
         let mut frame_buffers = Vec::with_capacity(payloads.len());
+        let mut decoded_envelopes = Vec::with_capacity(payloads.len());
 
         for payload in payloads {
             if payload.len() < 85 {
@@ -529,29 +558,110 @@ impl<E: StorageEngine> Store<E> {
             }
 
             scratch_index.validate_append(&env)?;
-            scratch_index.commit_envelope_unchecked(env);
+            scratch_index.commit_envelope_unchecked(env.clone());
 
             let mut frame_buf = Vec::new();
             ContainerFrame::encode_payload(payload, &mut frame_buf);
             frame_buffers.push(frame_buf);
+            decoded_envelopes.push(env);
         }
 
         let block_refs: Vec<&[u8]> = frame_buffers.iter().map(|f| f.as_slice()).collect();
-        let verdict = self.engine.append_batch(&block_refs)?;
+        let verdict = self.engine.append_batch_detailed(&block_refs);
 
         match verdict {
-            WriteLandingVerdict::Landed(_) => {
+            BatchLandingVerdict::LandedAll { final_position: _ } => {
                 for frame_buf in &frame_buffers {
                     self.rolling_commitment.update_frame(frame_buf);
                 }
                 self.fiber_index = scratch_index;
-                Ok(WriteLandingVerdict::Landed(
-                    self.rolling_commitment.frame_count(),
-                ))
+                Ok(BatchLandingVerdict::LandedAll {
+                    final_position: self.rolling_commitment.frame_count(),
+                })
             }
-            WriteLandingVerdict::Undetermined { carried_epoch } => {
+            BatchLandingVerdict::Undetermined {
+                landed_count,
+                carried_epoch,
+            } => {
+                if landed_count >= payloads.len() {
+                    return Err(OperationFailure::new(
+                        FailureCondition::PrecursorChainBroken(None),
+                        format!(
+                            "engine reported impossible batch landed_count {landed_count} for undetermined outcome on batch of length {}",
+                            payloads.len()
+                        ),
+                    ));
+                }
+                for i in 0..landed_count {
+                    self.rolling_commitment.update_frame(&frame_buffers[i]);
+                    self.fiber_index
+                        .commit_envelope_unchecked(decoded_envelopes[i].clone());
+                }
+                Ok(BatchLandingVerdict::Undetermined {
+                    landed_count,
+                    carried_epoch,
+                })
+            }
+            BatchLandingVerdict::PartialFailure {
+                landed_count,
+                error,
+            } => {
+                if landed_count >= payloads.len() {
+                    return Err(OperationFailure::new(
+                        FailureCondition::PrecursorChainBroken(None),
+                        format!(
+                            "engine reported impossible batch landed_count {landed_count} for partial failure on batch of length {}",
+                            payloads.len()
+                        ),
+                    ));
+                }
+                for i in 0..landed_count {
+                    self.rolling_commitment.update_frame(&frame_buffers[i]);
+                    self.fiber_index
+                        .commit_envelope_unchecked(decoded_envelopes[i].clone());
+                }
+                Ok(BatchLandingVerdict::PartialFailure {
+                    landed_count,
+                    error,
+                })
+            }
+        }
+    }
+
+    /// Appends a batch of event envelopes returning detailed landing progress.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if authority verification or pre-landing validation fails.
+    pub fn append_batch_envelopes_detailed(
+        &mut self,
+        envelopes: &[EventEnvelope],
+    ) -> Result<BatchLandingVerdict<u64>, OperationFailure> {
+        let mut encoded_payloads = Vec::with_capacity(envelopes.len());
+        for env in envelopes {
+            let mut env_buf = Vec::new();
+            env.encode(&mut env_buf);
+            encoded_payloads.push(env_buf);
+        }
+        let payload_refs: Vec<&[u8]> = encoded_payloads.iter().map(|p| p.as_slice()).collect();
+        self.append_batch_detailed(&payload_refs)
+    }
+
+    /// Appends a batch of framed payload byte slices, returning a [`WriteLandingVerdict`].
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if validation or storage write fails.
+    pub fn append_batch_verdict(
+        &mut self,
+        payloads: &[&[u8]],
+    ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
+        match self.append_batch_detailed(payloads)? {
+            BatchLandingVerdict::LandedAll { final_position } => {
+                Ok(WriteLandingVerdict::Landed(final_position))
+            }
+            BatchLandingVerdict::Undetermined { carried_epoch, .. } => {
                 Ok(WriteLandingVerdict::Undetermined { carried_epoch })
             }
+            BatchLandingVerdict::PartialFailure { error, .. } => Err(error),
         }
     }
 
@@ -577,14 +687,15 @@ impl<E: StorageEngine> Store<E> {
         &mut self,
         envelopes: &[EventEnvelope],
     ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-        let mut encoded_payloads = Vec::with_capacity(envelopes.len());
-        for env in envelopes {
-            let mut env_buf = Vec::new();
-            env.encode(&mut env_buf);
-            encoded_payloads.push(env_buf);
+        match self.append_batch_envelopes_detailed(envelopes)? {
+            BatchLandingVerdict::LandedAll { final_position } => {
+                Ok(WriteLandingVerdict::Landed(final_position))
+            }
+            BatchLandingVerdict::Undetermined { carried_epoch, .. } => {
+                Ok(WriteLandingVerdict::Undetermined { carried_epoch })
+            }
+            BatchLandingVerdict::PartialFailure { error, .. } => Err(error),
         }
-        let payload_refs: Vec<&[u8]> = encoded_payloads.iter().map(|p| p.as_slice()).collect();
-        self.append_batch_verdict(&payload_refs)
     }
 
     /// Appends a batch of event envelopes to the container after pre-landing validation.
@@ -673,6 +784,14 @@ impl<E: StorageEngine> Store<E> {
         }
     }
 
+    /// Reads a single raw block at the specified sequence or index from the underlying engine.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if reading fails or index is out of bounds.
+    pub fn read_block(&mut self, index: u64) -> Result<Vec<u8>, OperationFailure> {
+        self.engine.read_block(index)
+    }
+
     /// Reads all raw frame payloads from the container.
     ///
     /// # Errors
@@ -681,7 +800,9 @@ impl<E: StorageEngine> Store<E> {
         let frames = match self.engine.read_all() {
             Ok(f) => f,
             Err(err) => {
-                self.broken_reader_cause = Some(err.condition().clone());
+                if matches!(err.condition(), FailureCondition::PrecursorChainBroken(_)) {
+                    self.broken_reader_cause = Some(err.condition().clone());
+                }
                 return Err(err);
             }
         };
@@ -734,7 +855,9 @@ impl<E: StorageEngine> Store<E> {
         })();
 
         if let Err(ref err) = res {
-            self.broken_reader_cause = Some(err.condition().clone());
+            if matches!(err.condition(), FailureCondition::PrecursorChainBroken(_)) {
+                self.broken_reader_cause = Some(err.condition().clone());
+            }
         }
         res
     }
@@ -756,6 +879,135 @@ impl<E: StorageEngine> Store<E> {
     ) -> Result<Vec<EventEnvelope>, OperationFailure> {
         self.read_all_envelopes_inner(true)
     }
+
+    /// Iterates over all event envelopes sequentially using borrowed views without bulk allocation.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if reading fails, decoding fails, or the reader retained broken state.
+    pub fn for_each_envelope<F>(&mut self, mut f: F) -> Result<(), OperationFailure>
+    where
+        F: FnMut(EventEnvelopeRef<'_>) -> Result<(), OperationFailure>,
+    {
+        if let Some(ref cause) = self.broken_reader_cause {
+            if !matches!(cause, FailureCondition::TransportUnavailable) {
+                return Err(OperationFailure::new(
+                    cause.clone(),
+                    "reader session retained broken state; point lookups unavailable",
+                ));
+            }
+        }
+
+        if self.fiber_index.has_broken_fibers() {
+            return Err(OperationFailure::new(
+                FailureCondition::PrecursorChainBroken(None),
+                "discovered break in precursor chain",
+            ));
+        }
+
+        let mut validation_index = SessionIndex::new();
+        let mut rolling = RollingCommitment::new();
+        let mut broken_error = None;
+        let mut callback_error = None;
+
+        let res = self.engine.recover_frames(64, &mut |_seq, frame| {
+            if frame.len() < 85 {
+                let err = OperationFailure::new(
+                    FailureCondition::EnvelopeMismatch,
+                    format!("frame length < 85 bytes: {}", frame.len()),
+                );
+                broken_error = Some(err.clone());
+                return Err(err);
+            }
+            let (env_ref, consumed) = EventEnvelopeRef::decode(frame).map_err(|err| {
+                let op_err = OperationFailure::new(
+                    FailureCondition::EnvelopeMismatch,
+                    format!("failed to decode envelope: {err}"),
+                );
+                broken_error = Some(op_err.clone());
+                op_err
+            })?;
+            if consumed != frame.len() {
+                let err = OperationFailure::new(
+                    FailureCondition::EnvelopeMismatch,
+                    format!(
+                        "frame decode error: {}",
+                        crate::encoding::DecodeError::TruncatedPayload {
+                            expected: frame.len(),
+                            available: consumed,
+                        }
+                    ),
+                );
+                broken_error = Some(err.clone());
+                return Err(err);
+            }
+
+            let owned_env = env_ref.to_owned();
+            if let Err(val_err) = validation_index.validate_append(&owned_env) {
+                broken_error = Some(val_err.clone());
+                return Err(val_err);
+            }
+            validation_index.commit_envelope_unchecked(owned_env);
+
+            let mut frame_buf = Vec::new();
+            ContainerFrame::encode_payload(frame, &mut frame_buf);
+            rolling.update_frame(&frame_buf);
+
+            match f(env_ref) {
+                Ok(()) => Ok(()),
+                Err(cb_err) => {
+                    callback_error = Some(cb_err.clone());
+                    Err(cb_err)
+                }
+            }
+        });
+
+        if let Some(cb_err) = callback_error {
+            return Err(cb_err);
+        }
+
+        if let Some(err) = broken_error {
+            self.broken_reader_cause = Some(err.condition().clone());
+            return Err(err);
+        }
+
+        match res {
+            Ok(_) => {
+                self.fiber_index = validation_index;
+                self.rolling_commitment = rolling;
+                self.broken_reader_cause = None;
+                Ok(())
+            }
+            Err(engine_err) => {
+                if !matches!(
+                    engine_err.condition(),
+                    FailureCondition::TransportUnavailable
+                ) {
+                    self.broken_reader_cause = Some(engine_err.condition().clone());
+                }
+                Err(engine_err)
+            }
+        }
+    }
+
+    /// Incrementally folds all event envelopes through a visitor closure using borrowed views.
+    ///
+    /// This avoids materializing a full `Vec<EventEnvelope>` in memory, allowing projections
+    /// to be built with bounded transfer memory.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if reading fails, decoding fails, or the reader retained broken state.
+    pub fn fold_envelopes<B, F>(&mut self, init: B, mut f: F) -> Result<B, OperationFailure>
+    where
+        F: FnMut(B, EventEnvelopeRef<'_>) -> Result<B, OperationFailure>,
+    {
+        let mut acc = Some(init);
+        self.for_each_envelope(|env| {
+            let current = acc.take().expect("accumulator present");
+            acc = Some(f(current, env)?);
+            Ok(())
+        })?;
+        Ok(acc.expect("accumulator present"))
+    }
 }
 
 #[cfg(test)]
@@ -773,6 +1025,8 @@ mod tests {
         claim: Option<OwnershipClaimRecord>,
         admission: OpenAdmission,
         meta_records: crate::file::MetaRecords,
+        fail_after_n_blocks: Option<usize>,
+        undetermined_after_n_blocks: Option<usize>,
     }
 
     impl Default for InMemoryEngine {
@@ -786,6 +1040,8 @@ mod tests {
                 claim: None,
                 admission: OpenAdmission::Ready,
                 meta_records: crate::file::MetaRecords::default(),
+                fail_after_n_blocks: None,
+                undetermined_after_n_blocks: None,
             }
         }
     }
@@ -816,18 +1072,22 @@ mod tests {
             block: &[u8],
         ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
             self.check_authority()?;
-            self.blocks.push(block.to_vec());
-            Ok(WriteLandingVerdict::Landed(self.blocks.len() as u64))
-        }
-
-        fn append_batch(
-            &mut self,
-            blocks: &[&[u8]],
-        ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-            self.check_authority()?;
-            for block in blocks {
-                self.blocks.push(block.to_vec());
+            if let Some(limit) = self.undetermined_after_n_blocks {
+                if self.blocks.len() >= limit {
+                    return Ok(WriteLandingVerdict::Undetermined {
+                        carried_epoch: self.epoch,
+                    });
+                }
             }
+            if let Some(limit) = self.fail_after_n_blocks {
+                if self.blocks.len() >= limit {
+                    return Err(OperationFailure::new(
+                        FailureCondition::PrecursorChainBroken(None),
+                        "simulated append failure",
+                    ));
+                }
+            }
+            self.blocks.push(block.to_vec());
             Ok(WriteLandingVerdict::Landed(self.blocks.len() as u64))
         }
 
@@ -1165,5 +1425,387 @@ mod tests {
         assert_eq!(h1.event_count(), 2);
         let h2 = store_batch.fiber(fiber2).expect("fiber2");
         assert_eq!(h2.event_count(), 1);
+    }
+
+    #[test]
+    fn test_store_append_batch_detailed_partial_landing_and_undetermined() {
+        let fiber1 = [0x51; 16];
+        let env1 = EventEnvelope::genesis([0x01; 16], fiber1, b"f1-genesis".to_vec())
+            .expect("env1 genesis");
+        let env2 =
+            EventEnvelope::chain(&env1, [0x02; 16], b"f1-event2".to_vec()).expect("env2 chain");
+        let env3 =
+            EventEnvelope::chain(&env2, [0x03; 16], b"f1-event3".to_vec()).expect("env3 chain");
+        let env4 =
+            EventEnvelope::chain(&env3, [0x04; 16], b"f1-event4".to_vec()).expect("env4 chain");
+
+        let mut store = Store::open_writer(InMemoryEngine {
+            epoch: 1,
+            undetermined_after_n_blocks: Some(2),
+            ..Default::default()
+        })
+        .expect("open store");
+
+        let verdict = store
+            .append_batch_envelopes_detailed(&[
+                env1.clone(),
+                env2.clone(),
+                env3.clone(),
+                env4.clone(),
+            ])
+            .expect("batch detailed returns verdict");
+        assert_eq!(
+            verdict,
+            BatchLandingVerdict::Undetermined {
+                landed_count: 2,
+                carried_epoch: 1,
+            }
+        );
+        assert_eq!(verdict.unattempted_count(4), 1);
+        assert_eq!(store.rolling_commitment().frame_count(), 2);
+        let h = store.fiber(fiber1).expect("fiber1");
+        assert_eq!(h.event_count(), 2);
+        let latest = store.get_latest(fiber1).expect("latest").expect("env");
+        assert_eq!(latest.header.event_id, env2.header.event_id);
+
+        let mut store_ok = Store::open_writer(InMemoryEngine {
+            epoch: 1,
+            ..Default::default()
+        })
+        .expect("open store ok");
+
+        let verdict_all = store_ok
+            .append_batch_envelopes_detailed(&[env1.clone(), env2.clone(), env3.clone()])
+            .expect("batch detailed succeeds");
+        assert_eq!(
+            verdict_all,
+            BatchLandingVerdict::LandedAll { final_position: 3 }
+        );
+        assert_eq!(verdict_all.landed_count(3), 3);
+        assert_eq!(verdict_all.unattempted_count(3), 0);
+        assert_eq!(store_ok.rolling_commitment().frame_count(), 3);
+        let h_ok = store_ok.fiber(fiber1).expect("fiber1");
+        assert_eq!(h_ok.event_count(), 3);
+    }
+
+    #[test]
+    fn test_store_append_batch_detailed_partial_landing_failure() {
+        let fiber1 = [0x52; 16];
+        let env1 = EventEnvelope::genesis([0x01; 16], fiber1, b"f1-genesis".to_vec())
+            .expect("env1 genesis");
+        let env2 =
+            EventEnvelope::chain(&env1, [0x02; 16], b"f1-event2".to_vec()).expect("env2 chain");
+        let env3 =
+            EventEnvelope::chain(&env2, [0x03; 16], b"f1-event3".to_vec()).expect("env3 chain");
+        let env4 =
+            EventEnvelope::chain(&env3, [0x04; 16], b"f1-event4".to_vec()).expect("env4 chain");
+        let env5 =
+            EventEnvelope::chain(&env4, [0x05; 16], b"f1-event5".to_vec()).expect("env5 chain");
+
+        let mut store = Store::open_writer(InMemoryEngine {
+            epoch: 1,
+            fail_after_n_blocks: Some(2),
+            ..Default::default()
+        })
+        .expect("open store");
+
+        let verdict = store
+            .append_batch_envelopes_detailed(&[
+                env1.clone(),
+                env2.clone(),
+                env3.clone(),
+                env4.clone(),
+                env5.clone(),
+            ])
+            .expect("batch detailed returns partial failure verdict");
+
+        match &verdict {
+            BatchLandingVerdict::PartialFailure {
+                landed_count,
+                error,
+            } => {
+                assert_eq!(*landed_count, 2);
+                assert_eq!(verdict.unattempted_count(5), 2);
+                assert_eq!(
+                    *error.condition(),
+                    FailureCondition::PrecursorChainBroken(None)
+                );
+            }
+            other => panic!("expected PartialFailure, got {other:?}"),
+        }
+
+        assert_eq!(store.rolling_commitment().frame_count(), 2);
+        let h = store.fiber(fiber1).expect("fiber1");
+        assert_eq!(h.event_count(), 2);
+        let latest = store.get_latest(fiber1).expect("latest").expect("env");
+        assert_eq!(latest.header.event_id, env2.header.event_id);
+    }
+
+    #[test]
+    fn test_store_append_batch_detailed_empty_and_prevalidation() {
+        let mut store = Store::open_writer(InMemoryEngine {
+            epoch: 1,
+            ..Default::default()
+        })
+        .expect("open store");
+
+        let empty_res = store
+            .append_batch_detailed(&[])
+            .expect("empty batch succeeds");
+        assert_eq!(
+            empty_res,
+            BatchLandingVerdict::LandedAll { final_position: 0 }
+        );
+        assert_eq!(empty_res.landed_count(0), 0);
+        assert_eq!(empty_res.unattempted_count(0), 0);
+
+        let short_payload = [0u8; 10];
+        let short_err = store.append_batch_detailed(&[&short_payload]).unwrap_err();
+        assert_eq!(*short_err.condition(), FailureCondition::EnvelopeMismatch);
+    }
+
+    #[derive(Debug, Default)]
+    struct TrackingEngine {
+        inner: InMemoryEngine,
+        read_all_called: bool,
+        read_chunk_called: bool,
+    }
+
+    impl StorageEngine for TrackingEngine {
+        fn carried_epoch(&self) -> u64 {
+            self.inner.carried_epoch()
+        }
+
+        fn check_authority(&self) -> Result<(), OperationFailure> {
+            self.inner.check_authority()
+        }
+
+        fn append_block(
+            &mut self,
+            block: &[u8],
+        ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
+            self.inner.append_block(block)
+        }
+
+        fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
+            self.read_all_called = true;
+            self.inner.read_all()
+        }
+
+        fn read_chunk(
+            &mut self,
+            start_index: u64,
+            max_items: usize,
+        ) -> Result<Vec<Vec<u8>>, OperationFailure> {
+            self.read_chunk_called = true;
+            let start = usize::try_from(start_index).unwrap_or(usize::MAX);
+            if start >= self.inner.blocks.len() || max_items == 0 {
+                return Ok(Vec::new());
+            }
+            let end = start.saturating_add(max_items).min(self.inner.blocks.len());
+            let mut frames = Vec::new();
+            for block in &self.inner.blocks[start..end] {
+                let (payload, _) = ContainerFrame::decode(block).map_err(|err| {
+                    OperationFailure::new(
+                        FailureCondition::PrecursorChainBroken(None),
+                        format!("frame decode error: {err}"),
+                    )
+                })?;
+                frames.push(payload);
+            }
+            Ok(frames)
+        }
+
+        fn uncertain_diagnostic(&self) -> Option<&str> {
+            self.inner.uncertain_diagnostic()
+        }
+
+        fn claim(&self) -> Option<&OwnershipClaimRecord> {
+            self.inner.claim()
+        }
+
+        fn admission(&self) -> &OpenAdmission {
+            self.inner.admission()
+        }
+
+        fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
+            self.inner.schema_descriptor()
+        }
+
+        fn set_schema_descriptor(
+            &mut self,
+            descriptor: &SchemaDescriptor,
+        ) -> Result<(), OperationFailure> {
+            self.inner.set_schema_descriptor(descriptor)
+        }
+
+        fn record_meta_record(&mut self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
+            self.inner.record_meta_record(record)
+        }
+
+        fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
+            self.inner.outbound_pointer()
+        }
+
+        fn inbound_pointer(&self) -> Option<&InboundPointerRecord> {
+            self.inner.inbound_pointer()
+        }
+
+        fn migration_start(&self) -> Option<&MigrationStartRecord> {
+            self.inner.migration_start()
+        }
+
+        fn migration_end(&self) -> Option<&MigrationEndRecord> {
+            self.inner.migration_end()
+        }
+
+        fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
+            self.inner.rescue_policy_choice()
+        }
+
+        fn is_retired(&self) -> Result<bool, OperationFailure> {
+            self.inner.is_retired()
+        }
+
+        fn sync(&mut self) -> Result<(), OperationFailure> {
+            self.inner.sync()
+        }
+    }
+
+    #[test]
+    fn test_incremental_recovery_open_writer_and_reader_no_read_all() {
+        let mut store = Store::open_writer(InMemoryEngine {
+            epoch: 1,
+            ..Default::default()
+        })
+        .expect("open store");
+
+        let fiber1 = [0x11; 16];
+        let gen1_env = EventEnvelope::genesis([0x01; 16], fiber1, b"fiber1-msg1").unwrap();
+        let mut gen1 = Vec::new();
+        gen1_env.encode(&mut gen1);
+        let mut child1 = Vec::new();
+        EventEnvelope {
+            header: crate::encoding::EnvelopeHeader {
+                event_id: [0x02; 16],
+                fiber_id: fiber1,
+                detached: false,
+                precursor: [0x01; 16],
+                precursor_hash: gen1_env.commitment(),
+            },
+            payload: b"fiber1-msg2".to_vec(),
+        }
+        .encode(&mut child1);
+
+        store.append_frame(&gen1).expect("append gen1");
+        store.append_frame(&child1).expect("append child1");
+
+        let original_digest = store.rolling_commitment().current_commitment();
+        let original_frame_count = store.rolling_commitment().frame_count();
+
+        let engine_for_writer = TrackingEngine {
+            inner: InMemoryEngine {
+                epoch: 1,
+                blocks: store.engine().blocks.clone(),
+                ..Default::default()
+            },
+            read_all_called: false,
+            read_chunk_called: false,
+        };
+
+        let reopened_writer = Store::open_writer(engine_for_writer).expect("reopen writer");
+        assert!(
+            !reopened_writer.engine().read_all_called,
+            "open_writer must not call read_all"
+        );
+        assert!(
+            reopened_writer.engine().read_chunk_called,
+            "open_writer must call read_chunk"
+        );
+        assert_eq!(
+            reopened_writer.rolling_commitment().current_commitment(),
+            original_digest
+        );
+        assert_eq!(
+            reopened_writer.rolling_commitment().frame_count(),
+            original_frame_count
+        );
+
+        let engine_for_reader = TrackingEngine {
+            inner: InMemoryEngine {
+                epoch: 1,
+                blocks: store.engine().blocks.clone(),
+                ..Default::default()
+            },
+            read_all_called: false,
+            read_chunk_called: false,
+        };
+
+        let reopened_reader = Store::open_reader(engine_for_reader);
+        assert!(
+            !reopened_reader.engine().read_all_called,
+            "open_reader must not call read_all"
+        );
+        assert!(
+            reopened_reader.engine().read_chunk_called,
+            "open_reader must call read_chunk"
+        );
+        assert_eq!(
+            reopened_reader.rolling_commitment().current_commitment(),
+            original_digest
+        );
+        assert_eq!(
+            reopened_reader.rolling_commitment().frame_count(),
+            original_frame_count
+        );
+    }
+
+    #[test]
+    fn test_incremental_recovery_various_chunk_sizes() {
+        let mut store = Store::open_writer(InMemoryEngine {
+            epoch: 1,
+            ..Default::default()
+        })
+        .expect("open store");
+
+        let fiber = [0x77; 16];
+        for i in 1..=25u8 {
+            store
+                .append_to_fiber(fiber, [i; 16], format!("msg-{i}").into_bytes())
+                .expect("append");
+        }
+
+        let orig_digest = store.rolling_commitment().current_commitment();
+        let orig_count = store.rolling_commitment().frame_count();
+        assert_eq!(orig_count, 25);
+
+        for chunk_size in [1, 2, 3, 7, 16, 25, 50] {
+            let mut rolling = RollingCommitment::new();
+            let mut index = SessionIndex::new();
+            let mut engine = InMemoryEngine {
+                epoch: 1,
+                blocks: store.engine().blocks.clone(),
+                ..Default::default()
+            };
+
+            let count = engine
+                .recover_frames(chunk_size, &mut |_seq, frame| {
+                    let mut frame_buf = Vec::new();
+                    ContainerFrame::encode_payload(frame, &mut frame_buf);
+                    rolling.update_frame(&frame_buf);
+                    index.process_frame(frame)
+                })
+                .expect("recover frames");
+
+            assert_eq!(count, 25);
+            assert_eq!(rolling.current_commitment(), orig_digest);
+            assert_eq!(rolling.frame_count(), orig_count);
+
+            let handle = index.fiber(fiber).expect("fiber handle");
+            assert_eq!(handle.event_count(), 25);
+            assert_eq!(handle.precursor(), [25; 16]);
+            let latest = index.get_latest(&fiber).expect("latest").unwrap();
+            assert_eq!(latest.header.event_id, [25; 16]);
+        }
     }
 }

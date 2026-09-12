@@ -15,6 +15,29 @@ enum UserEvent {
 }
 
 #[test]
+fn test_readme_derived_order_event_compiles() {
+    #[derive(Debug, Clone, PartialEq, Eq, PardosaSchema)]
+    #[repr(u8)]
+    #[pardosa(version = 1)]
+    enum OrderEvent {
+        #[pardosa(tombstone)]
+        Tombstone = 0,
+        Created {
+            order_id: EventString<64>,
+            amount_cents: u64,
+        } = 1,
+        Shipped {
+            tracking_number: EventString<64>,
+        } = 2,
+        Cancelled = 3,
+    }
+
+    assert_eq!(OrderEvent::schema_version(), 1);
+    let identity = OrderEvent::schema_identity();
+    assert_ne!(identity.as_bytes(), &[0u8; 32]);
+}
+
+#[test]
 fn test_user_event_schema_version_and_identity() {
     assert_eq!(UserEvent::schema_version(), 1);
     let desc = UserEvent::schema_descriptor();

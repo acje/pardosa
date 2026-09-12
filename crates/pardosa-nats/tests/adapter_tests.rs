@@ -661,6 +661,108 @@ fn test_nats_reader_capability_no_transport_escape() {
     adapter.delete_streams().expect("cleanup");
 }
 
+fn run_rustc_nats(code: &str) -> (bool, String) {
+    use std::io::Write;
+    use std::process::Command;
+
+    let deps_dir = std::env::current_exe()
+        .expect("current test executable")
+        .parent()
+        .expect("parent deps directory")
+        .to_path_buf();
+
+    let entries = std::fs::read_dir(&deps_dir)
+        .unwrap_or_else(|e| panic!("failed to read deps dir {}: {e}", deps_dir.display()));
+    let mut nats_rlibs = Vec::new();
+    let mut pardosa_rlibs = Vec::new();
+    for entry in entries {
+        let entry = entry.unwrap();
+        let p = entry.path();
+        if let Some(s) = p.file_name().and_then(|n| n.to_str()) {
+            if s.starts_with("libpardosa_nats-") && s.ends_with(".rlib") {
+                nats_rlibs.push(p.clone());
+            } else if s.starts_with("libpardosa-") && s.ends_with(".rlib") {
+                pardosa_rlibs.push(p.clone());
+            }
+        }
+    }
+    nats_rlibs.sort_by_key(|p| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
+    pardosa_rlibs.sort_by_key(|p| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
+    let nats_rlib = nats_rlibs.pop().expect("libpardosa_nats rlib");
+    let pardosa_rlib = pardosa_rlibs.pop().expect("libpardosa rlib");
+
+    let rustc_cmd = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let mut cmd = Command::new(&rustc_cmd);
+    cmd.arg("--edition")
+        .arg("2021")
+        .arg("-L")
+        .arg(&deps_dir)
+        .arg("--extern")
+        .arg(format!("pardosa={}", pardosa_rlib.display()))
+        .arg("--extern")
+        .arg(format!("pardosa_nats={}", nats_rlib.display()))
+        .arg("--crate-type")
+        .arg("lib")
+        .arg("--emit")
+        .arg("mir=-")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().expect("spawn rustc");
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(code.as_bytes()).expect("write code");
+    }
+    let output = child.wait_with_output().expect("wait rustc");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+#[test]
+fn test_compile_fail_nats_reader_transport_escape() {
+    let client_escape_code = r#"
+        use pardosa_nats::NatsReaderSession;
+        pub fn run_invalid(reader: &NatsReaderSession) {
+            let _ = reader.engine().client();
+        }
+    "#;
+    let (client_ok, client_stderr) = run_rustc_nats(client_escape_code);
+    assert!(
+        !client_ok,
+        "NatsReaderSession::engine().client() must not exist (R2-H2)"
+    );
+    assert!(
+        client_stderr.contains("no method named `client`") || client_stderr.contains("E0599"),
+        "rejection must cite missing client method: {client_stderr}"
+    );
+
+    let positive_code = r#"
+        use pardosa_nats::NatsReaderSession;
+        pub fn run_valid(reader: &NatsReaderSession) {
+            let _ = reader.stem();
+            let _ = reader.meta_stream_name();
+            let _ = reader.data_stream_name();
+            let _ = reader.engine().stem();
+        }
+    "#;
+    let (pos_ok, pos_stderr) = run_rustc_nats(positive_code);
+    assert!(
+        pos_ok,
+        "valid NatsReaderSession methods must compile cleanly:\n{pos_stderr}"
+    );
+}
+
 #[test]
 fn test_nats_c8_2_schema_completeness() {
     let valid_schema = SchemaDescriptor::new(
@@ -762,6 +864,56 @@ fn test_nats_format_vectors_roundtrip() {
             adapter.delete_streams().expect("cleanup");
         }
     }
+}
+
+#[test]
+fn test_nats_create_append_then_read_in_same_session() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("same_sess_read");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
+    let claim = sample_claim(1);
+    let mut writer = adapter.create(&claim).expect("create writer");
+
+    let fiber = [0x42; 16];
+    let event_id1 = [1u8; 16];
+    let payload1 = b"event-data-1";
+    let v1 = writer
+        .append_to_fiber(fiber, event_id1, payload1)
+        .expect("append 1");
+    assert!(matches!(v1, WriteLandingVerdict::Landed(_)));
+
+    let b0 = writer
+        .read_block(0)
+        .expect("read_block(0) must succeed on same session");
+    let (env0, _) = EventEnvelope::decode(&b0).expect("decode envelope");
+    assert_eq!(env0.header.event_id, event_id1);
+    assert_eq!(&env0.payload, payload1);
+
+    let folded = writer
+        .fold_envelopes(Vec::new(), |mut acc, env| {
+            acc.push((env.header.event_id, env.payload.to_vec()));
+            Ok(acc)
+        })
+        .expect("fold in same session");
+    assert_eq!(folded.len(), 1);
+    assert_eq!(folded[0].0, event_id1);
+    assert_eq!(&folded[0].1, payload1);
+
+    let event_id2 = [2u8; 16];
+    let payload2 = b"event-data-2";
+    let v2 = writer
+        .append_to_fiber(fiber, event_id2, payload2)
+        .expect("append 2");
+    assert!(matches!(v2, WriteLandingVerdict::Landed(_)));
+
+    let b1 = writer
+        .read_block(1)
+        .expect("read_block(1) must succeed on same session");
+    let (env1, _) = EventEnvelope::decode(&b1).expect("decode envelope");
+    assert_eq!(env1.header.event_id, event_id2);
+    assert_eq!(&env1.payload, payload2);
+
+    adapter.delete_streams().expect("cleanup");
 }
 
 #[test]
@@ -1477,10 +1629,37 @@ fn test_nats_migration_read_rejects_malformed_envelope() {
 }
 
 #[test]
-fn test_nats_replay_constants_and_contract() {
-    use pardosa_nats::adapter::{MAX_CONCURRENT_FETCHES, MAX_REPLAY_BYTES};
-    assert_eq!(MAX_CONCURRENT_FETCHES, 32);
-    assert_eq!(MAX_REPLAY_BYTES, 64 * 1024 * 1024);
+fn test_readme_nats_storage_adapter_example_compiles() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("readme_nats");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem)
+        .expect("connect")
+        .with_subjects(format!("{stem}.meta"), format!("{stem}.data"));
+
+    let claim = OwnershipClaimRecord {
+        epoch: 1,
+        machine_id: [1u8; 16],
+        boot_id: [2u8; 16],
+        process_id: std::process::id() as u64,
+        process_start_time_ns: 1_000_000,
+        claim_time_ns: 2_000_000,
+        operator_label: "service-worker".to_string(),
+    };
+    let mut writer = adapter.create(&claim).expect("create writer");
+
+    let fiber_id = derive_fiber_id("order-9876");
+    let event_id = [1u8; 16];
+    let payload = b"{\"status\":\"confirmed\"}";
+    let verdict = writer
+        .append_to_fiber(fiber_id, event_id, payload)
+        .expect("append to fiber");
+    if let WriteLandingVerdict::Landed(envelope) = verdict {
+        assert_eq!(envelope.header.event_id, event_id);
+    } else {
+        panic!("expected landed verdict");
+    }
+
+    adapter.delete_streams().expect("cleanup");
 }
 
 #[test]
@@ -1540,34 +1719,229 @@ fn test_nats_replay_bounded_batching_exact_order_and_commitment() {
     adapter.delete_streams().expect("cleanup");
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BenchmarkEvent {
+    tag: String,
+}
+
+impl BenchmarkEvent {
+    fn decode(bytes: &[u8]) -> Result<Self, OperationFailure> {
+        let tag = std::str::from_utf8(bytes).map_err(|err| {
+            OperationFailure::new(FailureCondition::EnvelopeMismatch, err.to_string())
+        })?;
+        Ok(Self {
+            tag: tag.to_string(),
+        })
+    }
+}
+
 #[test]
-fn test_nats_replay_capacity_exhaustion_refusal() {
+fn test_nats_projection_replay_equivalence_baseline_vs_streaming() {
     let server = LiveNatsServer::acquire();
-    let stem = unique_stem("replay_cap_refusal");
+    let stem = unique_stem("proj_equiv");
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
     let claim = sample_claim(1);
     let mut writer = adapter.create(&claim).expect("create writer");
 
-    for _seq in 1..=10 {
-        let payload = vec![0xaa; 100];
-        writer.append_raw_frame(&payload).expect("append frame");
+    let frame_count = 100u64;
+    for seq in 1..=frame_count {
+        let env = sample_envelope(seq);
+        writer.append_envelope(&env).expect("append envelope");
     }
 
-    let rt = adapter.runtime().clone();
-    let js = adapter.jetstream().clone();
-    let data_stream = adapter.data_stream_name().to_string();
+    let mut reader_baseline = adapter.open_read().expect("open read baseline");
+    let envelopes = reader_baseline
+        .read_all_envelopes()
+        .expect("read all envelopes");
+    let mut baseline_projection = Vec::with_capacity(envelopes.len());
+    for env in envelopes {
+        let event = BenchmarkEvent::decode(&env.payload).expect("decode baseline");
+        baseline_projection.push((env.header.detached, env.header.fiber_id, event));
+    }
 
-    let err = rt
-        .block_on(async {
-            pardosa_nats::adapter::read_data_frames_async_bounded(&js, &data_stream, 32, 500).await
+    let mut reader_streaming = adapter.open_read().expect("open read streaming");
+    let streaming_projection = reader_streaming
+        .fold_envelopes(Vec::new(), |mut acc, env| {
+            let event = BenchmarkEvent::decode(env.payload).expect("decode streaming");
+            acc.push((env.header.detached, env.header.fiber_id, event));
+            Ok(acc)
         })
-        .expect_err("500 byte limit must be refused on 1000 byte total stream");
+        .expect("fold envelopes");
 
-    assert_eq!(*err.condition(), FailureCondition::RefusalDueToCapacity);
+    assert_eq!(baseline_projection.len(), frame_count as usize);
+    assert_eq!(streaming_projection.len(), frame_count as usize);
+    assert_eq!(baseline_projection, streaming_projection);
+
+    adapter.delete_streams().expect("cleanup");
+}
+
+#[test]
+fn test_nats_replay_corrupted_frame_refusal() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("replay_corrupt");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
+    let claim = sample_claim(1);
+    let mut writer = adapter.create(&claim).expect("create writer");
+
+    let env = sample_envelope(1);
+    writer.append_envelope(&env).expect("append valid envelope");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let server_url = server.url().to_string();
+    let data_subject = format!("{stem}_data");
+    rt.block_on(async {
+        let client = async_nats::connect(&server_url).await.unwrap();
+        let js = async_nats::jetstream::new(client);
+        js.publish(
+            data_subject,
+            bytes::Bytes::from_static(b"garbage_undecodable_frame"),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    });
+
+    let mut reader = adapter
+        .open_read()
+        .expect("open_read succeeds and tracks broken reader state per C5.28");
+    let err = reader
+        .read_all_frames()
+        .expect_err("read_all_frames must fail when data stream contains a corrupted frame");
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::PrecursorChainBroken(None)
+    );
     assert!(err
         .diagnostic_detail()
         .message()
-        .contains("replay byte limit exceeded"));
+        .contains("corrupted container frame"));
+
+    adapter.delete_streams().expect("cleanup");
+}
+
+#[test]
+fn test_nats_incremental_recovery_open_writer_and_reader_identical_state() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("nats_incremental_rec");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
+    let claim = sample_claim(1);
+    let mut writer = adapter.create(&claim).expect("create writer");
+
+    let fiber1 = [0x11; 16];
+    let fiber2 = [0x22; 16];
+    let fiber3 = [0x33; 16];
+
+    for i in 1..=5u8 {
+        let event_id = [i; 16];
+        let payload = format!("fiber1-event-{i}").into_bytes();
+        writer
+            .append_to_fiber(fiber1, event_id, payload)
+            .expect("append fiber1");
+    }
+
+    for i in 6..=10u8 {
+        let event_id = [i; 16];
+        let payload = format!("fiber2-event-{i}").into_bytes();
+        writer
+            .append_to_fiber(fiber2, event_id, payload)
+            .expect("append fiber2");
+    }
+
+    for i in 11..=15u8 {
+        let event_id = [i; 16];
+        let payload = format!("fiber3-event-{i}").into_bytes();
+        writer
+            .append_to_fiber(fiber3, event_id, payload)
+            .expect("append fiber3");
+    }
+
+    let orig_digest = writer.rolling_commitment().current_commitment();
+    let orig_count = writer.rolling_commitment().frame_count();
+    assert_eq!(orig_count, 15);
+
+    let orig_h1_count = writer.fiber(fiber1).expect("h1").event_count();
+    let orig_h1_prec = writer.fiber(fiber1).expect("h1").precursor();
+    let orig_h2_count = writer.fiber(fiber2).expect("h2").event_count();
+    let orig_h2_prec = writer.fiber(fiber2).expect("h2").precursor();
+    let orig_h3_count = writer.fiber(fiber3).expect("h3").event_count();
+    let orig_h3_prec = writer.fiber(fiber3).expect("h3").precursor();
+
+    let orig_id1 = writer
+        .get_latest(fiber1)
+        .expect("latest1")
+        .unwrap()
+        .header
+        .event_id;
+    let orig_id2 = writer
+        .get_latest(fiber2)
+        .expect("latest2")
+        .unwrap()
+        .header
+        .event_id;
+    let orig_id3 = writer
+        .get_latest(fiber3)
+        .expect("latest3")
+        .unwrap()
+        .header
+        .event_id;
+
+    drop(writer);
+
+    let reopened_writer = adapter.open_write(1).expect("reopen writer");
+    assert_eq!(
+        reopened_writer.rolling_commitment().current_commitment(),
+        orig_digest
+    );
+    assert_eq!(
+        reopened_writer.rolling_commitment().frame_count(),
+        orig_count
+    );
+    let w_h1 = reopened_writer.fiber(fiber1).expect("w h1");
+    let w_h2 = reopened_writer.fiber(fiber2).expect("w h2");
+    let w_h3 = reopened_writer.fiber(fiber3).expect("w h3");
+    assert_eq!(w_h1.event_count(), orig_h1_count);
+    assert_eq!(w_h1.precursor(), orig_h1_prec);
+    assert_eq!(w_h2.event_count(), orig_h2_count);
+    assert_eq!(w_h2.precursor(), orig_h2_prec);
+    assert_eq!(w_h3.event_count(), orig_h3_count);
+    assert_eq!(w_h3.precursor(), orig_h3_prec);
+
+    let w_latest1 = reopened_writer.get_latest(fiber1).expect("w l1").unwrap();
+    let w_latest2 = reopened_writer.get_latest(fiber2).expect("w l2").unwrap();
+    let w_latest3 = reopened_writer.get_latest(fiber3).expect("w l3").unwrap();
+    assert_eq!(w_latest1.header.event_id, orig_id1);
+    assert_eq!(w_latest2.header.event_id, orig_id2);
+    assert_eq!(w_latest3.header.event_id, orig_id3);
+
+    let reopened_reader = adapter.open_read().expect("open reader");
+    assert_eq!(
+        reopened_reader.rolling_commitment().current_commitment(),
+        orig_digest
+    );
+    assert_eq!(
+        reopened_reader.rolling_commitment().frame_count(),
+        orig_count
+    );
+    let r_h1 = reopened_reader.fiber(fiber1).expect("r h1");
+    let r_h2 = reopened_reader.fiber(fiber2).expect("r h2");
+    let r_h3 = reopened_reader.fiber(fiber3).expect("r h3");
+    assert_eq!(r_h1.event_count(), orig_h1_count);
+    assert_eq!(r_h1.precursor(), orig_h1_prec);
+    assert_eq!(r_h2.event_count(), orig_h2_count);
+    assert_eq!(r_h2.precursor(), orig_h2_prec);
+    assert_eq!(r_h3.event_count(), orig_h3_count);
+    assert_eq!(r_h3.precursor(), orig_h3_prec);
+
+    let r_latest1 = reopened_reader.get_latest(fiber1).expect("r l1").unwrap();
+    let r_latest2 = reopened_reader.get_latest(fiber2).expect("r l2").unwrap();
+    let r_latest3 = reopened_reader.get_latest(fiber3).expect("r l3").unwrap();
+    assert_eq!(r_latest1.header.event_id, orig_id1);
+    assert_eq!(r_latest2.header.event_id, orig_id2);
+    assert_eq!(r_latest3.header.event_id, orig_id3);
 
     adapter.delete_streams().expect("cleanup");
 }

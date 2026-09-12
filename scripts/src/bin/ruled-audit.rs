@@ -7,6 +7,7 @@
 //! Ownership of each RULED number is read from a curated TSV (`ticket<TAB>lo<TAB>hi`),
 //! not derived from close_reason text: a close_reason states both the rulings the
 //! ticket owns and the rulings it cites, so derivation cannot separate them.
+#![allow(clippy::pedantic)]
 
 use regex::Regex;
 use serde::Deserialize;

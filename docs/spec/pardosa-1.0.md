@@ -1112,6 +1112,7 @@ remains incomplete under C6.23; answer coverage does not complete that inventory
 | Operation failure | Invariant-breaking open configuration | Refuse at open under C5.35; the cost of an unpromised property is instead documented. |
 | Artefact admission refusal | Missing schema descriptor | No artefact omitting its descriptor is admitted (C5.45, C6.25); distinct from an existing descriptor not establishing mismatch decomposition. |
 | Migration failure | Caller transformation refuses | The payload transformation may refuse under C6.18; refusal is not successful migration or indeterminate write landing. |
+| Operation failure | `TransportUnavailable` | Underlying storage transport or network endpoint is unavailable or timed out; distinct from corruption (C6.7, C6.10). |
 | Closed value sub-domain | `ValueConstraint`: `TooLong`, `Empty`, `NotReal`, `InvalidChar`, `InvalidUtf8` | The five value-constraint codes; none is a catch-all. |
 | Closed liveness sub-domain | `ProvenDead { proof }`, `Indeterminate` | Proof of death or absence of proof, never a proof of liveness (C2.5). `DeathProof` carries the death proof. |
 | Closed death-proof sub-domain | `DeathProof`: machine reboot, process absence, process-id reuse | These three are the death-proof facts; clean release proves release instead (C5.14, C6.43). |

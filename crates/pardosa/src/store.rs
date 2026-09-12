@@ -10,7 +10,7 @@ mod engine;
 mod fiber_handle;
 mod pipeline;
 mod session_index;
-pub use engine::StorageEngine;
+pub use engine::{FrameRecoveryCallback, StorageEngine};
 pub use fiber_handle::FiberHandle;
 pub use pipeline::Store;
 pub use session_index::{SessionIndex, MAX_EVENTS_PER_FIBER};
@@ -1074,6 +1074,59 @@ pub enum WriteLandingVerdict<T> {
     },
 }
 
+/// Outcome of a bounded batch-write operation per C5.12 and C5.16.
+///
+/// Distinguishes known landed prefix, next-attempt ambiguity, and unattempted suffix without automatic retry.
+/// Invariants are enforced by type shape: full success carries only the final position, making count desynchronization unrepresentable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchLandingVerdict<T> {
+    /// All items in the batch successfully landed.
+    LandedAll {
+        /// Position or sequence of the final landed item.
+        final_position: T,
+    },
+    /// Landing of the item following the landed prefix is undetermined per C5.16.
+    Undetermined {
+        /// Number of prefix items known to have landed.
+        landed_count: usize,
+        /// Monotonic epoch carried by the write whose landing is undetermined.
+        carried_epoch: u64,
+    },
+    /// An explicit operation failure occurred after landing a prefix.
+    PartialFailure {
+        /// Number of prefix items known to have landed.
+        landed_count: usize,
+        /// Operation failure encountered on the first failing item.
+        error: OperationFailure,
+    },
+}
+
+impl<T> BatchLandingVerdict<T> {
+    /// Returns the number of items verified to have landed from the submitted batch.
+    #[must_use]
+    pub fn landed_count(&self, total_submitted: usize) -> usize {
+        match self {
+            Self::LandedAll { .. } => total_submitted,
+            Self::Undetermined { landed_count, .. } | Self::PartialFailure { landed_count, .. } => {
+                (*landed_count).min(total_submitted)
+            }
+        }
+    }
+
+    /// Returns the number of items that remained unattempted in the submitted batch.
+    #[must_use]
+    pub fn unattempted_count(&self, total_submitted: usize) -> usize {
+        match self {
+            Self::LandedAll { .. } => 0,
+            Self::Undetermined { landed_count, .. } | Self::PartialFailure { landed_count, .. } => {
+                total_submitted
+                    .saturating_sub(*landed_count)
+                    .saturating_sub(1)
+            }
+        }
+    }
+}
+
 /// Diagnostic detail reported with an operation failure per C6.9 and C6.11.
 ///
 /// Holds Pardosa-owned contextual information about the failure without
@@ -1219,15 +1272,13 @@ pub enum FailureCondition {
     ///
     /// Remedy: redirect writes to the migration target; source append authority is permanently retired.
     RetiredMigrationSource,
+    /// Underlying storage transport or network endpoint is unavailable or timed out (C6.7).
+    ///
+    /// Remedy: inspect network connectivity, cluster health, and authentication credentials; retry operation.
+    TransportUnavailable,
 }
 
 impl FailureCondition {
-    /// Failure condition indicating that capacity limits (items or bytes) were exceeded per Moltke resource policy.
-    #[allow(non_upper_case_globals)]
-    pub const RefusalDueToCapacity: FailureCondition = FailureCondition::ValueConstraintViolated {
-        constraint: ValueConstraint::TooLong,
-    };
-
     /// Returns the documented remedy for this failure condition per C6.10.
     #[must_use]
     pub fn remedy(&self) -> &'static str {
@@ -1273,6 +1324,9 @@ impl FailureCondition {
             Self::TransformationRefused => "provide valid payload transformation for migration",
             Self::RetiredMigrationSource => {
                 "redirect writes to migration target; source append authority is permanently retired"
+            }
+            Self::TransportUnavailable => {
+                "inspect network connectivity, cluster health, and authentication credentials; retry operation"
             }
         }
     }
@@ -1323,6 +1377,9 @@ impl fmt::Display for FailureCondition {
             Self::TransformationRefused => write!(f, "caller payload transformation refused"),
             Self::RetiredMigrationSource => {
                 write!(f, "append to retired migration source rejected")
+            }
+            Self::TransportUnavailable => {
+                write!(f, "underlying storage transport unavailable or timed out")
             }
         }
     }

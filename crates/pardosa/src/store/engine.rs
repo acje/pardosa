@@ -5,7 +5,10 @@ use crate::encoding::{
     OwnershipClaimRecord, OwnershipRecord, RescuePolicyChoiceRecord,
 };
 use crate::schema::SchemaDescriptor;
-use crate::store::{OpenAdmission, OperationFailure, WriteLandingVerdict};
+use crate::store::{BatchLandingVerdict, OpenAdmission, OperationFailure, WriteLandingVerdict};
+
+/// Callback invoked for each recovered frame during incremental recovery.
+pub type FrameRecoveryCallback<'a> = dyn FnMut(u64, &[u8]) -> Result<(), OperationFailure> + 'a;
 
 /// Minimal I/O contract for storage drivers.
 pub trait StorageEngine {
@@ -28,6 +31,39 @@ pub trait StorageEngine {
     /// Returns [`OperationFailure`] if storage write or synchronization fails.
     fn append_block(&mut self, block: &[u8]) -> Result<WriteLandingVerdict<u64>, OperationFailure>;
 
+    /// Appends a batch of raw frame blocks, returning detailed landing progress.
+    fn append_batch_detailed(&mut self, blocks: &[&[u8]]) -> BatchLandingVerdict<u64> {
+        if let Err(error) = self.check_authority() {
+            return BatchLandingVerdict::PartialFailure {
+                landed_count: 0,
+                error,
+            };
+        }
+        let mut last_position = 0;
+        for (i, block) in blocks.iter().enumerate() {
+            match self.append_block(block) {
+                Ok(WriteLandingVerdict::Landed(seq)) => {
+                    last_position = seq;
+                }
+                Ok(WriteLandingVerdict::Undetermined { carried_epoch }) => {
+                    return BatchLandingVerdict::Undetermined {
+                        landed_count: i,
+                        carried_epoch,
+                    };
+                }
+                Err(error) => {
+                    return BatchLandingVerdict::PartialFailure {
+                        landed_count: i,
+                        error,
+                    };
+                }
+            }
+        }
+        BatchLandingVerdict::LandedAll {
+            final_position: last_position,
+        }
+    }
+
     /// Appends a batch of raw frame blocks, returning the write landing verdict with sequence or frame count.
     ///
     /// # Errors
@@ -36,19 +72,15 @@ pub trait StorageEngine {
         &mut self,
         blocks: &[&[u8]],
     ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-        self.check_authority()?;
-        let mut last_verdict = WriteLandingVerdict::Landed(0);
-        for block in blocks {
-            match self.append_block(block)? {
-                WriteLandingVerdict::Landed(seq) => {
-                    last_verdict = WriteLandingVerdict::Landed(seq);
-                }
-                WriteLandingVerdict::Undetermined { carried_epoch } => {
-                    return Ok(WriteLandingVerdict::Undetermined { carried_epoch });
-                }
+        match self.append_batch_detailed(blocks) {
+            BatchLandingVerdict::LandedAll { final_position, .. } => {
+                Ok(WriteLandingVerdict::Landed(final_position))
             }
+            BatchLandingVerdict::Undetermined { carried_epoch, .. } => {
+                Ok(WriteLandingVerdict::Undetermined { carried_epoch })
+            }
+            BatchLandingVerdict::PartialFailure { error, .. } => Err(error),
         }
-        Ok(last_verdict)
     }
 
     /// Reads a single block at the specified sequence or index.
@@ -56,16 +88,8 @@ pub trait StorageEngine {
     /// # Errors
     /// Returns [`OperationFailure`] if reading fails.
     fn read_block(&mut self, index: u64) -> Result<Vec<u8>, OperationFailure> {
-        let all = self.read_all()?;
-        let idx = usize::try_from(index).map_err(|_| {
-            OperationFailure::new(
-                crate::store::FailureCondition::ValueConstraintViolated {
-                    constraint: crate::encoding::ValueConstraint::TooLong,
-                },
-                "block index out of bounds",
-            )
-        })?;
-        all.into_iter().nth(idx).ok_or_else(|| {
+        let mut chunk = self.read_chunk(index, 1)?;
+        chunk.pop().ok_or_else(|| {
             OperationFailure::new(
                 crate::store::FailureCondition::ValueConstraintViolated {
                     constraint: crate::encoding::ValueConstraint::TooLong,
@@ -80,6 +104,57 @@ pub trait StorageEngine {
     /// # Errors
     /// Returns [`OperationFailure`] if reading fails.
     fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure>;
+
+    /// Reads a chunk of raw blocks starting from sequence or index offset up to `max_items`.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if reading fails.
+    fn read_chunk(
+        &mut self,
+        start_index: u64,
+        max_items: usize,
+    ) -> Result<Vec<Vec<u8>>, OperationFailure> {
+        if max_items == 0 {
+            return Ok(Vec::new());
+        }
+        let all = self.read_all()?;
+        let start = usize::try_from(start_index).unwrap_or(usize::MAX);
+        if start >= all.len() {
+            return Ok(Vec::new());
+        }
+        let end = start.saturating_add(max_items).min(all.len());
+        Ok(all[start..end].to_vec())
+    }
+
+    /// Recovers frames incrementally in chunks, invoking `on_frame` for each frame.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if reading or frame processing fails.
+    fn recover_frames(
+        &mut self,
+        chunk_size: usize,
+        on_frame: &mut FrameRecoveryCallback<'_>,
+    ) -> Result<u64, OperationFailure> {
+        let chunk_size = chunk_size.max(1);
+        let mut start_index: u64 = 0;
+        let mut total_frames: u64 = 0;
+        loop {
+            let chunk = self.read_chunk(start_index, chunk_size)?;
+            if chunk.is_empty() {
+                break;
+            }
+            let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+            for frame in &chunk {
+                on_frame(total_frames, frame)?;
+                total_frames = total_frames.saturating_add(1);
+            }
+            start_index = start_index.saturating_add(chunk_len);
+            if chunk.len() < chunk_size {
+                break;
+            }
+        }
+        Ok(total_frames)
+    }
 
     /// Acquires exclusion on the underlying storage.
     ///

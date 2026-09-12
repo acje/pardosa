@@ -127,53 +127,62 @@ async fn read_meta_records_async(
     Ok(records)
 }
 
-/// Maximum concurrent message fetches in flight during stream replay.
-pub const MAX_CONCURRENT_FETCHES: usize = 32;
+const REPLAY_CONCURRENCY: usize = 16;
 
-/// Maximum accumulated frame payload bytes admitted during stream replay (64 MiB).
-pub const MAX_REPLAY_BYTES: usize = 64 * 1024 * 1024;
-
-/// Reads and verifies container data frames asynchronously with bounded batching and resource limits.
-///
-/// # Resource Contract
-/// - **Boundary**: `read_data_frames_async` during stream open and replay.
-/// - **Concurrency**: Bounded pipelined message fetches with at most `max_concurrent_fetches` in-flight requests.
-/// - **Item Limit**: Bounded to at most [`MAX_STREAM_ITEMS`] frames per stream.
-/// - **Byte Ceiling**: Total accumulated frame payload bytes capped at `max_replay_bytes`.
-/// - **Exhaustion Policy**: On item count or byte ceiling breach, immediately halts replay, aborts in-flight tasks, drops uncommitted frames, and returns [`FailureCondition::RefusalDueToCapacity`].
-/// - **Exclusions**: Excludes transient NATS client transport buffers and network frames managed by `async-nats`.
-///
-/// # Errors
-/// Returns [`OperationFailure`] with:
-/// - [`FailureCondition::NoArtefactExists`] if the data stream cannot be opened.
-/// - [`FailureCondition::PrecursorChainBroken`] if the stream is empty, corrupted, or missing a sequence.
-/// - [`FailureCondition::RefusalDueToCapacity`] if the stream exceeds item count or byte limits.
-/// - [`FailureCondition::InvariantBreakingConfiguration`] if `max_concurrent_fetches` is zero.
-pub async fn read_data_frames_async_bounded(
-    js: &async_nats::jetstream::Context,
-    data_stream_name: &str,
-    max_concurrent_fetches: usize,
-    max_replay_bytes: usize,
-) -> Result<(ContainerHeader, Vec<Vec<u8>>, RollingCommitment, u64), OperationFailure> {
-    if max_concurrent_fetches == 0 {
-        return Err(OperationFailure::new(
-            FailureCondition::InvariantBreakingConfiguration,
-            "max_concurrent_fetches must be greater than zero",
-        ));
-    }
-    let mut stream = js.get_stream(data_stream_name).await.map_err(|err| {
+fn map_nats_stream_open_error(stream_name: &str, err: impl std::fmt::Display) -> OperationFailure {
+    let msg = err.to_string();
+    if msg.contains("stream not found") || msg.contains("404") || msg.contains("not found") {
         OperationFailure::new(
             FailureCondition::NoArtefactExists,
-            format!("failed to open data stream {data_stream_name}: {err}"),
+            format!("stream {stream_name} not found: {msg}"),
         )
-    })?;
+    } else {
+        OperationFailure::new(
+            FailureCondition::TransportUnavailable,
+            format!("transport unavailable opening stream {stream_name}: {msg}"),
+        )
+    }
+}
+
+fn map_nats_info_error(stream_name: &str, err: impl std::fmt::Display) -> OperationFailure {
+    OperationFailure::new(
+        FailureCondition::TransportUnavailable,
+        format!("transport unavailable querying info for stream {stream_name}: {err}"),
+    )
+}
+
+fn map_nats_raw_message_error(seq: u64, err: impl std::fmt::Display) -> OperationFailure {
+    let msg = err.to_string();
+    if msg.contains("timed out")
+        || msg.contains("timeout")
+        || msg.contains("connection")
+        || msg.contains("unavailable")
+    {
+        OperationFailure::new(
+            FailureCondition::TransportUnavailable,
+            format!("transport unavailable reading raw message at seq {seq}: {msg}"),
+        )
+    } else {
+        OperationFailure::new(
+            FailureCondition::PrecursorChainBroken(None),
+            format!("failed to read raw message from data stream at seq {seq}: {msg}"),
+        )
+    }
+}
+
+async fn read_data_frames_async(
+    js: &async_nats::jetstream::Context,
+    data_stream_name: &str,
+) -> Result<(ContainerHeader, Vec<Vec<u8>>, RollingCommitment, u64), OperationFailure> {
+    let mut stream = js
+        .get_stream(data_stream_name)
+        .await
+        .map_err(|err| map_nats_stream_open_error(data_stream_name, err))?;
     let (messages, first, last) = {
-        let info = stream.info().await.map_err(|err| {
-            OperationFailure::new(
-                FailureCondition::PrecursorChainBroken(None),
-                format!("failed to get info for data stream {data_stream_name}: {err}"),
-            )
-        })?;
+        let info = stream
+            .info()
+            .await
+            .map_err(|err| map_nats_info_error(data_stream_name, err))?;
         (
             info.state.messages,
             info.state.first_sequence,
@@ -186,151 +195,160 @@ pub async fn read_data_frames_async_bounded(
             "data stream is empty; missing container header per C10.3",
         ));
     }
-    let header_raw = stream.get_raw_message(first).await.map_err(|err| {
-        OperationFailure::new(
-            FailureCondition::PrecursorChainBroken(None),
-            format!("failed to read container header from data stream: {err}"),
-        )
-    })?;
-    let (header, _) = ContainerHeader::decode(&header_raw.payload).map_err(|err| {
+    let header_raw = stream
+        .get_raw_message(first)
+        .await
+        .map_err(|err| map_nats_raw_message_error(first, err))?;
+    let (header, consumed) = ContainerHeader::decode(&header_raw.payload).map_err(|err| {
         OperationFailure::new(
             FailureCondition::PrecursorChainBroken(None),
             format!("invalid container header in data stream: {err}"),
         )
     })?;
-
-    let total_frames_count = last.saturating_sub(first);
-    if total_frames_count > MAX_STREAM_ITEMS as u64 {
+    if consumed != header_raw.payload.len() {
         return Err(OperationFailure::new(
-            FailureCondition::RefusalDueToCapacity,
-            format!(
-                "stream frame count {total_frames_count} exceeds item limit {MAX_STREAM_ITEMS}"
-            ),
+            FailureCondition::PrecursorChainBroken(None),
+            "trailing unconsumed bytes in container header",
         ));
     }
 
-    let mut frames = Vec::with_capacity(total_frames_count as usize);
+    let mut frames = Vec::new();
     let mut rolling = RollingCommitment::new();
-    let mut total_bytes: usize = 0;
 
-    let mut curr_seq = first + 1;
-    while curr_seq <= last {
-        let chunk_end = (curr_seq.saturating_add(max_concurrent_fetches as u64 - 1)).min(last);
-        let chunk_len = (chunk_end - curr_seq + 1) as usize;
+    if first < last {
+        use futures_util::StreamExt;
+        let stream_ref = &stream;
+        let mut msg_stream = futures_util::stream::iter((first + 1)..=last)
+            .map(|seq| async move {
+                let raw = stream_ref
+                    .get_raw_message(seq)
+                    .await
+                    .map_err(|err| map_nats_raw_message_error(seq, err))?;
+                Ok::<_, OperationFailure>((seq, raw))
+            })
+            .buffered(REPLAY_CONCURRENCY);
 
-        let mut set = tokio::task::JoinSet::new();
-        for seq in curr_seq..=chunk_end {
-            let stream_clone = stream.clone();
-            set.spawn(async move {
-                let res = stream_clone.get_raw_message(seq).await;
-                (seq, res)
-            });
-        }
-
-        let mut results = Vec::with_capacity(chunk_len);
-        results.resize_with(chunk_len, || None);
-
-        let mut first_error: Option<OperationFailure> = None;
-
-        while let Some(join_res) = set.join_next().await {
-            match join_res {
-                Ok((seq, Ok(raw_msg))) => {
-                    if first_error.is_none() {
-                        let idx = (seq - curr_seq) as usize;
-                        results[idx] = Some(raw_msg);
-                    }
-                }
-                Ok((seq, Err(err))) => {
-                    if first_error.is_none() {
-                        first_error = Some(OperationFailure::new(
-                            FailureCondition::PrecursorChainBroken(None),
-                            format!("failed to read frame from data stream at seq {seq}: {err}"),
-                        ));
-                        set.abort_all();
-                    }
-                }
-                Err(join_err) => {
-                    if first_error.is_none() {
-                        first_error = Some(OperationFailure::new(
-                            FailureCondition::PrecursorChainBroken(None),
-                            format!("concurrent fetch task failed: {join_err}"),
-                        ));
-                        set.abort_all();
-                    }
-                }
-            }
-        }
-
-        if let Some(err) = first_error {
-            return Err(err);
-        }
-
-        for (idx, raw_opt) in results.into_iter().enumerate() {
-            let seq = curr_seq + idx as u64;
-            let raw = raw_opt.ok_or_else(|| {
-                OperationFailure::new(
-                    FailureCondition::PrecursorChainBroken(None),
-                    format!("missing message for sequence {seq}"),
-                )
-            })?;
-
-            let (payload, _) = ContainerFrame::decode(&raw.payload).map_err(|err| {
+        while let Some(item) = msg_stream.next().await {
+            let (seq, raw) = item?;
+            let (payload, consumed) = ContainerFrame::decode(&raw.payload).map_err(|err| {
                 OperationFailure::new(
                     FailureCondition::PrecursorChainBroken(None),
                     format!("corrupted container frame in data stream at seq {seq}: {err}"),
                 )
             })?;
-
-            match total_bytes.checked_add(payload.len()) {
-                Some(b) if b <= max_replay_bytes => {
-                    total_bytes = b;
-                }
-                _ => {
-                    return Err(OperationFailure::new(
-                        FailureCondition::RefusalDueToCapacity,
-                        format!(
-                            "replay byte limit exceeded: total payload bytes would exceed ceiling {max_replay_bytes}"
-                        ),
-                    ));
-                }
+            if consumed != raw.payload.len() {
+                return Err(OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    format!("corrupted container frame in data stream at seq {seq}: trailing unconsumed bytes"),
+                ));
             }
-
             rolling.update_frame(&raw.payload);
             frames.push(payload);
         }
-
-        curr_seq = chunk_end + 1;
     }
 
     Ok((header, frames, rolling, last))
 }
 
-/// Reads and verifies container data frames asynchronously with default bounded concurrency and 64 MiB byte ceiling.
-///
-/// # Resource Contract
-/// - **Boundary**: `read_data_frames_async` during stream open and replay.
-/// - **Concurrency**: Bounded pipelined message fetches with at most [`MAX_CONCURRENT_FETCHES`] in-flight requests.
-/// - **Item Limit**: Bounded to at most [`MAX_STREAM_ITEMS`] frames per stream.
-/// - **Byte Ceiling**: Total accumulated frame payload bytes capped at [`MAX_REPLAY_BYTES`] (64 MiB).
-/// - **Exhaustion Policy**: On item count or byte ceiling breach, immediately halts replay, aborts in-flight tasks, drops uncommitted frames, and returns [`FailureCondition::RefusalDueToCapacity`].
-/// - **Exclusions**: Excludes transient NATS client transport buffers and network frames managed by `async-nats`.
-///
-/// # Errors
-/// Returns [`OperationFailure`] with:
-/// - [`FailureCondition::NoArtefactExists`] if the data stream cannot be opened.
-/// - [`FailureCondition::PrecursorChainBroken`] if the stream is empty, corrupted, or missing a sequence.
-/// - [`FailureCondition::RefusalDueToCapacity`] if the stream exceeds item count or byte limits.
-pub async fn read_data_frames_async(
+async fn read_chunk_async(
     js: &async_nats::jetstream::Context,
     data_stream_name: &str,
-) -> Result<(ContainerHeader, Vec<Vec<u8>>, RollingCommitment, u64), OperationFailure> {
-    read_data_frames_async_bounded(
-        js,
-        data_stream_name,
-        MAX_CONCURRENT_FETCHES,
-        MAX_REPLAY_BYTES,
-    )
-    .await
+    start_index: u64,
+    max_items: usize,
+    terminal_seq: Option<u64>,
+) -> Result<Vec<Vec<u8>>, OperationFailure> {
+    if max_items == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stream = js
+        .get_stream(data_stream_name)
+        .await
+        .map_err(|err| map_nats_stream_open_error(data_stream_name, err))?;
+    let (messages, first, mut last) = {
+        let info = stream
+            .info()
+            .await
+            .map_err(|err| map_nats_info_error(data_stream_name, err))?;
+        (
+            info.state.messages,
+            info.state.first_sequence,
+            info.state.last_sequence,
+        )
+    };
+    if messages == 0 {
+        return Err(OperationFailure::new(
+            FailureCondition::PrecursorChainBroken(None),
+            "data stream is empty; missing container header per C10.3",
+        ));
+    }
+    if let Some(t_seq) = terminal_seq {
+        last = std::cmp::min(last, t_seq);
+    }
+    let header_raw = stream
+        .get_raw_message(first)
+        .await
+        .map_err(|err| map_nats_raw_message_error(first, err))?;
+    let (_header, consumed) = ContainerHeader::decode(&header_raw.payload).map_err(|err| {
+        OperationFailure::new(
+            FailureCondition::PrecursorChainBroken(None),
+            format!("invalid container header in data stream: {err}"),
+        )
+    })?;
+    if consumed != header_raw.payload.len() {
+        return Err(OperationFailure::new(
+            FailureCondition::PrecursorChainBroken(None),
+            "trailing unconsumed bytes in container header",
+        ));
+    }
+
+    let start_seq = match first
+        .checked_add(1)
+        .and_then(|s| s.checked_add(start_index))
+    {
+        Some(s) => s,
+        None => return Ok(Vec::new()),
+    };
+    if start_seq > last {
+        return Ok(Vec::new());
+    }
+
+    let max_items_u64 = u64::try_from(max_items).unwrap_or(u64::MAX);
+    let end_seq = std::cmp::min(
+        start_seq.saturating_add(max_items_u64).saturating_sub(1),
+        last,
+    );
+
+    use futures_util::StreamExt;
+    let stream_ref = &stream;
+    let mut msg_stream = futures_util::stream::iter(start_seq..=end_seq)
+        .map(|seq| async move {
+            let raw = stream_ref
+                .get_raw_message(seq)
+                .await
+                .map_err(|err| map_nats_raw_message_error(seq, err))?;
+            Ok::<_, OperationFailure>((seq, raw))
+        })
+        .buffered(REPLAY_CONCURRENCY);
+
+    let mut frames = Vec::with_capacity((end_seq - start_seq + 1) as usize);
+    while let Some(item) = msg_stream.next().await {
+        let (seq, raw) = item?;
+        let (payload, consumed) = ContainerFrame::decode(&raw.payload).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::PrecursorChainBroken(None),
+                format!("corrupted container frame in data stream at seq {seq}: {err}"),
+            )
+        })?;
+        if consumed != raw.payload.len() {
+            return Err(OperationFailure::new(
+                FailureCondition::PrecursorChainBroken(None),
+                format!("corrupted container frame in data stream at seq {seq}: trailing unconsumed bytes"),
+            ));
+        }
+        frames.push(payload);
+    }
+
+    Ok(frames)
 }
 
 /// JetStream storage adapter managing container artefacts in NATS JetStream per C5.10, C5.11, and C10.3.
@@ -489,18 +507,6 @@ impl NatsStorageAdapter {
     #[must_use]
     pub fn data_stream_name(&self) -> &str {
         &self.data_stream_name
-    }
-
-    /// Returns a reference to the JetStream context.
-    #[must_use]
-    pub fn jetstream(&self) -> &async_nats::jetstream::Context {
-        &self.js
-    }
-
-    /// Returns a reference to the underlying Tokio runtime.
-    #[must_use]
-    pub fn runtime(&self) -> &Arc<tokio::runtime::Runtime> {
-        &self.runtime
     }
 
     /// Returns the presence of artefact streams in JetStream per C5.10.
@@ -711,7 +717,7 @@ impl NatsStorageAdapter {
                 meta_records,
                 admission: OpenAdmission::Ready,
                 last_data_seq: data_ack.sequence,
-                initial_frames: Some(Vec::new()),
+                read_all_count: 0,
                 publish_timeout: Duration::from_secs(5),
                 simulate_indeterminate: false,
                 uncertain: false,
@@ -954,7 +960,7 @@ impl NatsStorageAdapter {
                 meta_records,
                 admission: OpenAdmission::Ready,
                 last_data_seq: data_ack.sequence,
-                initial_frames: Some(Vec::new()),
+                read_all_count: 0,
                 publish_timeout: Duration::from_secs(5),
                 simulate_indeterminate: false,
                 uncertain: false,
@@ -1041,8 +1047,45 @@ impl NatsStorageAdapter {
 
         let js_data = self.js.clone();
         let data_name = self.data_stream_name.clone();
-        let (_, frames, _, last_data_seq) = run_future(&handle, async move {
-            read_data_frames_async(&js_data, &data_name).await
+        let last_data_seq = run_future(&handle, async move {
+            let mut stream = js_data.get_stream(&data_name).await.map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::NoArtefactExists,
+                    format!("failed to open data stream {data_name}: {err}"),
+                )
+            })?;
+            let (messages, first_seq, last_seq) = {
+                let info = stream.info().await.map_err(|err| {
+                    OperationFailure::new(
+                        FailureCondition::PrecursorChainBroken(None),
+                        format!("failed to get info for data stream {data_name}: {err}"),
+                    )
+                })?;
+                (
+                    info.state.messages,
+                    info.state.first_sequence,
+                    info.state.last_sequence,
+                )
+            };
+            if messages == 0 {
+                return Err(OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    "data stream is empty; missing container header per C10.3",
+                ));
+            }
+            let header_raw = stream.get_raw_message(first_seq).await.map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    format!("failed to read container header from data stream: {err}"),
+                )
+            })?;
+            let (_header, _) = ContainerHeader::decode(&header_raw.payload).map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    format!("invalid container header in data stream: {err}"),
+                )
+            })?;
+            Ok(last_seq)
         })?;
 
         let engine = NatsEngine {
@@ -1059,7 +1102,7 @@ impl NatsStorageAdapter {
             meta_records: meta,
             admission: OpenAdmission::Ready,
             last_data_seq,
-            initial_frames: Some(frames),
+            read_all_count: 0,
             publish_timeout: Duration::from_secs(5),
             simulate_indeterminate: false,
             uncertain: false,
@@ -1108,7 +1151,7 @@ impl NatsStorageAdapter {
             meta_records,
             admission,
             last_data_seq: 0,
-            initial_frames: None,
+            read_all_count: 0,
             publish_timeout: Duration::from_secs(5),
             simulate_indeterminate: false,
             uncertain: false,
@@ -1295,7 +1338,7 @@ pub struct NatsEngine {
     pub(crate) meta_records: NatsMetaRecords,
     pub(crate) admission: OpenAdmission,
     pub(crate) last_data_seq: u64,
-    pub(crate) initial_frames: Option<Vec<Vec<u8>>>,
+    pub(crate) read_all_count: usize,
     pub(crate) publish_timeout: Duration,
     pub(crate) simulate_indeterminate: bool,
     pub(crate) uncertain: bool,
@@ -1303,6 +1346,13 @@ pub struct NatsEngine {
 }
 
 impl NatsEngine {
+    /// Returns the number of times `read_all` was invoked on this engine.
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    #[must_use]
+    pub fn read_all_count(&self) -> usize {
+        self.read_all_count
+    }
+
     /// Returns the common artefact stem.
     #[must_use]
     pub fn stem(&self) -> &str {
@@ -1478,9 +1528,7 @@ impl StorageEngine for NatsEngine {
     }
 
     fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
-        if let Some(frames) = self.initial_frames.take() {
-            return Ok(frames);
-        }
+        self.read_all_count += 1;
         let handle = self.runtime.handle().clone();
         let js = self.js.clone();
         let data_name = self.data_stream_name.clone();
@@ -1488,6 +1536,109 @@ impl StorageEngine for NatsEngine {
             read_data_frames_async(&js, &data_name).await
         })?;
         Ok(frames)
+    }
+
+    fn read_chunk(
+        &mut self,
+        start_index: u64,
+        max_items: usize,
+    ) -> Result<Vec<Vec<u8>>, OperationFailure> {
+        if max_items == 0 {
+            return Ok(Vec::new());
+        }
+        let handle = self.runtime.handle().clone();
+        let js = self.js.clone();
+        let data_name = self.data_stream_name.clone();
+        run_future(&handle, async move {
+            read_chunk_async(&js, &data_name, start_index, max_items, None).await
+        })
+    }
+
+    fn recover_frames(
+        &mut self,
+        chunk_size: usize,
+        on_frame: &mut FrameRecoveryCallback<'_>,
+    ) -> Result<u64, OperationFailure> {
+        let handle = self.runtime.handle().clone();
+        let js = self.js.clone();
+        let data_name = self.data_stream_name.clone();
+
+        let (first, last) = run_future(&handle, async move {
+            let mut stream = js
+                .get_stream(&data_name)
+                .await
+                .map_err(|err| map_nats_stream_open_error(&data_name, err))?;
+            let (messages, first_seq, last_seq) = {
+                let info = stream
+                    .info()
+                    .await
+                    .map_err(|err| map_nats_info_error(&data_name, err))?;
+                (
+                    info.state.messages,
+                    info.state.first_sequence,
+                    info.state.last_sequence,
+                )
+            };
+            if messages == 0 {
+                return Err(OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    "data stream is empty; missing container header per C10.3",
+                ));
+            }
+            let first_msg = stream
+                .get_raw_message(first_seq)
+                .await
+                .map_err(|err| map_nats_raw_message_error(first_seq, err))?;
+            let (_header, consumed) =
+                ContainerHeader::decode(&first_msg.payload).map_err(|err| {
+                    OperationFailure::new(
+                        FailureCondition::PrecursorChainBroken(None),
+                        format!("invalid container header in data stream: {err}"),
+                    )
+                })?;
+            if consumed != first_msg.payload.len() {
+                return Err(OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    "trailing unconsumed bytes in container header",
+                ));
+            }
+            Ok((first_seq, last_seq))
+        })?;
+
+        let data_start_seq = match first.checked_add(1) {
+            Some(s) => s,
+            None => return Ok(0),
+        };
+        if data_start_seq > last {
+            return Ok(0);
+        }
+
+        let mut current_seq = data_start_seq;
+        let mut total_recovered = 0u64;
+
+        while current_seq <= last {
+            let chunk_limit = (chunk_size as u64).min(last - current_seq + 1) as usize;
+            let start_idx = current_seq - data_start_seq;
+            let js = self.js.clone();
+            let data_name = self.data_stream_name.clone();
+            let frames = run_future(&handle, async move {
+                read_chunk_async(&js, &data_name, start_idx, chunk_limit, Some(last)).await
+            })?;
+            if frames.is_empty() {
+                return Err(OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    format!("unexpected missing messages between {current_seq} and {last} in data stream"),
+                ));
+            }
+            for frame in frames {
+                on_frame(total_recovered, &frame)?;
+                total_recovered += 1;
+                current_seq += 1;
+            }
+        }
+
+        self.last_data_seq = last;
+        Ok(total_recovered)
     }
 
     fn set_publish_timeout(&mut self, timeout: std::time::Duration) {
@@ -1761,6 +1912,14 @@ impl NatsWriterSession {
     ) -> Result<(), OperationFailure> {
         self.store.record_meta_record(record)
     }
+
+    /// Reads a single raw block at the specified sequence or index from the data stream.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if reading fails or index is out of bounds.
+    pub fn read_block(&mut self, index: u64) -> Result<Vec<u8>, OperationFailure> {
+        self.store.read_block(index)
+    }
 }
 
 /// Reader session providing non-exclusive read-only access to an artefact container in JetStream.
@@ -1801,6 +1960,14 @@ impl NatsReaderSession {
         self.store.engine().meta_records()
     }
 
+    /// Reads a single raw block at the specified sequence or index from the data stream.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if reading fails or index is out of bounds.
+    pub fn read_block(&mut self, index: u64) -> Result<Vec<u8>, OperationFailure> {
+        self.store.read_block(index)
+    }
+
     /// Reads all framed payloads from the data stream, validating CRC32C on each frame.
     ///
     /// # Errors
@@ -1825,6 +1992,28 @@ impl NatsReaderSession {
         &mut self,
     ) -> Result<Vec<EventEnvelope>, OperationFailure> {
         self.store.read_all_envelopes_for_migration()
+    }
+
+    /// Iterates over all event envelopes sequentially using borrowed views without bulk allocation.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if reading fails, decoding fails, or the reader retained broken state.
+    pub fn for_each_envelope<F>(&mut self, f: F) -> Result<(), OperationFailure>
+    where
+        F: FnMut(EventEnvelopeRef<'_>) -> Result<(), OperationFailure>,
+    {
+        self.store.for_each_envelope(f)
+    }
+
+    /// Incrementally folds all event envelopes through a visitor closure using borrowed views.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if reading fails, decoding fails, or the reader retained broken state.
+    pub fn fold_envelopes<B, F>(&mut self, init: B, f: F) -> Result<B, OperationFailure>
+    where
+        F: FnMut(B, EventEnvelopeRef<'_>) -> Result<B, OperationFailure>,
+    {
+        self.store.fold_envelopes(init, f)
     }
 }
 
