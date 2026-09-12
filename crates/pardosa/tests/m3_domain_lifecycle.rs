@@ -1625,110 +1625,37 @@ impl StorageEngine for MockEngine {
 }
 
 #[test]
-fn test_c5_12_and_c5_16_bounded_batch_landing_verdicts() {
+fn test_c5_12_and_c5_16_landing_verdicts() {
     let fiber = [0x99; 16];
     let e1 = EventEnvelope::genesis([0x01; 16], fiber, b"event-1".to_vec()).expect("genesis");
-    let e2 = EventEnvelope::chain(&e1, [0x02; 16], b"event-2".to_vec()).expect("chain 2");
-    let e3 = EventEnvelope::chain(&e2, [0x03; 16], b"event-3".to_vec()).expect("chain 3");
-    let e4 = EventEnvelope::chain(&e3, [0x04; 16], b"event-4".to_vec()).expect("chain 4");
-    let batch = [e1.clone(), e2.clone(), e3.clone(), e4.clone()];
 
     let mut store_all = Store::open_writer(MockEngine::default()).expect("store open");
-    let v_all = store_all
-        .append_batch_envelopes_detailed(&batch)
-        .expect("verdict all");
-    assert!(v_all.is_all_landed());
-    assert_eq!(v_all.final_position(), Some(4));
-    assert_eq!(v_all.landed_count(), 4);
-    assert_eq!(v_all.unattempted_count(), 0);
-    assert_eq!(v_all.total_count(), 4);
-    assert_eq!(store_all.rolling_commitment().frame_count(), 4);
-    assert_eq!(
-        store_all
-            .session_index()
-            .expect("idx")
-            .event_count(&fiber)
-            .unwrap(),
-        4
-    );
+    let v_all = store_all.append_envelope_verdict(&e1).expect("verdict all");
+    assert_eq!(v_all, WriteLandingVerdict::Landed(1));
+    assert_eq!(store_all.rolling_commitment().frame_count(), 1);
 
     let mut store_undet = Store::open_writer(MockEngine {
-        undetermined_at_block: Some(2),
+        undetermined_at_block: Some(0),
         ..Default::default()
     })
     .expect("store open");
     let v_undet = store_undet
-        .append_batch_envelopes_detailed(&batch)
+        .append_envelope_verdict(&e1)
         .expect("verdict undet");
-    assert_eq!(v_undet.landed_count(), 2);
     assert_eq!(
-        v_undet.next_attempt(),
-        Some(&NextAttemptStatus::Undetermined { carried_epoch: 42 })
+        v_undet,
+        WriteLandingVerdict::Undetermined { carried_epoch: 42 }
     );
-    assert_eq!(v_undet.unattempted_count(), 1);
-    assert_eq!(v_undet.unresolved_count(), 1);
-    assert_eq!(v_undet.total_count(), 4);
-    assert_eq!(store_undet.rolling_commitment().frame_count(), 2);
-    assert_eq!(
-        store_undet
-            .session_index()
-            .expect("idx")
-            .event_count(&fiber)
-            .unwrap(),
-        2
-    );
-    assert_eq!(
-        store_undet
-            .session_index()
-            .expect("idx")
-            .get_latest(&fiber)
-            .unwrap()
-            .unwrap()
-            .header
-            .event_id,
-        e2.header.event_id
-    );
+    assert_eq!(store_undet.rolling_commitment().frame_count(), 0);
 
     let mut store_fail = Store::open_writer(MockEngine {
-        fail_at_block: Some(1),
+        fail_at_block: Some(0),
         ..Default::default()
     })
     .expect("store open");
-    let v_fail = store_fail
-        .append_batch_envelopes_detailed(&batch)
-        .expect("verdict fail");
-    assert_eq!(v_fail.landed_count(), 1);
-    match v_fail.next_attempt() {
-        Some(NextAttemptStatus::Rejected(error)) => {
-            assert_eq!(*error.condition(), FailureCondition::ConcurrencyConflict);
-        }
-        other => panic!("expected Rejected, got {other:?}"),
-    }
-    assert_eq!(v_fail.unattempted_count(), 2);
-    assert_eq!(v_fail.landed_count(), 1);
-    assert_eq!(v_fail.rejected_count(), 1);
-    assert_eq!(v_fail.unattempted_count(), 2);
-    assert_eq!(v_fail.total_count(), 4);
-    assert_eq!(store_fail.rolling_commitment().frame_count(), 1);
-    assert_eq!(
-        store_fail
-            .session_index()
-            .expect("idx")
-            .event_count(&fiber)
-            .unwrap(),
-        1
-    );
-    assert_eq!(
-        store_fail
-            .session_index()
-            .expect("idx")
-            .get_latest(&fiber)
-            .unwrap()
-            .unwrap()
-            .header
-            .event_id,
-        e1.header.event_id
-    );
+    let err = store_fail.append_envelope_verdict(&e1).unwrap_err();
+    assert_eq!(*err.condition(), FailureCondition::ConcurrencyConflict);
+    assert_eq!(store_fail.rolling_commitment().frame_count(), 0);
 }
 
 #[test]
@@ -1888,169 +1815,6 @@ fn test_for_each_envelope_positive_corruption_poisons_reader_session_terminally(
 }
 
 #[test]
-fn test_m4_impossible_engine_batch_count_is_refused_by_store() {
-    #[derive(Debug, Default)]
-    struct RogueBatchEngine {
-        epoch: u64,
-    }
-    impl StorageEngine for RogueBatchEngine {
-        fn carried_epoch(&self) -> u64 {
-            self.epoch
-        }
-        fn append_block(
-            &mut self,
-            _b: &[u8],
-        ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-            Ok(WriteLandingVerdict::Landed(1))
-        }
-        fn append_batch_detailed(&mut self, _blocks: &[&[u8]]) -> BatchLandingVerdict<u64> {
-            BatchLandingVerdict::PartialProgress {
-                landed_count: 5,
-                next_attempt: NextAttemptStatus::Undetermined {
-                    carried_epoch: self.epoch,
-                },
-                unattempted_count: 0,
-            }
-        }
-        fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
-            Ok(Vec::new())
-        }
-        fn is_retired(&self) -> Result<bool, OperationFailure> {
-            Ok(false)
-        }
-        fn sync(&mut self) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn uncertain_diagnostic(&self) -> Option<&str> {
-            None
-        }
-        fn claim(&self) -> Option<&OwnershipClaimRecord> {
-            None
-        }
-        fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
-            None
-        }
-        fn set_schema_descriptor(&mut self, _d: &SchemaDescriptor) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn record_meta_record(&mut self, _r: &OwnershipRecord) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
-            None
-        }
-        fn inbound_pointer(&self) -> Option<&InboundPointerRecord> {
-            None
-        }
-        fn migration_start(&self) -> Option<&MigrationStartRecord> {
-            None
-        }
-        fn migration_end(&self) -> Option<&MigrationEndRecord> {
-            None
-        }
-        fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
-            None
-        }
-    }
-
-    let fiber = [0x55; 16];
-    let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"valid-1").unwrap();
-    let mut e1_buf = Vec::new();
-    e1.encode(&mut e1_buf);
-
-    let mut store = Store::open_writer(RogueBatchEngine { epoch: 1 }).unwrap();
-    let err = store.append_batch_detailed(&[&e1_buf]).unwrap_err();
-    assert_eq!(
-        *err.condition(),
-        FailureCondition::PrecursorChainBroken(None)
-    );
-    assert!(err.diagnostic_detail().message().contains(
-        "inconsistent batch partition: landed 5 + next 1 + unattempted 0 != batch length 1"
-    ));
-}
-
-#[test]
-fn test_m4_inconsistent_suffix_partition_rejected() {
-    struct SuffixRogueEngine {
-        epoch: u64,
-    }
-    impl StorageEngine for SuffixRogueEngine {
-        fn carried_epoch(&self) -> u64 {
-            self.epoch
-        }
-        fn append_block(
-            &mut self,
-            _b: &[u8],
-        ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-            Ok(WriteLandingVerdict::Landed(1))
-        }
-        fn append_batch_detailed(&mut self, _blocks: &[&[u8]]) -> BatchLandingVerdict<u64> {
-            BatchLandingVerdict::PartialProgress {
-                landed_count: 0,
-                next_attempt: NextAttemptStatus::Undetermined {
-                    carried_epoch: self.epoch,
-                },
-                unattempted_count: 99,
-            }
-        }
-        fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
-            Ok(Vec::new())
-        }
-        fn is_retired(&self) -> Result<bool, OperationFailure> {
-            Ok(false)
-        }
-        fn sync(&mut self) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn uncertain_diagnostic(&self) -> Option<&str> {
-            None
-        }
-        fn claim(&self) -> Option<&OwnershipClaimRecord> {
-            None
-        }
-        fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
-            None
-        }
-        fn set_schema_descriptor(&mut self, _d: &SchemaDescriptor) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn record_meta_record(&mut self, _r: &OwnershipRecord) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
-            None
-        }
-        fn inbound_pointer(&self) -> Option<&InboundPointerRecord> {
-            None
-        }
-        fn migration_start(&self) -> Option<&MigrationStartRecord> {
-            None
-        }
-        fn migration_end(&self) -> Option<&MigrationEndRecord> {
-            None
-        }
-        fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
-            None
-        }
-    }
-
-    let fiber = [0x55; 16];
-    let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"valid-1").unwrap();
-    let mut e1_buf = Vec::new();
-    e1.encode(&mut e1_buf);
-
-    let mut store = Store::open_writer(SuffixRogueEngine { epoch: 1 }).unwrap();
-    let err = store.append_batch_detailed(&[&e1_buf]).unwrap_err();
-    assert_eq!(
-        *err.condition(),
-        FailureCondition::PrecursorChainBroken(None)
-    );
-    assert!(err.diagnostic_detail().message().contains(
-        "inconsistent batch partition: landed 0 + next 1 + unattempted 99 != batch length 1"
-    ));
-}
-
-#[test]
 fn test_m3_consumer_callback_returning_precursor_chain_broken_does_not_poison_reader() {
     let mut engine = MockEngine::default();
     let fiber = [0x44; 16];
@@ -2159,257 +1923,30 @@ fn test_h1_open_reader_with_transport_unavailable_refuses_point_lookups_and_reco
 }
 
 #[test]
-fn test_m4_inconsistent_landed_all_count_is_refused_and_preserves_projection() {
-    use pardosa::encoding::{
-        EventEnvelope, InboundPointerRecord, MigrationEndRecord, MigrationStartRecord,
-        OutboundPointerRecord, OwnershipClaimRecord, OwnershipRecord, RescuePolicyChoiceRecord,
-    };
-    use pardosa::schema::SchemaDescriptor;
-    use pardosa::store::{
-        BatchLandingVerdict, FailureCondition, OperationFailure, StorageEngine, Store,
-        WriteLandingVerdict,
-    };
-
-    struct LandedAllRogueEngine {
-        epoch: u64,
-    }
-    impl StorageEngine for LandedAllRogueEngine {
-        fn carried_epoch(&self) -> u64 {
-            self.epoch
+fn test_compile_fail_batch_api_removed() {
+    let code_batch_detailed = r#"
+        use pardosa::prelude::*;
+        pub fn run_test<E: StorageEngine>(mut store: Store<E>) {
+            let _ = store.append_batch_detailed(&[]);
         }
-        fn append_block(
-            &mut self,
-            _b: &[u8],
-        ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-            Ok(WriteLandingVerdict::Landed(1))
-        }
-        fn append_batch_detailed(&mut self, _blocks: &[&[u8]]) -> BatchLandingVerdict<u64> {
-            BatchLandingVerdict::LandedAll {
-                final_position: 1,
-                landed_count: 0,
-            }
-        }
-        fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
-            Ok(Vec::new())
-        }
-        fn is_retired(&self) -> Result<bool, OperationFailure> {
-            Ok(false)
-        }
-        fn sync(&mut self) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn uncertain_diagnostic(&self) -> Option<&str> {
-            None
-        }
-        fn claim(&self) -> Option<&OwnershipClaimRecord> {
-            None
-        }
-        fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
-            None
-        }
-        fn set_schema_descriptor(&mut self, _d: &SchemaDescriptor) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn record_meta_record(&mut self, _r: &OwnershipRecord) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
-            None
-        }
-        fn inbound_pointer(&self) -> Option<&InboundPointerRecord> {
-            None
-        }
-        fn migration_start(&self) -> Option<&MigrationStartRecord> {
-            None
-        }
-        fn migration_end(&self) -> Option<&MigrationEndRecord> {
-            None
-        }
-        fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
-            None
-        }
-    }
-
-    let fiber = [0x55; 16];
-    let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"valid-1").unwrap();
-    let mut e1_buf = Vec::new();
-    e1.encode(&mut e1_buf);
-
-    let mut store = Store::open_writer(LandedAllRogueEngine { epoch: 1 }).unwrap();
-    let initial_frame_count = store.rolling_commitment().frame_count();
-    let err = store.append_batch_detailed(&[&e1_buf]).unwrap_err();
-    assert_eq!(
-        *err.condition(),
-        FailureCondition::PrecursorChainBroken(None)
+    "#;
+    let (ok, stderr) = run_rustc(code_batch_detailed);
+    assert!(!ok, "Store::append_batch_detailed must not exist on Store");
+    assert!(
+        stderr.contains("no method named `append_batch_detailed`"),
+        "error must cite missing method:\n{stderr}"
     );
-    assert!(err
-        .diagnostic_detail()
-        .message()
-        .contains("engine reported inconsistent LandedAll count: landed 0 != batch length 1"));
-    assert_eq!(
-        store.rolling_commitment().frame_count(),
-        initial_frame_count
-    );
-    let idx = store.session_index().expect("session index must be valid");
-    assert_eq!(idx.len(), 0);
-}
 
-#[test]
-fn test_m4_inconsistent_refusal_count_is_refused() {
-    use pardosa::encoding::{
-        EventEnvelope, InboundPointerRecord, MigrationEndRecord, MigrationStartRecord,
-        OutboundPointerRecord, OwnershipClaimRecord, OwnershipRecord, RescuePolicyChoiceRecord,
-    };
-    use pardosa::schema::SchemaDescriptor;
-    use pardosa::store::{
-        BatchLandingVerdict, FailureCondition, OperationFailure, StorageEngine, Store,
-        WriteLandingVerdict,
-    };
-
-    struct RefusalRogueEngine {
-        epoch: u64,
-    }
-    impl StorageEngine for RefusalRogueEngine {
-        fn carried_epoch(&self) -> u64 {
-            self.epoch
-        }
-        fn append_block(
-            &mut self,
-            _b: &[u8],
-        ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-            Ok(WriteLandingVerdict::Landed(1))
-        }
-        fn append_batch_detailed(&mut self, _blocks: &[&[u8]]) -> BatchLandingVerdict<u64> {
-            BatchLandingVerdict::PreAttemptRefusal {
-                error: OperationFailure::new(
-                    FailureCondition::TransportUnavailable,
-                    "mock refusal",
-                ),
-                unattempted_count: 99,
-            }
-        }
-        fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
-            Ok(Vec::new())
-        }
-        fn is_retired(&self) -> Result<bool, OperationFailure> {
-            Ok(false)
-        }
-        fn sync(&mut self) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn uncertain_diagnostic(&self) -> Option<&str> {
-            None
-        }
-        fn claim(&self) -> Option<&OwnershipClaimRecord> {
-            None
-        }
-        fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
-            None
-        }
-        fn set_schema_descriptor(&mut self, _d: &SchemaDescriptor) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn record_meta_record(&mut self, _r: &OwnershipRecord) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
-            None
-        }
-        fn inbound_pointer(&self) -> Option<&InboundPointerRecord> {
-            None
-        }
-        fn migration_start(&self) -> Option<&MigrationStartRecord> {
-            None
-        }
-        fn migration_end(&self) -> Option<&MigrationEndRecord> {
-            None
-        }
-        fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
-            None
-        }
-    }
-
-    let fiber = [0x55; 16];
-    let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"valid-1").unwrap();
-    let mut e1_buf = Vec::new();
-    e1.encode(&mut e1_buf);
-
-    let mut store = Store::open_writer(RefusalRogueEngine { epoch: 1 }).unwrap();
-    let err = store.append_batch_detailed(&[&e1_buf]).unwrap_err();
-    assert_eq!(
-        *err.condition(),
-        FailureCondition::PrecursorChainBroken(None)
-    );
-    assert!(err.diagnostic_detail().message().contains(
-        "engine reported inconsistent PreAttemptRefusal count: unattempted 99 != batch length 1"
-    ));
-}
-
-#[test]
-fn test_m4_batch_landing_verdict_total_count_checked_arithmetic_overflow() {
-    use pardosa::store::{BatchLandingVerdict, NextAttemptStatus};
-
-    let v_overflow_pos1: BatchLandingVerdict<u64> = BatchLandingVerdict::PartialProgress {
-        landed_count: usize::MAX,
-        next_attempt: NextAttemptStatus::Undetermined { carried_epoch: 1 },
-        unattempted_count: 0,
-    };
-    assert_eq!(v_overflow_pos1.checked_total_count(), None);
-
-    let v_overflow_pos2: BatchLandingVerdict<u64> = BatchLandingVerdict::PartialProgress {
-        landed_count: usize::MAX - 1,
-        next_attempt: NextAttemptStatus::Undetermined { carried_epoch: 1 },
-        unattempted_count: 1,
-    };
-    assert_eq!(v_overflow_pos2.checked_total_count(), None);
-
-    let v_legal_boundary: BatchLandingVerdict<u64> = BatchLandingVerdict::PartialProgress {
-        landed_count: usize::MAX - 2,
-        next_attempt: NextAttemptStatus::Undetermined { carried_epoch: 1 },
-        unattempted_count: 1,
-    };
-    assert_eq!(v_legal_boundary.checked_total_count(), Some(usize::MAX));
-}
-
-#[test]
-fn test_compile_fail_batch_landing_receipt_private_construction() {
-    let invalid_code = r#"
+    let code_batch_type = r#"
         use pardosa::prelude::*;
         pub fn run_test() {
-            let _receipt = BatchLandingReceipt {
-                final_position: Some(1u64),
-                landed_count: 1,
-                next_attempt: None,
-                unattempted_count: 0,
-                total: 1,
-            };
+            let _ = BatchLandingVerdict::LandedAll { final_position: 1, landed_count: 1 };
         }
     "#;
-    let (ok, stderr) = run_rustc(invalid_code);
+    let (ok2, stderr2) = run_rustc(code_batch_type);
+    assert!(!ok2, "BatchLandingVerdict must not exist in prelude");
     assert!(
-        !ok,
-        "direct construction of BatchLandingReceipt must fail compilation"
-    );
-    assert!(
-        stderr.contains("private"),
-        "error must cite private fields:\n{stderr}"
-    );
-
-    let positive_code = r#"
-        use pardosa::prelude::*;
-        pub fn run_test(receipt: &BatchLandingReceipt<u64>) {
-            let _all = receipt.is_all_landed();
-            let _pos = receipt.final_position();
-            let _landed = receipt.landed_count();
-            let _unresolved = receipt.unresolved_count();
-            let _rejected = receipt.rejected_count();
-            let _unattempted = receipt.unattempted_count();
-            let _total = receipt.total_count();
-        }
-    "#;
-    let (pos_ok, pos_stderr) = run_rustc(positive_code);
-    assert!(
-        pos_ok,
-        "valid accessors on BatchLandingReceipt must compile cleanly:\n{pos_stderr}"
+        stderr2.contains("cannot find") || stderr2.contains("E0425"),
+        "error must cite unresolved type:\n{stderr2}"
     );
 }

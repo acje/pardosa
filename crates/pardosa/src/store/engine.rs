@@ -5,9 +5,7 @@ use crate::encoding::{
     OwnershipClaimRecord, OwnershipRecord, RescuePolicyChoiceRecord,
 };
 use crate::schema::SchemaDescriptor;
-use crate::store::{
-    BatchLandingVerdict, NextAttemptStatus, OpenAdmission, OperationFailure, WriteLandingVerdict,
-};
+use crate::store::{OpenAdmission, OperationFailure, WriteLandingVerdict};
 
 /// Callback invoked for each recovered frame during incremental recovery.
 pub type FrameRecoveryCallback<'a> = dyn FnMut(u64, &[u8]) -> Result<(), OperationFailure> + 'a;
@@ -32,74 +30,6 @@ pub trait StorageEngine {
     /// # Errors
     /// Returns [`OperationFailure`] if storage write or synchronization fails.
     fn append_block(&mut self, block: &[u8]) -> Result<WriteLandingVerdict<u64>, OperationFailure>;
-
-    /// Appends a batch of raw frame blocks, returning detailed landing progress.
-    fn append_batch_detailed(&mut self, blocks: &[&[u8]]) -> BatchLandingVerdict<u64> {
-        if let Err(error) = self.check_authority() {
-            return BatchLandingVerdict::PreAttemptRefusal {
-                error,
-                unattempted_count: blocks.len(),
-            };
-        }
-        if blocks.is_empty() {
-            return BatchLandingVerdict::LandedAll {
-                final_position: 0,
-                landed_count: 0,
-            };
-        }
-        let mut last_position = 0;
-
-        for (i, block) in blocks.iter().enumerate() {
-            match self.append_block(block) {
-                Ok(WriteLandingVerdict::Landed(seq)) => {
-                    last_position = seq;
-                }
-                Ok(WriteLandingVerdict::Undetermined { carried_epoch }) => {
-                    return BatchLandingVerdict::PartialProgress {
-                        landed_count: i,
-                        next_attempt: NextAttemptStatus::Undetermined { carried_epoch },
-                        unattempted_count: blocks.len().saturating_sub(i + 1),
-                    };
-                }
-                Err(error) => {
-                    return BatchLandingVerdict::PartialProgress {
-                        landed_count: i,
-                        next_attempt: NextAttemptStatus::Rejected(error),
-                        unattempted_count: blocks.len().saturating_sub(i + 1),
-                    };
-                }
-            }
-        }
-
-        BatchLandingVerdict::LandedAll {
-            final_position: last_position,
-            landed_count: blocks.len(),
-        }
-    }
-
-    /// Appends a batch of raw frame blocks, returning the write landing verdict with sequence or frame count.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if storage write or synchronization fails.
-    fn append_batch(
-        &mut self,
-        blocks: &[&[u8]],
-    ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-        match self.append_batch_detailed(blocks) {
-            BatchLandingVerdict::LandedAll { final_position, .. } => {
-                Ok(WriteLandingVerdict::Landed(final_position))
-            }
-            BatchLandingVerdict::PreAttemptRefusal { error, .. } => Err(error),
-            BatchLandingVerdict::PartialProgress {
-                next_attempt: NextAttemptStatus::Undetermined { carried_epoch },
-                ..
-            } => Ok(WriteLandingVerdict::Undetermined { carried_epoch }),
-            BatchLandingVerdict::PartialProgress {
-                next_attempt: NextAttemptStatus::Rejected(err),
-                ..
-            } => Err(err),
-        }
-    }
 
     /// Reads a single block at the specified sequence or index.
     ///
