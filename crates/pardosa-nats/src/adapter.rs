@@ -15,7 +15,19 @@ where
             tokio::runtime::RuntimeFlavor::MultiThread => {
                 tokio::task::block_in_place(|| handle.block_on(fut))
             }
-            _ => std::thread::scope(|s| s.spawn(|| handle.block_on(fut)).join().unwrap()),
+            _ => std::thread::scope(|s| match s.spawn(|| handle.block_on(fut)).join() {
+                Ok(val) => val,
+                Err(payload) => {
+                    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic payload".to_string()
+                    };
+                    panic!("worker thread panicked during asynchronous operation: {msg}");
+                }
+            }),
         },
         Err(_) => handle.block_on(fut),
     }
@@ -43,8 +55,21 @@ fn is_wrong_last_sequence(err: &async_nats::jetstream::context::PublishError) ->
 /// All decoded ownership records found in an artefact's meta stream.
 pub type NatsMetaRecords = MetaRecords;
 
-async fn stream_exists(js: &async_nats::jetstream::Context, stream_name: &str) -> bool {
-    js.get_stream(stream_name).await.is_ok()
+async fn stream_exists(
+    js: &async_nats::jetstream::Context,
+    stream_name: &str,
+) -> Result<bool, OperationFailure> {
+    match js.get_stream(stream_name).await {
+        Ok(_) => Ok(true),
+        Err(err) => {
+            let failure = map_nats_stream_open_error(stream_name, &err);
+            if *failure.condition() == FailureCondition::NoArtefactExists {
+                Ok(false)
+            } else {
+                Err(failure)
+            }
+        }
+    }
 }
 
 async fn read_meta_records_async(
@@ -53,7 +78,16 @@ async fn read_meta_records_async(
 ) -> Result<NatsMetaRecords, OperationFailure> {
     let mut stream = match js.get_stream(meta_stream_name).await {
         Ok(s) => s,
-        Err(_) => return Ok(NatsMetaRecords::default()),
+        Err(err) => {
+            let mapped = map_nats_stream_open_error(meta_stream_name, &err);
+            if *mapped.condition() == FailureCondition::NoArtefactExists {
+                return Ok(NatsMetaRecords::default());
+            }
+            return Err(OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                format!("failed to get meta stream {meta_stream_name}: {err}"),
+            ));
+        }
     };
     let info = match stream.info().await {
         Ok(info) => info,
@@ -73,13 +107,32 @@ async fn read_meta_records_async(
     for seq in first..=last {
         let raw = match stream.get_raw_message(seq).await {
             Ok(msg) => msg,
-            Err(_) => continue,
+            Err(err) => {
+                return Err(OperationFailure::new(
+                    FailureCondition::OwnershipRecordUnreadable,
+                    format!("failed to get raw message from meta stream at seq {seq}: {err}"),
+                ));
+            }
         };
         if seq == 1 {
-            let _ = ContainerHeader::decode(&raw.payload);
+            let (_, consumed) = ContainerHeader::decode(&raw.payload).map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::OwnershipRecordUnreadable,
+                    format!("failed to decode container header in meta stream at seq 1: {err}"),
+                )
+            })?;
+            if consumed != raw.payload.len() {
+                return Err(OperationFailure::new(
+                    FailureCondition::OwnershipRecordUnreadable,
+                    format!(
+                        "unconsumed trailing bytes in container header at seq 1: {} bytes remain",
+                        raw.payload.len() - consumed
+                    ),
+                ));
+            }
             continue;
         }
-        let (payload, _) = match ContainerFrame::decode(&raw.payload) {
+        let (payload, consumed_frame) = match ContainerFrame::decode(&raw.payload) {
             Ok(res) => res,
             Err(err) => {
                 return Err(OperationFailure::new(
@@ -88,37 +141,79 @@ async fn read_meta_records_async(
                 ));
             }
         };
-        if let Ok((record, _)) = OwnershipRecord::decode(&payload) {
-            match record {
-                OwnershipRecord::OwnershipClaim(claim) => {
-                    records.latest_claim = Some(claim);
-                }
-                OwnershipRecord::SchemaDescriptor {
-                    schema_version,
-                    descriptor_bytes,
-                } => {
-                    if let Ok((root, _)) = DescriptorNode::decode(&descriptor_bytes) {
-                        records.schema_descriptor =
-                            Some(SchemaDescriptor::new(schema_version, root));
-                    }
-                }
-                OwnershipRecord::OutboundPointer(p) => {
-                    records.outbound_pointer = Some(p);
-                }
-                OwnershipRecord::InboundPointer(p) => {
-                    records.inbound_pointer = Some(p);
-                }
-                OwnershipRecord::MigrationStart(m) => {
-                    records.migration_start = Some(m);
-                }
-                OwnershipRecord::MigrationEnd(m) => {
-                    records.migration_end = Some(m);
-                }
-                OwnershipRecord::RescuePolicyChoice(r) => {
-                    records.rescue_policy_choice = Some(r);
-                }
-                _ => {}
+        if consumed_frame != raw.payload.len() {
+            return Err(OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                format!(
+                    "unconsumed trailing bytes in frame in meta stream at seq {seq}: {} bytes remain",
+                    raw.payload.len() - consumed_frame
+                ),
+            ));
+        }
+        let (record, consumed_record) = match OwnershipRecord::decode(&payload) {
+            Ok(res) => res,
+            Err(err) => {
+                return Err(OperationFailure::new(
+                    FailureCondition::OwnershipRecordUnreadable,
+                    format!("failed to decode ownership record in meta stream at seq {seq}: {err}"),
+                ));
             }
+        };
+        if consumed_record != payload.len() {
+            return Err(OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                format!(
+                    "unconsumed trailing bytes in ownership record in meta stream at seq {seq}: {} bytes remain",
+                    payload.len() - consumed_record
+                ),
+            ));
+        }
+        match record {
+            OwnershipRecord::OwnershipClaim(claim) => {
+                records.latest_claim = Some(claim);
+            }
+            OwnershipRecord::SchemaDescriptor {
+                schema_version,
+                descriptor_bytes,
+            } => {
+                let (root, consumed_desc) = match DescriptorNode::decode(&descriptor_bytes) {
+                    Ok(res) => res,
+                    Err(err) => {
+                        return Err(OperationFailure::new(
+                            FailureCondition::OwnershipRecordUnreadable,
+                            format!(
+                                "failed to decode schema descriptor in meta stream at seq {seq}: {err}"
+                            ),
+                        ));
+                    }
+                };
+                if consumed_desc != descriptor_bytes.len() {
+                    return Err(OperationFailure::new(
+                        FailureCondition::OwnershipRecordUnreadable,
+                        format!(
+                            "unconsumed trailing bytes in schema descriptor in meta stream at seq {seq}: {} bytes remain",
+                            descriptor_bytes.len() - consumed_desc
+                        ),
+                    ));
+                }
+                records.schema_descriptor = Some(SchemaDescriptor::new(schema_version, root));
+            }
+            OwnershipRecord::OutboundPointer(p) => {
+                records.outbound_pointer = Some(p);
+            }
+            OwnershipRecord::InboundPointer(p) => {
+                records.inbound_pointer = Some(p);
+            }
+            OwnershipRecord::MigrationStart(m) => {
+                records.migration_start = Some(m);
+            }
+            OwnershipRecord::MigrationEnd(m) => {
+                records.migration_end = Some(m);
+            }
+            OwnershipRecord::RescuePolicyChoice(r) => {
+                records.rescue_policy_choice = Some(r);
+            }
+            _ => {}
         }
     }
     Ok(records)
@@ -147,6 +242,26 @@ fn map_nats_stream_open_error(
             FailureCondition::TransportUnavailable,
             format!("transport unavailable opening stream {stream_name}: {err}"),
         )
+    }
+}
+
+fn map_nats_stream_delete_error(
+    stream_name: &str,
+    err: &async_nats::jetstream::context::DeleteStreamError,
+) -> Result<(), OperationFailure> {
+    use async_nats::jetstream::context::GetStreamErrorKind;
+    use async_nats::jetstream::ErrorCode;
+    let is_not_found = match err.kind() {
+        GetStreamErrorKind::JetStream(js_err) => js_err.error_code() == ErrorCode::STREAM_NOT_FOUND,
+        _ => false,
+    };
+    if is_not_found {
+        Ok(())
+    } else {
+        Err(OperationFailure::new(
+            FailureCondition::TransportUnavailable,
+            format!("failed to delete stream {stream_name}: {err}"),
+        ))
     }
 }
 
@@ -508,7 +623,10 @@ impl NatsStorageAdapter {
         let data_stream_name = format!("{stem}_data");
         let meta_subject = format!("{stem}_meta");
         let data_subject = format!("{stem}_data");
-        let js = runtime.block_on(async { async_nats::jetstream::new(client.clone()) });
+        let js = {
+            let _guard = runtime.enter();
+            async_nats::jetstream::new(client.clone())
+        };
         Self {
             url,
             stem,
@@ -577,22 +695,30 @@ impl NatsStorageAdapter {
     }
 
     /// Returns the presence of artefact streams in JetStream per C5.10.
-    #[must_use]
-    pub fn presence(&self) -> ArtefactPresence {
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if stream inspection fails unexpectedly.
+    pub fn try_presence(&self) -> Result<ArtefactPresence, OperationFailure> {
         let js = self.js.clone();
         let meta_name = self.meta_stream_name.clone();
         let data_name = self.data_stream_name.clone();
         let handle = self.runtime.handle().clone();
         run_future(&handle, async move {
-            let meta_exists = stream_exists(&js, &meta_name).await;
-            let data_exists = stream_exists(&js, &data_name).await;
-            match (meta_exists, data_exists) {
+            let meta_exists = stream_exists(&js, &meta_name).await?;
+            let data_exists = stream_exists(&js, &data_name).await?;
+            Ok(match (meta_exists, data_exists) {
                 (false, false) => ArtefactPresence::None,
                 (true, false) => ArtefactPresence::OwnershipRecordOnly,
                 (false, true) => ArtefactPresence::EventDataOnly,
                 (true, true) => ArtefactPresence::Both,
-            }
+            })
         })
+    }
+
+    /// Returns the presence of artefact streams in JetStream per C5.10.
+    #[must_use]
+    pub fn presence(&self) -> ArtefactPresence {
+        self.try_presence().unwrap_or(ArtefactPresence::None)
     }
 
     /// Creates the artefact streams exclusively with initial ownership claim per C5.10, C5.64, and C12.3.
@@ -604,7 +730,7 @@ impl NatsStorageAdapter {
         &self,
         initial_claim: &OwnershipClaimRecord,
     ) -> Result<NatsWriterSession, OperationFailure> {
-        admit_create(self.presence())?;
+        admit_create(self.try_presence()?)?;
 
         let js = self.js.clone();
         let client = self.client.clone();
@@ -803,7 +929,7 @@ impl NatsStorageAdapter {
         &self,
         claim: &OwnershipClaimRecord,
     ) -> Result<(), OperationFailure> {
-        let presence = self.presence();
+        let presence = self.try_presence()?;
         if presence != ArtefactPresence::None {
             return Err(OperationFailure::new(
                 FailureCondition::StoreAlreadyExists,
@@ -924,7 +1050,7 @@ impl NatsStorageAdapter {
         &self,
         claim: &OwnershipClaimRecord,
     ) -> Result<NatsWriterSession, OperationFailure> {
-        let presence = self.presence();
+        let presence = self.try_presence()?;
         if presence != ArtefactPresence::OwnershipRecordOnly {
             return Err(OperationFailure::new(
                 FailureCondition::StoreAlreadyExists,
@@ -1046,7 +1172,7 @@ impl NatsStorageAdapter {
     /// Returns [`OperationFailure`] with [`FailureCondition::StaleEpoch`] if carried epoch is superseded.
     pub fn open_write(&self, carried_epoch: u64) -> Result<NatsWriterSession, OperationFailure> {
         let handle = self.runtime.handle().clone();
-        match self.presence() {
+        match self.try_presence()? {
             ArtefactPresence::None => {
                 return Err(OperationFailure::new(
                     FailureCondition::NoArtefactExists,
@@ -1188,7 +1314,7 @@ impl NatsStorageAdapter {
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::NoArtefactExists`] if artefact is missing.
     pub fn open_read(&self) -> Result<NatsReaderSession, OperationFailure> {
-        let presence = self.presence();
+        let presence = self.try_presence()?;
         if presence == ArtefactPresence::None {
             return Err(OperationFailure::new(
                 FailureCondition::NoArtefactExists,
@@ -1383,8 +1509,12 @@ impl NatsStorageAdapter {
         let handle = self.runtime.handle().clone();
 
         run_future(&handle, async move {
-            let _ = js.delete_stream(&meta_name).await;
-            let _ = js.delete_stream(&data_name).await;
+            if let Err(err) = js.delete_stream(&meta_name).await {
+                map_nats_stream_delete_error(&meta_name, &err)?;
+            }
+            if let Err(err) = js.delete_stream(&data_name).await {
+                map_nats_stream_delete_error(&data_name, &err)?;
+            }
             Ok(())
         })
     }
@@ -1589,6 +1719,15 @@ impl StorageEngine for NatsEngine {
 
         match ack {
             WriteLandingVerdict::Landed(pub_ack) => {
+                if pub_ack.stream != self.data_stream_name {
+                    self.uncertain = true;
+                    let msg = format!(
+                        "publish ack stream mismatch: expected {}, got {}",
+                        self.data_stream_name, pub_ack.stream
+                    );
+                    self.uncertain_diagnostic = Some(msg);
+                    return Ok(WriteLandingVerdict::Undetermined { carried_epoch });
+                }
                 self.last_data_seq = pub_ack.sequence;
                 Ok(WriteLandingVerdict::Landed(pub_ack.sequence))
             }
@@ -2202,7 +2341,9 @@ impl MigrationTarget for NatsStorageAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_nats::jetstream::context::{GetStreamError, GetStreamErrorKind};
+    use async_nats::jetstream::context::{
+        DeleteStreamError, DeleteStreamErrorKind, GetStreamError, GetStreamErrorKind,
+    };
     use async_nats::jetstream::stream::{RawMessageError, RawMessageErrorKind};
     use pardosa::store::FailureCondition;
 
@@ -2300,5 +2441,40 @@ mod tests {
         let err = GetStreamError::new(GetStreamErrorKind::JetStream(js_err));
         let failure = map_nats_stream_open_error("test_stream", &err);
         assert_eq!(*failure.condition(), FailureCondition::TransportUnavailable);
+    }
+
+    #[test]
+    fn test_map_nats_stream_delete_error_stream_not_found_is_ok() {
+        let js_err: async_nats::jetstream::Error = serde_json::from_str(
+            r#"{"code": 404, "err_code": 10059, "description": "stream not found"}"#,
+        )
+        .unwrap();
+        let err = DeleteStreamError::new(DeleteStreamErrorKind::JetStream(js_err));
+        let res = map_nats_stream_delete_error("test_stream", &err);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_map_nats_stream_delete_error_unrelated_code_is_transport_unavailable() {
+        let js_err: async_nats::jetstream::Error = serde_json::from_str(
+            r#"{"code": 500, "err_code": 10000, "description": "internal server error"}"#,
+        )
+        .unwrap();
+        let err = DeleteStreamError::new(DeleteStreamErrorKind::JetStream(js_err));
+        let res = map_nats_stream_delete_error("test_stream", &err);
+        assert_eq!(
+            *res.expect_err("must fail").condition(),
+            FailureCondition::TransportUnavailable
+        );
+    }
+
+    #[test]
+    fn test_map_nats_stream_delete_error_empty_name_is_transport_unavailable() {
+        let err = DeleteStreamError::new(DeleteStreamErrorKind::EmptyName);
+        let res = map_nats_stream_delete_error("test_stream", &err);
+        assert_eq!(
+            *res.expect_err("must fail").condition(),
+            FailureCondition::TransportUnavailable
+        );
     }
 }

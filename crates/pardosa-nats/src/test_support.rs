@@ -49,7 +49,7 @@ impl LiveNatsServer {
 
         let tempdir = TempDir::new()?;
         let host = "127.0.0.1";
-        let child = Command::new("nats-server")
+        let mut child = Command::new("nats-server")
             .arg("-a")
             .arg(host)
             .arg("-p")
@@ -63,7 +63,11 @@ impl LiveNatsServer {
             .spawn()?;
 
         let url = format!("nats://{host}:{port}");
-        wait_for_readiness(&url)?;
+        if let Err(err) = wait_for_readiness(&url) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
 
         Ok(Self {
             url,

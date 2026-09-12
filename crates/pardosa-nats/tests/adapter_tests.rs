@@ -1945,3 +1945,253 @@ fn test_nats_incremental_recovery_open_writer_and_reader_identical_state() {
 
     adapter.delete_streams().expect("cleanup");
 }
+
+#[test]
+fn test_nats_unreadable_newer_claim_halts_writes_zero_data_appends() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("unreadable_claim");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
+
+    let claim = sample_claim(1);
+    let mut writer = adapter.create(&claim).expect("create should succeed");
+    writer.append_raw_frame(b"frame-1").expect("first frame");
+    let seq_before = writer.last_sequence();
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        let client = async_nats::connect(server.url())
+            .await
+            .expect("connect async_nats");
+        let js = async_nats::jetstream::new(client);
+        let mut malformed_payload = Vec::new();
+        OwnershipRecord::OwnershipClaim(sample_claim(2)).encode(&mut malformed_payload);
+        malformed_payload.extend_from_slice(b"trailing-corrupt-bytes");
+        let mut frame_bytes = Vec::new();
+        ContainerFrame::encode_payload(&malformed_payload, &mut frame_bytes);
+
+        js.publish(adapter.meta_stream_name().to_string(), frame_bytes.into())
+            .await
+            .expect("publish malformed claim")
+            .await
+            .expect("ack malformed claim");
+    });
+
+    let err = writer
+        .append_raw_frame(b"frame-2-should-fail")
+        .expect_err("unreadable newer claim must halt write");
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::OwnershipRecordUnreadable
+    );
+    assert_eq!(writer.last_sequence(), seq_before);
+
+    rt.block_on(async {
+        let client = async_nats::connect(server.url()).await.expect("connect");
+        let js = async_nats::jetstream::new(client);
+        let mut stream = js
+            .get_stream(adapter.data_stream_name())
+            .await
+            .expect("get data stream");
+        let info = stream.info().await.expect("stream info");
+        assert_eq!(info.state.messages, 2);
+    });
+
+    adapter.delete_streams().expect("cleanup");
+}
+
+#[test]
+fn test_nats_unreadable_retirement_record_halts_writes_zero_data_appends() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("unreadable_retire");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
+
+    let claim = sample_claim(1);
+    let mut writer = adapter.create(&claim).expect("create should succeed");
+    writer.append_raw_frame(b"frame-1").expect("first frame");
+    let seq_before = writer.last_sequence();
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        let client = async_nats::connect(server.url())
+            .await
+            .expect("connect async_nats");
+        let js = async_nats::jetstream::new(client);
+        let outbound = OutboundPointerRecord {
+            next_generation_locator_id: [7u8; 16],
+            cutover_epoch: 2,
+        };
+        let mut malformed_payload = Vec::new();
+        OwnershipRecord::OutboundPointer(outbound).encode(&mut malformed_payload);
+        malformed_payload.extend_from_slice(b"trailing-corrupt-bytes");
+        let mut frame_bytes = Vec::new();
+        ContainerFrame::encode_payload(&malformed_payload, &mut frame_bytes);
+
+        js.publish(adapter.meta_stream_name().to_string(), frame_bytes.into())
+            .await
+            .expect("publish malformed retirement")
+            .await
+            .expect("ack malformed retirement");
+    });
+
+    let err = writer
+        .append_raw_frame(b"frame-2-should-fail")
+        .expect_err("unreadable retirement record must halt write");
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::OwnershipRecordUnreadable
+    );
+    assert_eq!(writer.last_sequence(), seq_before);
+
+    rt.block_on(async {
+        let client = async_nats::connect(server.url()).await.expect("connect");
+        let js = async_nats::jetstream::new(client);
+        let mut stream = js
+            .get_stream(adapter.data_stream_name())
+            .await
+            .expect("get data stream");
+        let info = stream.info().await.expect("stream info");
+        assert_eq!(info.state.messages, 2);
+    });
+
+    adapter.delete_streams().expect("cleanup");
+}
+
+#[test]
+fn test_nats_routing_stream_mismatch_marks_session_uncertain() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("routing_mismatch");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
+
+    let claim = sample_claim(1);
+    let _writer = adapter.create(&claim).expect("create writer");
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let rogue_stem = unique_stem("rogue_stream");
+    let rogue_subject = format!("{rogue_stem}_subject");
+    rt.block_on(async {
+        let client = async_nats::connect(server.url())
+            .await
+            .expect("connect async_nats");
+        let js = async_nats::jetstream::new(client);
+        js.create_stream(async_nats::jetstream::stream::Config {
+            name: rogue_stem.clone(),
+            subjects: vec![rogue_subject.clone()],
+            storage: async_nats::jetstream::stream::StorageType::File,
+            ..Default::default()
+        })
+        .await
+        .expect("create rogue stream");
+
+        let header = ContainerHeader::new();
+        let mut header_bytes = Vec::new();
+        header.encode(&mut header_bytes);
+        js.publish(rogue_subject.clone(), header_bytes.into())
+            .await
+            .expect("publish header to rogue stream")
+            .await
+            .expect("ack header to rogue stream");
+    });
+
+    let mismatched_adapter = NatsStorageAdapter::new(server.url(), &stem)
+        .expect("connect")
+        .with_subjects(adapter.meta_stream_name().to_string(), rogue_subject);
+    let mut mismatched_writer = mismatched_adapter.open_write(1).expect("open write");
+
+    let err = mismatched_writer
+        .append_raw_frame(b"mismatched-payload")
+        .expect_err("mismatched stream ack must yield undetermined landing");
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::OwnershipRecordUnreadable
+    );
+    assert!(mismatched_writer.uncertain_diagnostic().is_some());
+    assert!(mismatched_writer
+        .uncertain_diagnostic()
+        .unwrap()
+        .contains("publish ack stream mismatch"));
+
+    let err2 = mismatched_writer
+        .append_raw_frame(b"subsequent-write")
+        .expect_err("uncertain session must refuse writes");
+    assert!(err2.to_string().contains("uncertain state"));
+
+    adapter.delete_streams().expect("cleanup");
+    let _ = rt.block_on(async {
+        let client = async_nats::connect(server.url()).await.ok()?;
+        let js = async_nats::jetstream::new(client);
+        let _ = js.delete_stream(&rogue_stem).await;
+        Some(())
+    });
+}
+
+#[test]
+fn test_nats_and_file_read_meta_records_reject_trailing_bytes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let meta_path = dir.path().join("test.meta");
+
+    let header = ContainerHeader::new();
+    let mut file_bytes = header.to_bytes().to_vec();
+
+    let mut claim_bytes = Vec::new();
+    OwnershipRecord::OwnershipClaim(sample_claim(1)).encode(&mut claim_bytes);
+    claim_bytes.extend_from_slice(b"trailing-bytes");
+
+    let mut frame_bytes = Vec::new();
+    ContainerFrame::encode_payload(&claim_bytes, &mut frame_bytes);
+    file_bytes.extend_from_slice(&frame_bytes);
+
+    std::fs::write(&meta_path, &file_bytes).expect("write meta");
+
+    let file_err = pardosa::file::read_meta_records(&meta_path)
+        .expect_err("file read_meta_records must reject trailing bytes in ownership record");
+    assert_eq!(
+        *file_err.condition(),
+        FailureCondition::OwnershipRecordUnreadable
+    );
+
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("meta_trailing");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
+    adapter
+        .create_incomplete_meta_only(&sample_claim(1))
+        .expect("create meta");
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        let client = async_nats::connect(server.url()).await.expect("connect");
+        let js = async_nats::jetstream::new(client);
+        js.publish(adapter.meta_stream_name().to_string(), frame_bytes.into())
+            .await
+            .expect("pub")
+            .await
+            .expect("ack");
+    });
+
+    let nats_err = adapter
+        .read_meta_records()
+        .expect_err("nats read_meta_records must reject trailing bytes in ownership record");
+    assert_eq!(
+        *nats_err.condition(),
+        FailureCondition::OwnershipRecordUnreadable
+    );
+
+    adapter.delete_streams().expect("cleanup");
+}
+
+#[test]
+fn test_nats_from_client_internal_no_nested_block_on() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("no_nested_block_on");
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("tokio runtime"));
+    let rt_clone = rt.clone();
+    let server_url = server.url().to_string();
+
+    let adapter = rt.block_on(async move {
+        let client = async_nats::connect(&server_url)
+            .await
+            .expect("connect async_nats");
+        NatsStorageAdapter::from_client_with_runtime(client, stem, rt_clone)
+    });
+
+    assert_eq!(adapter.presence(), ArtefactPresence::None);
+}

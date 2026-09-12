@@ -361,12 +361,21 @@ pub fn read_meta_records(meta_path: &Path) -> Result<MetaRecords, OperationFailu
     })?;
     let mut records = MetaRecords::default();
     for frame in frames {
-        let (record, _) = OwnershipRecord::decode(&frame).map_err(|err| {
+        let (record, consumed) = OwnershipRecord::decode(&frame).map_err(|err| {
             OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
                 format!("failed to decode ownership record from .meta: {err}"),
             )
         })?;
+        if consumed != frame.len() {
+            return Err(OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                format!(
+                    "unconsumed trailing bytes in ownership record from .meta: {} bytes remain",
+                    frame.len() - consumed
+                ),
+            ));
+        }
         match record {
             OwnershipRecord::OwnershipClaim(claim) => {
                 records.latest_claim = Some(claim);
@@ -375,12 +384,22 @@ pub fn read_meta_records(meta_path: &Path) -> Result<MetaRecords, OperationFailu
                 schema_version,
                 descriptor_bytes,
             } => {
-                let (root, _) = DescriptorNode::decode(&descriptor_bytes).map_err(|err| {
-                    OperationFailure::new(
+                let (root, consumed_desc) =
+                    DescriptorNode::decode(&descriptor_bytes).map_err(|err| {
+                        OperationFailure::new(
+                            FailureCondition::OwnershipRecordUnreadable,
+                            format!("failed to decode schema descriptor in .meta: {err}"),
+                        )
+                    })?;
+                if consumed_desc != descriptor_bytes.len() {
+                    return Err(OperationFailure::new(
                         FailureCondition::OwnershipRecordUnreadable,
-                        format!("failed to decode schema descriptor in .meta: {err}"),
-                    )
-                })?;
+                        format!(
+                            "unconsumed trailing bytes in schema descriptor in .meta: {} bytes remain",
+                            descriptor_bytes.len() - consumed_desc
+                        ),
+                    ));
+                }
                 records.schema_descriptor = Some(SchemaDescriptor::new(schema_version, root));
             }
             OwnershipRecord::OutboundPointer(p) => {
