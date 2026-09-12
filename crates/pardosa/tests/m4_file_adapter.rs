@@ -619,13 +619,21 @@ fn test_m4_append_batch_detailed_partial_landing_undetermined_and_failure() {
         .append_batch_envelopes_detailed(&[env1.clone(), env2.clone(), env3.clone(), env4.clone()])
         .expect("append batch detailed returns verdict");
 
-    assert_eq!(
-        verdict,
-        BatchLandingVerdict::Undetermined {
-            landed_count: 2,
-            carried_epoch: 1,
+    match &verdict {
+        BatchLandingVerdict::Receipts { receipts } => {
+            assert_eq!(receipts.len(), 4);
+            assert_eq!(receipts[0], ItemLandingStatus::Landed(1));
+            assert_eq!(receipts[1], ItemLandingStatus::Landed(2));
+            assert_eq!(
+                receipts[2],
+                ItemLandingStatus::Unresolved { carried_epoch: 1 }
+            );
+            assert_eq!(receipts[3], ItemLandingStatus::Unattempted);
         }
-    );
+        other => panic!("expected Receipts, got {other:?}"),
+    }
+    assert_eq!(verdict.landed_count(4), 2);
+    assert_eq!(verdict.unresolved_count(), 1);
     assert_eq!(verdict.unattempted_count(4), 1);
     assert_eq!(writer_undetermined.rolling_commitment().frame_count(), 2);
     let h = writer_undetermined
@@ -662,19 +670,25 @@ fn test_m4_append_batch_detailed_partial_landing_undetermined_and_failure() {
         .expect("returns partial failure verdict");
 
     match &verdict_fail {
-        BatchLandingVerdict::PartialFailure {
-            landed_count,
-            error,
-        } => {
-            assert_eq!(*landed_count, 1);
-            assert_eq!(verdict_fail.unattempted_count(3), 1);
-            assert_eq!(
-                *error.condition(),
-                FailureCondition::PrecursorChainBroken(None)
-            );
+        BatchLandingVerdict::Receipts { receipts } => {
+            assert_eq!(receipts.len(), 3);
+            assert_eq!(receipts[0], ItemLandingStatus::Landed(1));
+            match &receipts[1] {
+                ItemLandingStatus::Rejected(error) => {
+                    assert_eq!(
+                        *error.condition(),
+                        FailureCondition::PrecursorChainBroken(None)
+                    );
+                }
+                other => panic!("expected Rejected, got {other:?}"),
+            }
+            assert_eq!(receipts[2], ItemLandingStatus::Unattempted);
         }
-        other => panic!("expected PartialFailure, got {other:?}"),
+        other => panic!("expected Receipts, got {other:?}"),
     }
+    assert_eq!(verdict_fail.landed_count(3), 1);
+    assert_eq!(verdict_fail.rejected_count(), 1);
+    assert_eq!(verdict_fail.unattempted_count(3), 1);
 
     assert_eq!(writer_fail.rolling_commitment().frame_count(), 1);
     let h_fail = writer_fail.fiber(fiber1).expect("fiber1 handle");
@@ -690,6 +704,47 @@ fn test_m4_append_batch_detailed_partial_landing_undetermined_and_failure() {
         reader_fail.rolling_commitment().current_commitment(),
         writer_fail.rolling_commitment().current_commitment()
     );
+}
+
+#[test]
+fn test_m4_append_batch_sync_error_marks_all_written_unresolved() {
+    let dir = TestDir::new("batch_sync_error");
+    let store_path = dir.path().join("store_sync_err");
+    let adapter = FileStorageAdapter::new(&store_path);
+    let claim = sample_claim(1);
+
+    let mut writer = adapter
+        .create(&claim)
+        .expect("create writer")
+        .with_simulate_sync_error(true);
+    let fiber1 = [0x88; 16];
+    let env1 = EventEnvelope::genesis([0x01; 16], fiber1, b"f1-genesis".to_vec()).expect("genesis");
+    let env2 = EventEnvelope::chain(&env1, [0x02; 16], b"f1-event2".to_vec()).expect("chain");
+
+    let verdict = writer
+        .append_batch_envelopes_detailed(&[env1.clone(), env2.clone()])
+        .expect("returns verdict");
+
+    match &verdict {
+        BatchLandingVerdict::Receipts { receipts } => {
+            assert_eq!(receipts.len(), 2);
+            assert_eq!(
+                receipts[0],
+                ItemLandingStatus::Unresolved { carried_epoch: 1 }
+            );
+            assert_eq!(
+                receipts[1],
+                ItemLandingStatus::Unresolved { carried_epoch: 1 }
+            );
+        }
+        other => panic!("expected Receipts with Unresolved, got {other:?}"),
+    }
+    assert_eq!(verdict.landed_count(2), 0);
+    assert_eq!(verdict.unresolved_count(), 2);
+    assert_eq!(verdict.unattempted_count(2), 0);
+    assert!(verdict.has_unresolved());
+
+    assert_eq!(writer.rolling_commitment().frame_count(), 0);
 }
 
 #[test]

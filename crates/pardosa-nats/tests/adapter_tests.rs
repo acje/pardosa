@@ -867,6 +867,84 @@ fn test_nats_format_vectors_roundtrip() {
 }
 
 #[test]
+fn test_nats_append_batch_detailed_outcomes_and_variable_sizes() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("nats_batch_outcomes");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
+    let claim = sample_claim(1);
+    let mut writer = adapter.create(&claim).expect("create writer");
+
+    let fiber = [0x77; 16];
+
+    let empty_v = writer
+        .append_batch_envelopes_detailed(&[])
+        .expect("empty batch");
+    assert_eq!(
+        empty_v,
+        BatchLandingVerdict::LandedAll { final_position: 0 }
+    );
+    assert_eq!(empty_v.landed_count(0), 0);
+
+    let env1 = EventEnvelope::genesis([0x01; 16], fiber, b"payload-1".to_vec()).expect("genesis");
+    let single_v = writer
+        .append_batch_envelopes_detailed(std::slice::from_ref(&env1))
+        .expect("single batch");
+    assert_eq!(single_v.landed_count(1), 1);
+    assert_eq!(single_v.unresolved_count(), 0);
+    assert_eq!(single_v.unattempted_count(1), 0);
+    assert!(single_v.is_all_landed());
+
+    let mut batch_80 = Vec::with_capacity(80);
+    let mut prev = env1;
+    for i in 2..=81u8 {
+        let env = EventEnvelope::chain(&prev, [i; 16], format!("payload-{i}").into_bytes())
+            .expect("chain");
+        prev = env.clone();
+        batch_80.push(env);
+    }
+
+    let batch_v = writer
+        .append_batch_envelopes_detailed(&batch_80)
+        .expect("oversize batch");
+    assert!(batch_v.is_all_landed());
+    assert_eq!(batch_v.landed_count(80), 80);
+    assert_eq!(batch_v.unattempted_count(80), 0);
+
+    assert_eq!(writer.rolling_commitment().frame_count(), 81);
+    assert_eq!(writer.fiber(fiber).expect("fiber").event_count(), 81);
+
+    let stem_undet = unique_stem("nats_batch_undet");
+    let adapter_undet = NatsStorageAdapter::new(server.url(), &stem_undet).expect("connect");
+    let mut writer_undet = adapter_undet
+        .create(&claim)
+        .expect("create writer")
+        .with_simulate_indeterminate(true);
+
+    let undet_env = EventEnvelope::genesis([0x99; 16], [0x88; 16], b"undet".to_vec()).expect("gen");
+    let undet_v = writer_undet
+        .append_batch_envelopes_detailed(std::slice::from_ref(&undet_env))
+        .expect("undet returns verdict");
+
+    match &undet_v {
+        BatchLandingVerdict::Receipts { receipts } => {
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(
+                receipts[0],
+                ItemLandingStatus::Unresolved { carried_epoch: 1 }
+            );
+        }
+        other => panic!("expected Receipts with Unresolved, got {other:?}"),
+    }
+    assert_eq!(undet_v.landed_count(1), 0);
+    assert_eq!(undet_v.unresolved_count(), 1);
+    assert_eq!(undet_v.unattempted_count(1), 0);
+    assert!(undet_v.has_unresolved());
+
+    adapter.delete_streams().expect("cleanup");
+    adapter_undet.delete_streams().expect("cleanup");
+}
+
+#[test]
 fn test_nats_create_append_then_read_in_same_session() {
     let server = LiveNatsServer::acquire();
     let stem = unique_stem("same_sess_read");

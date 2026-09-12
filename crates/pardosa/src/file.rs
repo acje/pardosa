@@ -257,7 +257,15 @@ fn read_container_frames(
             format!("failed to seek container file: {err}"),
         )
     })?;
-    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let file_len = file
+        .metadata()
+        .map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::TransportUnavailable,
+                format!("failed to read container file metadata: {err}"),
+            )
+        })?
+        .len();
     if file_len < 12 {
         return Err(OperationFailure::new(
             FailureCondition::PrecursorChainBroken(None),
@@ -1270,19 +1278,27 @@ impl StorageEngine for FileEngine {
         blocks: &[&[u8]],
     ) -> crate::store::BatchLandingVerdict<u64> {
         if let Err(error) = self.check_authority() {
-            return crate::store::BatchLandingVerdict::PartialFailure {
-                landed_count: 0,
-                error,
-            };
+            return crate::store::BatchLandingVerdict::PreAttemptRefusal { error };
         }
         if blocks.is_empty() {
             return crate::store::BatchLandingVerdict::LandedAll {
                 final_position: self.frame_count,
             };
         }
+        if self.simulate_indeterminate {
+            self.uncertain = true;
+            self.uncertain_diagnostic = Some("simulated indeterminate write landing".to_string());
+            let receipts = vec![
+                crate::store::ItemLandingStatus::Unresolved {
+                    carried_epoch: self.carried_epoch,
+                };
+                blocks.len()
+            ];
+            return crate::store::BatchLandingVerdict::Receipts { receipts };
+        }
+
         let Some(file) = &mut self.file else {
-            return crate::store::BatchLandingVerdict::PartialFailure {
-                landed_count: 0,
+            return crate::store::BatchLandingVerdict::PreAttemptRefusal {
                 error: OperationFailure::new(
                     FailureCondition::OwnershipUnestablished,
                     "no file open for writing",
@@ -1291,8 +1307,7 @@ impl StorageEngine for FileEngine {
         };
 
         if let Err(err) = file.seek(SeekFrom::End(0)) {
-            return crate::store::BatchLandingVerdict::PartialFailure {
-                landed_count: 0,
+            return crate::store::BatchLandingVerdict::PreAttemptRefusal {
                 error: OperationFailure::new(
                     FailureCondition::PrecursorChainBroken(None),
                     format!("failed to seek to end of container: {err}"),
@@ -1300,40 +1315,56 @@ impl StorageEngine for FileEngine {
             };
         }
 
-        let mut landed_count = 0;
+        let mut receipts = Vec::with_capacity(blocks.len());
+        let mut written_blocks = 0usize;
+        let mut early_exit = None;
+
         for (i, block) in blocks.iter().enumerate() {
             if let Some(limit) = self.fail_after_n_blocks {
                 if (self.frame_count as usize) + i >= limit {
-                    return crate::store::BatchLandingVerdict::PartialFailure {
-                        landed_count: i,
-                        error: OperationFailure::new(
+                    early_exit = Some((
+                        i,
+                        crate::store::ItemLandingStatus::Rejected(OperationFailure::new(
                             FailureCondition::PrecursorChainBroken(None),
                             "simulated write failure after limit",
-                        ),
-                    };
+                        )),
+                    ));
+                    break;
                 }
             }
             if let Some(undet) = self.undetermined_after_n_blocks {
                 if (self.frame_count as usize) + i >= undet {
                     self.uncertain = true;
                     self.uncertain_diagnostic = Some("simulated undetermined".to_string());
-                    return crate::store::BatchLandingVerdict::Undetermined {
-                        landed_count: i,
-                        carried_epoch: self.carried_epoch,
-                    };
+                    early_exit = Some((
+                        i,
+                        crate::store::ItemLandingStatus::Unresolved {
+                            carried_epoch: self.carried_epoch,
+                        },
+                    ));
+                    break;
                 }
             }
-            if let Err(err) = file.write_all(block) {
+            let write_res = if self.simulate_write_error {
+                Err(std::io::Error::other("simulated write_all failure"))
+            } else {
+                file.write_all(block)
+            };
+
+            if let Err(err) = write_res {
                 self.uncertain = true;
                 self.uncertain_diagnostic = Some(format!(
                     "write_all failed; write landing undetermined: {err}"
                 ));
-                return crate::store::BatchLandingVerdict::Undetermined {
-                    landed_count: i,
-                    carried_epoch: self.carried_epoch,
-                };
+                early_exit = Some((
+                    i,
+                    crate::store::ItemLandingStatus::Unresolved {
+                        carried_epoch: self.carried_epoch,
+                    },
+                ));
+                break;
             }
-            landed_count += 1;
+            written_blocks += 1;
         }
 
         let sync_res = if self.simulate_sync_error {
@@ -1347,15 +1378,35 @@ impl StorageEngine for FileEngine {
             self.uncertain_diagnostic = Some(format!(
                 "sync_data failed; write landing undetermined: {err}"
             ));
-            return crate::store::BatchLandingVerdict::Undetermined {
-                landed_count: 0,
-                carried_epoch: self.carried_epoch,
-            };
+            for _ in 0..written_blocks {
+                receipts.push(crate::store::ItemLandingStatus::Unresolved {
+                    carried_epoch: self.carried_epoch,
+                });
+            }
+            if let Some((_, status)) = early_exit {
+                receipts.push(status);
+            }
+            while receipts.len() < blocks.len() {
+                receipts.push(crate::store::ItemLandingStatus::Unattempted);
+            }
+            return crate::store::BatchLandingVerdict::Receipts { receipts };
         }
 
-        self.frame_count += landed_count as u64;
-        crate::store::BatchLandingVerdict::LandedAll {
-            final_position: self.frame_count,
+        for _ in 0..written_blocks {
+            self.frame_count += 1;
+            receipts.push(crate::store::ItemLandingStatus::Landed(self.frame_count));
+        }
+
+        if let Some((_, status)) = early_exit {
+            receipts.push(status);
+            while receipts.len() < blocks.len() {
+                receipts.push(crate::store::ItemLandingStatus::Unattempted);
+            }
+            crate::store::BatchLandingVerdict::Receipts { receipts }
+        } else {
+            crate::store::BatchLandingVerdict::LandedAll {
+                final_position: self.frame_count,
+            }
         }
     }
 

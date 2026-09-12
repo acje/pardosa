@@ -13,7 +13,7 @@ use crate::store::session_index::SessionIndex;
 use crate::store::{FailureCondition, OpenAdmission, OperationFailure, WriteLandingVerdict};
 use std::fmt;
 
-pub use crate::store::BatchLandingVerdict;
+pub use crate::store::{BatchLandingVerdict, ItemLandingStatus};
 
 /// Unified storage pipeline owning fiber handles, caching, and state verification per C5 and C6.
 pub struct Store<E: StorageEngine> {
@@ -578,51 +578,28 @@ impl<E: StorageEngine> Store<E> {
                     final_position: self.rolling_commitment.frame_count(),
                 })
             }
-            BatchLandingVerdict::Undetermined {
-                landed_count,
-                carried_epoch,
-            } => {
-                if landed_count >= payloads.len() {
-                    return Err(OperationFailure::new(
-                        FailureCondition::PrecursorChainBroken(None),
-                        format!(
-                            "engine reported impossible batch landed_count {landed_count} for undetermined outcome on batch of length {}",
-                            payloads.len()
-                        ),
-                    ));
-                }
-                for i in 0..landed_count {
-                    self.rolling_commitment.update_frame(&frame_buffers[i]);
-                    self.fiber_index
-                        .commit_envelope_unchecked(decoded_envelopes[i].clone());
-                }
-                Ok(BatchLandingVerdict::Undetermined {
-                    landed_count,
-                    carried_epoch,
-                })
+            BatchLandingVerdict::PreAttemptRefusal { error } => {
+                Ok(BatchLandingVerdict::PreAttemptRefusal { error })
             }
-            BatchLandingVerdict::PartialFailure {
-                landed_count,
-                error,
-            } => {
-                if landed_count >= payloads.len() {
+            BatchLandingVerdict::Receipts { receipts } => {
+                if receipts.len() != payloads.len() {
                     return Err(OperationFailure::new(
                         FailureCondition::PrecursorChainBroken(None),
                         format!(
-                            "engine reported impossible batch landed_count {landed_count} for partial failure on batch of length {}",
+                            "engine reported receipt count {} mismatch with batch length {}",
+                            receipts.len(),
                             payloads.len()
                         ),
                     ));
                 }
-                for i in 0..landed_count {
-                    self.rolling_commitment.update_frame(&frame_buffers[i]);
-                    self.fiber_index
-                        .commit_envelope_unchecked(decoded_envelopes[i].clone());
+                for (i, status) in receipts.iter().enumerate() {
+                    if let ItemLandingStatus::Landed(_) = status {
+                        self.rolling_commitment.update_frame(&frame_buffers[i]);
+                        self.fiber_index
+                            .commit_envelope_unchecked(decoded_envelopes[i].clone());
+                    }
                 }
-                Ok(BatchLandingVerdict::PartialFailure {
-                    landed_count,
-                    error,
-                })
+                Ok(BatchLandingVerdict::Receipts { receipts })
             }
         }
     }
@@ -657,10 +634,24 @@ impl<E: StorageEngine> Store<E> {
             BatchLandingVerdict::LandedAll { final_position } => {
                 Ok(WriteLandingVerdict::Landed(final_position))
             }
-            BatchLandingVerdict::Undetermined { carried_epoch, .. } => {
-                Ok(WriteLandingVerdict::Undetermined { carried_epoch })
+            BatchLandingVerdict::PreAttemptRefusal { error } => Err(error),
+            BatchLandingVerdict::Receipts { receipts } => {
+                if let Some(carried_epoch) = receipts.iter().find_map(|r| match r {
+                    ItemLandingStatus::Unresolved { carried_epoch } => Some(*carried_epoch),
+                    _ => None,
+                }) {
+                    Ok(WriteLandingVerdict::Undetermined { carried_epoch })
+                } else if let Some(err) = receipts.into_iter().find_map(|r| match r {
+                    ItemLandingStatus::Rejected(err) => Some(err),
+                    _ => None,
+                }) {
+                    Err(err)
+                } else {
+                    Ok(WriteLandingVerdict::Landed(
+                        self.rolling_commitment.frame_count(),
+                    ))
+                }
             }
-            BatchLandingVerdict::PartialFailure { error, .. } => Err(error),
         }
     }
 
@@ -690,10 +681,24 @@ impl<E: StorageEngine> Store<E> {
             BatchLandingVerdict::LandedAll { final_position } => {
                 Ok(WriteLandingVerdict::Landed(final_position))
             }
-            BatchLandingVerdict::Undetermined { carried_epoch, .. } => {
-                Ok(WriteLandingVerdict::Undetermined { carried_epoch })
+            BatchLandingVerdict::PreAttemptRefusal { error } => Err(error),
+            BatchLandingVerdict::Receipts { receipts } => {
+                if let Some(carried_epoch) = receipts.iter().find_map(|r| match r {
+                    ItemLandingStatus::Unresolved { carried_epoch } => Some(*carried_epoch),
+                    _ => None,
+                }) {
+                    Ok(WriteLandingVerdict::Undetermined { carried_epoch })
+                } else if let Some(err) = receipts.into_iter().find_map(|r| match r {
+                    ItemLandingStatus::Rejected(err) => Some(err),
+                    _ => None,
+                }) {
+                    Err(err)
+                } else {
+                    Ok(WriteLandingVerdict::Landed(
+                        self.rolling_commitment.frame_count(),
+                    ))
+                }
             }
-            BatchLandingVerdict::PartialFailure { error, .. } => Err(error),
         }
     }
 
@@ -1453,13 +1458,21 @@ mod tests {
                 env4.clone(),
             ])
             .expect("batch detailed returns verdict");
-        assert_eq!(
-            verdict,
-            BatchLandingVerdict::Undetermined {
-                landed_count: 2,
-                carried_epoch: 1,
+        match &verdict {
+            BatchLandingVerdict::Receipts { receipts } => {
+                assert_eq!(receipts.len(), 4);
+                assert_eq!(receipts[0], ItemLandingStatus::Landed(1));
+                assert_eq!(receipts[1], ItemLandingStatus::Landed(2));
+                assert_eq!(
+                    receipts[2],
+                    ItemLandingStatus::Unresolved { carried_epoch: 1 }
+                );
+                assert_eq!(receipts[3], ItemLandingStatus::Unattempted);
             }
-        );
+            other => panic!("expected Receipts, got {other:?}"),
+        }
+        assert_eq!(verdict.landed_count(4), 2);
+        assert_eq!(verdict.unresolved_count(), 1);
         assert_eq!(verdict.unattempted_count(4), 1);
         assert_eq!(store.rolling_commitment().frame_count(), 2);
         let h = store.fiber(fiber1).expect("fiber1");
@@ -1519,19 +1532,27 @@ mod tests {
             .expect("batch detailed returns partial failure verdict");
 
         match &verdict {
-            BatchLandingVerdict::PartialFailure {
-                landed_count,
-                error,
-            } => {
-                assert_eq!(*landed_count, 2);
-                assert_eq!(verdict.unattempted_count(5), 2);
-                assert_eq!(
-                    *error.condition(),
-                    FailureCondition::PrecursorChainBroken(None)
-                );
+            BatchLandingVerdict::Receipts { receipts } => {
+                assert_eq!(receipts.len(), 5);
+                assert_eq!(receipts[0], ItemLandingStatus::Landed(1));
+                assert_eq!(receipts[1], ItemLandingStatus::Landed(2));
+                match &receipts[2] {
+                    ItemLandingStatus::Rejected(error) => {
+                        assert_eq!(
+                            *error.condition(),
+                            FailureCondition::PrecursorChainBroken(None)
+                        );
+                    }
+                    other => panic!("expected Rejected, got {other:?}"),
+                }
+                assert_eq!(receipts[3], ItemLandingStatus::Unattempted);
+                assert_eq!(receipts[4], ItemLandingStatus::Unattempted);
             }
-            other => panic!("expected PartialFailure, got {other:?}"),
+            other => panic!("expected Receipts, got {other:?}"),
         }
+        assert_eq!(verdict.landed_count(5), 2);
+        assert_eq!(verdict.rejected_count(), 1);
+        assert_eq!(verdict.unattempted_count(5), 2);
 
         assert_eq!(store.rolling_commitment().frame_count(), 2);
         let h = store.fiber(fiber1).expect("fiber1");

@@ -1658,13 +1658,21 @@ fn test_c5_12_and_c5_16_bounded_batch_landing_verdicts() {
     let v_undet = store_undet
         .append_batch_envelopes_detailed(&batch)
         .expect("verdict undet");
-    assert_eq!(
-        v_undet,
-        BatchLandingVerdict::Undetermined {
-            landed_count: 2,
-            carried_epoch: 42,
+    match &v_undet {
+        BatchLandingVerdict::Receipts { receipts } => {
+            assert_eq!(receipts.len(), 4);
+            assert_eq!(receipts[0], ItemLandingStatus::Landed(1));
+            assert_eq!(receipts[1], ItemLandingStatus::Landed(2));
+            assert_eq!(
+                receipts[2],
+                ItemLandingStatus::Unresolved { carried_epoch: 42 }
+            );
+            assert_eq!(receipts[3], ItemLandingStatus::Unattempted);
         }
-    );
+        other => panic!("expected Receipts, got {other:?}"),
+    }
+    assert_eq!(v_undet.landed_count(4), 2);
+    assert_eq!(v_undet.unresolved_count(), 1);
     assert_eq!(v_undet.unattempted_count(4), 1);
     assert_eq!(store_undet.rolling_commitment().frame_count(), 2);
     assert_eq!(
@@ -1696,16 +1704,23 @@ fn test_c5_12_and_c5_16_bounded_batch_landing_verdicts() {
         .append_batch_envelopes_detailed(&batch)
         .expect("verdict fail");
     match &v_fail {
-        BatchLandingVerdict::PartialFailure {
-            landed_count,
-            error,
-        } => {
-            assert_eq!(*landed_count, 1);
-            assert_eq!(v_fail.unattempted_count(4), 2);
-            assert_eq!(*error.condition(), FailureCondition::ConcurrencyConflict);
+        BatchLandingVerdict::Receipts { receipts } => {
+            assert_eq!(receipts.len(), 4);
+            assert_eq!(receipts[0], ItemLandingStatus::Landed(1));
+            match &receipts[1] {
+                ItemLandingStatus::Rejected(error) => {
+                    assert_eq!(*error.condition(), FailureCondition::ConcurrencyConflict);
+                }
+                other => panic!("expected Rejected, got {other:?}"),
+            }
+            assert_eq!(receipts[2], ItemLandingStatus::Unattempted);
+            assert_eq!(receipts[3], ItemLandingStatus::Unattempted);
         }
-        other => panic!("expected PartialFailure, got {other:?}"),
+        other => panic!("expected Receipts, got {other:?}"),
     }
+    assert_eq!(v_fail.landed_count(4), 1);
+    assert_eq!(v_fail.rejected_count(), 1);
+    assert_eq!(v_fail.unattempted_count(4), 2);
     assert_eq!(store_fail.rolling_commitment().frame_count(), 1);
     assert_eq!(
         store_fail
@@ -1900,10 +1915,14 @@ fn test_m4_impossible_engine_batch_count_is_refused_by_store() {
         ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
             Ok(WriteLandingVerdict::Landed(1))
         }
-        fn append_batch_detailed(&mut self, _b: &[&[u8]]) -> BatchLandingVerdict<u64> {
-            BatchLandingVerdict::Undetermined {
-                landed_count: 1,
-                carried_epoch: self.epoch,
+        fn append_batch_detailed(&mut self, _blocks: &[&[u8]]) -> BatchLandingVerdict<u64> {
+            BatchLandingVerdict::Receipts {
+                receipts: vec![
+                    ItemLandingStatus::Landed(1),
+                    ItemLandingStatus::Unresolved {
+                        carried_epoch: self.epoch,
+                    },
+                ],
             }
         }
         fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
@@ -1961,7 +1980,7 @@ fn test_m4_impossible_engine_batch_count_is_refused_by_store() {
     assert!(err
         .diagnostic_detail()
         .message()
-        .contains("impossible batch landed_count"));
+        .contains("receipt count 2 mismatch with batch length 1"));
 }
 
 #[test]

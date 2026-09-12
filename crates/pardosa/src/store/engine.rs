@@ -34,33 +34,46 @@ pub trait StorageEngine {
     /// Appends a batch of raw frame blocks, returning detailed landing progress.
     fn append_batch_detailed(&mut self, blocks: &[&[u8]]) -> BatchLandingVerdict<u64> {
         if let Err(error) = self.check_authority() {
-            return BatchLandingVerdict::PartialFailure {
-                landed_count: 0,
-                error,
-            };
+            return BatchLandingVerdict::PreAttemptRefusal { error };
         }
+        if blocks.is_empty() {
+            return BatchLandingVerdict::LandedAll { final_position: 0 };
+        }
+        let mut receipts = Vec::with_capacity(blocks.len());
         let mut last_position = 0;
+        let mut all_succeeded = true;
+
         for (i, block) in blocks.iter().enumerate() {
             match self.append_block(block) {
                 Ok(WriteLandingVerdict::Landed(seq)) => {
+                    receipts.push(crate::store::ItemLandingStatus::Landed(seq));
                     last_position = seq;
                 }
                 Ok(WriteLandingVerdict::Undetermined { carried_epoch }) => {
-                    return BatchLandingVerdict::Undetermined {
-                        landed_count: i,
-                        carried_epoch,
-                    };
+                    receipts.push(crate::store::ItemLandingStatus::Unresolved { carried_epoch });
+                    all_succeeded = false;
+                    for _ in (i + 1)..blocks.len() {
+                        receipts.push(crate::store::ItemLandingStatus::Unattempted);
+                    }
+                    break;
                 }
                 Err(error) => {
-                    return BatchLandingVerdict::PartialFailure {
-                        landed_count: i,
-                        error,
-                    };
+                    receipts.push(crate::store::ItemLandingStatus::Rejected(error));
+                    all_succeeded = false;
+                    for _ in (i + 1)..blocks.len() {
+                        receipts.push(crate::store::ItemLandingStatus::Unattempted);
+                    }
+                    break;
                 }
             }
         }
-        BatchLandingVerdict::LandedAll {
-            final_position: last_position,
+
+        if all_succeeded {
+            BatchLandingVerdict::LandedAll {
+                final_position: last_position,
+            }
+        } else {
+            BatchLandingVerdict::Receipts { receipts }
         }
     }
 
@@ -73,13 +86,27 @@ pub trait StorageEngine {
         blocks: &[&[u8]],
     ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
         match self.append_batch_detailed(blocks) {
-            BatchLandingVerdict::LandedAll { final_position, .. } => {
+            BatchLandingVerdict::LandedAll { final_position } => {
                 Ok(WriteLandingVerdict::Landed(final_position))
             }
-            BatchLandingVerdict::Undetermined { carried_epoch, .. } => {
-                Ok(WriteLandingVerdict::Undetermined { carried_epoch })
+            BatchLandingVerdict::PreAttemptRefusal { error } => Err(error),
+            BatchLandingVerdict::Receipts { receipts } => {
+                if let Some(carried_epoch) = receipts.iter().find_map(|r| match r {
+                    crate::store::ItemLandingStatus::Unresolved { carried_epoch } => {
+                        Some(*carried_epoch)
+                    }
+                    _ => None,
+                }) {
+                    Ok(WriteLandingVerdict::Undetermined { carried_epoch })
+                } else if let Some(err) = receipts.into_iter().find_map(|r| match r {
+                    crate::store::ItemLandingStatus::Rejected(err) => Some(err),
+                    _ => None,
+                }) {
+                    Err(err)
+                } else {
+                    Ok(WriteLandingVerdict::Landed(0))
+                }
             }
-            BatchLandingVerdict::PartialFailure { error, .. } => Err(error),
         }
     }
 
