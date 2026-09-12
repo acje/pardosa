@@ -1475,3 +1475,99 @@ fn test_nats_migration_read_rejects_malformed_envelope() {
 
     adapter.delete_streams().expect("cleanup");
 }
+
+#[test]
+fn test_nats_replay_constants_and_contract() {
+    use pardosa_nats::adapter::{MAX_CONCURRENT_FETCHES, MAX_REPLAY_BYTES};
+    assert_eq!(MAX_CONCURRENT_FETCHES, 32);
+    assert_eq!(MAX_REPLAY_BYTES, 64 * 1024 * 1024);
+}
+
+#[test]
+fn test_nats_replay_bounded_batching_exact_order_and_commitment() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("replay_batching_order");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
+    let claim = sample_claim(1);
+    let mut writer = adapter.create(&claim).expect("create writer");
+
+    let frame_count = 75u64;
+    let mut expected_payloads = Vec::with_capacity(frame_count as usize);
+
+    for seq in 1..=frame_count {
+        let env = sample_envelope(seq);
+        let mut encoded = Vec::new();
+        env.encode(&mut encoded);
+        let appended_seq = writer.append_envelope(&env).expect("append envelope");
+        assert_eq!(appended_seq, seq);
+        expected_payloads.push(encoded);
+    }
+
+    let initial_commitment = writer.rolling_commitment().clone();
+    assert_eq!(initial_commitment.frame_count(), frame_count);
+
+    let mut replayed_writer = adapter.open_write(1).expect("open write replay");
+    assert_eq!(
+        replayed_writer.rolling_commitment().frame_count(),
+        frame_count
+    );
+    assert_eq!(
+        replayed_writer.rolling_commitment().current_commitment(),
+        initial_commitment.current_commitment()
+    );
+
+    let replayed_frames = replayed_writer.read_all_frames().expect("read frames");
+    assert_eq!(replayed_frames.len(), frame_count as usize);
+    for (idx, (actual, expected)) in replayed_frames
+        .iter()
+        .zip(expected_payloads.iter())
+        .enumerate()
+    {
+        assert_eq!(actual, expected, "frame mismatch at index {idx}");
+    }
+
+    let mut reader = adapter.open_read().expect("open read");
+    let reader_frames = reader.read_all_frames().expect("reader frames");
+    assert_eq!(reader_frames.len(), frame_count as usize);
+    for (idx, (actual, expected)) in reader_frames
+        .iter()
+        .zip(expected_payloads.iter())
+        .enumerate()
+    {
+        assert_eq!(actual, expected, "reader frame mismatch at index {idx}");
+    }
+
+    adapter.delete_streams().expect("cleanup");
+}
+
+#[test]
+fn test_nats_replay_capacity_exhaustion_refusal() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("replay_cap_refusal");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
+    let claim = sample_claim(1);
+    let mut writer = adapter.create(&claim).expect("create writer");
+
+    for _seq in 1..=10 {
+        let payload = vec![0xaa; 100];
+        writer.append_raw_frame(&payload).expect("append frame");
+    }
+
+    let rt = adapter.runtime().clone();
+    let js = adapter.jetstream().clone();
+    let data_stream = adapter.data_stream_name().to_string();
+
+    let err = rt
+        .block_on(async {
+            pardosa_nats::adapter::read_data_frames_async_bounded(&js, &data_stream, 32, 500).await
+        })
+        .expect_err("500 byte limit must be refused on 1000 byte total stream");
+
+    assert_eq!(*err.condition(), FailureCondition::RefusalDueToCapacity);
+    assert!(err
+        .diagnostic_detail()
+        .message()
+        .contains("replay byte limit exceeded"));
+
+    adapter.delete_streams().expect("cleanup");
+}

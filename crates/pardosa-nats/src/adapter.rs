@@ -127,30 +127,65 @@ async fn read_meta_records_async(
     Ok(records)
 }
 
-async fn read_data_frames_async(
+/// Maximum concurrent message fetches in flight during stream replay.
+pub const MAX_CONCURRENT_FETCHES: usize = 32;
+
+/// Maximum accumulated frame payload bytes admitted during stream replay (64 MiB).
+pub const MAX_REPLAY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Reads and verifies container data frames asynchronously with bounded batching and resource limits.
+///
+/// # Resource Contract
+/// - **Boundary**: `read_data_frames_async` during stream open and replay.
+/// - **Concurrency**: Bounded pipelined message fetches with at most `max_concurrent_fetches` in-flight requests.
+/// - **Item Limit**: Bounded to at most [`MAX_STREAM_ITEMS`] frames per stream.
+/// - **Byte Ceiling**: Total accumulated frame payload bytes capped at `max_replay_bytes`.
+/// - **Exhaustion Policy**: On item count or byte ceiling breach, immediately halts replay, aborts in-flight tasks, drops uncommitted frames, and returns [`FailureCondition::RefusalDueToCapacity`].
+/// - **Exclusions**: Excludes transient NATS client transport buffers and network frames managed by `async-nats`.
+///
+/// # Errors
+/// Returns [`OperationFailure`] with:
+/// - [`FailureCondition::NoArtefactExists`] if the data stream cannot be opened.
+/// - [`FailureCondition::PrecursorChainBroken`] if the stream is empty, corrupted, or missing a sequence.
+/// - [`FailureCondition::RefusalDueToCapacity`] if the stream exceeds item count or byte limits.
+/// - [`FailureCondition::InvariantBreakingConfiguration`] if `max_concurrent_fetches` is zero.
+pub async fn read_data_frames_async_bounded(
     js: &async_nats::jetstream::Context,
     data_stream_name: &str,
+    max_concurrent_fetches: usize,
+    max_replay_bytes: usize,
 ) -> Result<(ContainerHeader, Vec<Vec<u8>>, RollingCommitment, u64), OperationFailure> {
+    if max_concurrent_fetches == 0 {
+        return Err(OperationFailure::new(
+            FailureCondition::InvariantBreakingConfiguration,
+            "max_concurrent_fetches must be greater than zero",
+        ));
+    }
     let mut stream = js.get_stream(data_stream_name).await.map_err(|err| {
         OperationFailure::new(
             FailureCondition::NoArtefactExists,
             format!("failed to open data stream {data_stream_name}: {err}"),
         )
     })?;
-    let info = stream.info().await.map_err(|err| {
-        OperationFailure::new(
-            FailureCondition::PrecursorChainBroken(None),
-            format!("failed to get info for data stream {data_stream_name}: {err}"),
+    let (messages, first, last) = {
+        let info = stream.info().await.map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::PrecursorChainBroken(None),
+                format!("failed to get info for data stream {data_stream_name}: {err}"),
+            )
+        })?;
+        (
+            info.state.messages,
+            info.state.first_sequence,
+            info.state.last_sequence,
         )
-    })?;
-    if info.state.messages == 0 {
+    };
+    if messages == 0 {
         return Err(OperationFailure::new(
             FailureCondition::PrecursorChainBroken(None),
             "data stream is empty; missing container header per C10.3",
         ));
     }
-    let first = info.state.first_sequence;
-    let last = info.state.last_sequence;
     let header_raw = stream.get_raw_message(first).await.map_err(|err| {
         OperationFailure::new(
             FailureCondition::PrecursorChainBroken(None),
@@ -164,25 +199,138 @@ async fn read_data_frames_async(
         )
     })?;
 
-    let mut frames = Vec::new();
-    let mut rolling = RollingCommitment::new();
-    for seq in (first + 1)..=last {
-        let raw = stream.get_raw_message(seq).await.map_err(|err| {
-            OperationFailure::new(
-                FailureCondition::PrecursorChainBroken(None),
-                format!("failed to read frame from data stream at seq {seq}: {err}"),
-            )
-        })?;
-        let (payload, _) = ContainerFrame::decode(&raw.payload).map_err(|err| {
-            OperationFailure::new(
-                FailureCondition::PrecursorChainBroken(None),
-                format!("corrupted container frame in data stream at seq {seq}: {err}"),
-            )
-        })?;
-        rolling.update_frame(&raw.payload);
-        frames.push(payload);
+    let total_frames_count = last.saturating_sub(first);
+    if total_frames_count > MAX_STREAM_ITEMS as u64 {
+        return Err(OperationFailure::new(
+            FailureCondition::RefusalDueToCapacity,
+            format!(
+                "stream frame count {total_frames_count} exceeds item limit {MAX_STREAM_ITEMS}"
+            ),
+        ));
     }
+
+    let mut frames = Vec::with_capacity(total_frames_count as usize);
+    let mut rolling = RollingCommitment::new();
+    let mut total_bytes: usize = 0;
+
+    let mut curr_seq = first + 1;
+    while curr_seq <= last {
+        let chunk_end = (curr_seq.saturating_add(max_concurrent_fetches as u64 - 1)).min(last);
+        let chunk_len = (chunk_end - curr_seq + 1) as usize;
+
+        let mut set = tokio::task::JoinSet::new();
+        for seq in curr_seq..=chunk_end {
+            let stream_clone = stream.clone();
+            set.spawn(async move {
+                let res = stream_clone.get_raw_message(seq).await;
+                (seq, res)
+            });
+        }
+
+        let mut results = Vec::with_capacity(chunk_len);
+        results.resize_with(chunk_len, || None);
+
+        let mut first_error: Option<OperationFailure> = None;
+
+        while let Some(join_res) = set.join_next().await {
+            match join_res {
+                Ok((seq, Ok(raw_msg))) => {
+                    if first_error.is_none() {
+                        let idx = (seq - curr_seq) as usize;
+                        results[idx] = Some(raw_msg);
+                    }
+                }
+                Ok((seq, Err(err))) => {
+                    if first_error.is_none() {
+                        first_error = Some(OperationFailure::new(
+                            FailureCondition::PrecursorChainBroken(None),
+                            format!("failed to read frame from data stream at seq {seq}: {err}"),
+                        ));
+                        set.abort_all();
+                    }
+                }
+                Err(join_err) => {
+                    if first_error.is_none() {
+                        first_error = Some(OperationFailure::new(
+                            FailureCondition::PrecursorChainBroken(None),
+                            format!("concurrent fetch task failed: {join_err}"),
+                        ));
+                        set.abort_all();
+                    }
+                }
+            }
+        }
+
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+
+        for (idx, raw_opt) in results.into_iter().enumerate() {
+            let seq = curr_seq + idx as u64;
+            let raw = raw_opt.ok_or_else(|| {
+                OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    format!("missing message for sequence {seq}"),
+                )
+            })?;
+
+            let (payload, _) = ContainerFrame::decode(&raw.payload).map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    format!("corrupted container frame in data stream at seq {seq}: {err}"),
+                )
+            })?;
+
+            match total_bytes.checked_add(payload.len()) {
+                Some(b) if b <= max_replay_bytes => {
+                    total_bytes = b;
+                }
+                _ => {
+                    return Err(OperationFailure::new(
+                        FailureCondition::RefusalDueToCapacity,
+                        format!(
+                            "replay byte limit exceeded: total payload bytes would exceed ceiling {max_replay_bytes}"
+                        ),
+                    ));
+                }
+            }
+
+            rolling.update_frame(&raw.payload);
+            frames.push(payload);
+        }
+
+        curr_seq = chunk_end + 1;
+    }
+
     Ok((header, frames, rolling, last))
+}
+
+/// Reads and verifies container data frames asynchronously with default bounded concurrency and 64 MiB byte ceiling.
+///
+/// # Resource Contract
+/// - **Boundary**: `read_data_frames_async` during stream open and replay.
+/// - **Concurrency**: Bounded pipelined message fetches with at most [`MAX_CONCURRENT_FETCHES`] in-flight requests.
+/// - **Item Limit**: Bounded to at most [`MAX_STREAM_ITEMS`] frames per stream.
+/// - **Byte Ceiling**: Total accumulated frame payload bytes capped at [`MAX_REPLAY_BYTES`] (64 MiB).
+/// - **Exhaustion Policy**: On item count or byte ceiling breach, immediately halts replay, aborts in-flight tasks, drops uncommitted frames, and returns [`FailureCondition::RefusalDueToCapacity`].
+/// - **Exclusions**: Excludes transient NATS client transport buffers and network frames managed by `async-nats`.
+///
+/// # Errors
+/// Returns [`OperationFailure`] with:
+/// - [`FailureCondition::NoArtefactExists`] if the data stream cannot be opened.
+/// - [`FailureCondition::PrecursorChainBroken`] if the stream is empty, corrupted, or missing a sequence.
+/// - [`FailureCondition::RefusalDueToCapacity`] if the stream exceeds item count or byte limits.
+pub async fn read_data_frames_async(
+    js: &async_nats::jetstream::Context,
+    data_stream_name: &str,
+) -> Result<(ContainerHeader, Vec<Vec<u8>>, RollingCommitment, u64), OperationFailure> {
+    read_data_frames_async_bounded(
+        js,
+        data_stream_name,
+        MAX_CONCURRENT_FETCHES,
+        MAX_REPLAY_BYTES,
+    )
+    .await
 }
 
 /// JetStream storage adapter managing container artefacts in NATS JetStream per C5.10, C5.11, and C10.3.
@@ -341,6 +489,18 @@ impl NatsStorageAdapter {
     #[must_use]
     pub fn data_stream_name(&self) -> &str {
         &self.data_stream_name
+    }
+
+    /// Returns a reference to the JetStream context.
+    #[must_use]
+    pub fn jetstream(&self) -> &async_nats::jetstream::Context {
+        &self.js
+    }
+
+    /// Returns a reference to the underlying Tokio runtime.
+    #[must_use]
+    pub fn runtime(&self) -> &Arc<tokio::runtime::Runtime> {
+        &self.runtime
     }
 
     /// Returns the presence of artefact streams in JetStream per C5.10.

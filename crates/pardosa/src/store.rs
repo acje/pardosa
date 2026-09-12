@@ -1222,6 +1222,12 @@ pub enum FailureCondition {
 }
 
 impl FailureCondition {
+    /// Failure condition indicating that capacity limits (items or bytes) were exceeded per Moltke resource policy.
+    #[allow(non_upper_case_globals)]
+    pub const RefusalDueToCapacity: FailureCondition = FailureCondition::ValueConstraintViolated {
+        constraint: ValueConstraint::TooLong,
+    };
+
     /// Returns the documented remedy for this failure condition per C6.10.
     #[must_use]
     pub fn remedy(&self) -> &'static str {
