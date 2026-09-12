@@ -1265,6 +1265,99 @@ impl StorageEngine for FileEngine {
         Ok(WriteLandingVerdict::Landed(self.frame_count))
     }
 
+    fn append_batch_detailed(
+        &mut self,
+        blocks: &[&[u8]],
+    ) -> crate::store::BatchLandingVerdict<u64> {
+        if let Err(error) = self.check_authority() {
+            return crate::store::BatchLandingVerdict::PartialFailure {
+                landed_count: 0,
+                error,
+            };
+        }
+        if blocks.is_empty() {
+            return crate::store::BatchLandingVerdict::LandedAll {
+                final_position: self.frame_count,
+            };
+        }
+        let Some(file) = &mut self.file else {
+            return crate::store::BatchLandingVerdict::PartialFailure {
+                landed_count: 0,
+                error: OperationFailure::new(
+                    FailureCondition::OwnershipUnestablished,
+                    "no file open for writing",
+                ),
+            };
+        };
+
+        if let Err(err) = file.seek(SeekFrom::End(0)) {
+            return crate::store::BatchLandingVerdict::PartialFailure {
+                landed_count: 0,
+                error: OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    format!("failed to seek to end of container: {err}"),
+                ),
+            };
+        }
+
+        let mut landed_count = 0;
+        for (i, block) in blocks.iter().enumerate() {
+            if let Some(limit) = self.fail_after_n_blocks {
+                if (self.frame_count as usize) + i >= limit {
+                    return crate::store::BatchLandingVerdict::PartialFailure {
+                        landed_count: i,
+                        error: OperationFailure::new(
+                            FailureCondition::PrecursorChainBroken(None),
+                            "simulated write failure after limit",
+                        ),
+                    };
+                }
+            }
+            if let Some(undet) = self.undetermined_after_n_blocks {
+                if (self.frame_count as usize) + i >= undet {
+                    self.uncertain = true;
+                    self.uncertain_diagnostic = Some("simulated undetermined".to_string());
+                    return crate::store::BatchLandingVerdict::Undetermined {
+                        landed_count: i,
+                        carried_epoch: self.carried_epoch,
+                    };
+                }
+            }
+            if let Err(err) = file.write_all(block) {
+                self.uncertain = true;
+                self.uncertain_diagnostic =
+                    Some(format!("write_all failed; write landing undetermined: {err}"));
+                return crate::store::BatchLandingVerdict::Undetermined {
+                    landed_count: i,
+                    carried_epoch: self.carried_epoch,
+                };
+            }
+            landed_count += 1;
+        }
+
+        let sync_res = if self.simulate_sync_error {
+            Err(std::io::Error::other("simulated sync_data failure"))
+        } else {
+            file.sync_data()
+        };
+
+        if let Err(err) = sync_res {
+            self.uncertain = true;
+            self.uncertain_diagnostic = Some(format!(
+                "sync_data failed; write landing undetermined: {err}"
+            ));
+            return crate::store::BatchLandingVerdict::Undetermined {
+                landed_count: 0,
+                carried_epoch: self.carried_epoch,
+            };
+        }
+
+        self.frame_count += landed_count as u64;
+        crate::store::BatchLandingVerdict::LandedAll {
+            final_position: self.frame_count,
+        }
+    }
+
     fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
         self.read_all_count += 1;
         let Some(file) = &mut self.file else {

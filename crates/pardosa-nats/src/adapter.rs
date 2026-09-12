@@ -1578,6 +1578,131 @@ impl StorageEngine for NatsEngine {
         }
     }
 
+    fn append_batch_detailed(&mut self, blocks: &[&[u8]]) -> BatchLandingVerdict<u64> {
+        if let Err(error) = self.check_authority() {
+            return BatchLandingVerdict::PartialFailure {
+                landed_count: 0,
+                error,
+            };
+        }
+        if blocks.is_empty() {
+            return BatchLandingVerdict::LandedAll {
+                final_position: self.last_data_seq,
+            };
+        }
+
+        let handle = self.runtime.handle().clone();
+        let js = self.js.clone();
+        let data_subject = self.data_subject.clone();
+        let timeout = self.publish_timeout;
+        let carried_epoch = self.carried_epoch;
+        let last_seq = self.last_data_seq;
+        let blocks_owned: Vec<Vec<u8>> = blocks.iter().map(|b| b.to_vec()).collect();
+
+        let res = run_future(&handle, async move {
+            let mut landed_count = 0;
+            let mut current_seq = last_seq;
+
+            for chunk in blocks_owned.chunks(64) {
+                let mut futures = Vec::with_capacity(chunk.len());
+                for (offset, block) in chunk.iter().enumerate() {
+                    let expected_seq = current_seq + offset as u64;
+                    let mut headers = async_nats::HeaderMap::new();
+                    headers.insert(
+                        async_nats::header::NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
+                        async_nats::HeaderValue::from(expected_seq),
+                    );
+                    let pub_future = js
+                        .publish_with_headers(data_subject.clone(), headers, block.clone().into())
+                        .await
+                        .map_err(|err| {
+                            if is_wrong_last_sequence(&err) {
+                                (
+                                    landed_count,
+                                    OperationFailure::new(
+                                        FailureCondition::ConcurrencyConflict,
+                                        "two-writer concurrency collision: expected sequence mismatch",
+                                    ),
+                                )
+                            } else {
+                                (
+                                    landed_count,
+                                    OperationFailure::new(
+                                        FailureCondition::PrecursorChainBroken(None),
+                                        format!("failed to initiate publish to data stream: {err}"),
+                                    ),
+                                )
+                            }
+                        })?;
+                    futures.push(pub_future);
+                }
+
+                for pub_future in futures {
+                    match tokio::time::timeout(timeout, pub_future).await {
+                        Ok(Ok(ack)) => {
+                            landed_count += 1;
+                            current_seq = ack.sequence;
+                        }
+                        Ok(Err(err)) => {
+                            if is_wrong_last_sequence(&err) {
+                                return Err((
+                                    landed_count,
+                                    OperationFailure::new(
+                                        FailureCondition::ConcurrencyConflict,
+                                        "two-writer concurrency collision: expected sequence mismatch",
+                                    ),
+                                ));
+                            } else {
+                                return Ok(BatchLandingVerdict::Undetermined {
+                                    landed_count,
+                                    carried_epoch,
+                                });
+                            }
+                        }
+                        Err(_) => {
+                            return Ok(BatchLandingVerdict::Undetermined {
+                                landed_count,
+                                carried_epoch,
+                            });
+                        }
+                    }
+                }
+            }
+
+            Ok(BatchLandingVerdict::LandedAll {
+                final_position: current_seq,
+            })
+        });
+
+        match res {
+            Ok(BatchLandingVerdict::LandedAll { final_position }) => {
+                self.last_data_seq = final_position;
+                BatchLandingVerdict::LandedAll { final_position }
+            }
+            Ok(BatchLandingVerdict::Undetermined {
+                landed_count,
+                carried_epoch,
+            }) => {
+                self.uncertain = true;
+                self.uncertain_diagnostic =
+                    Some("publish ack timed out or undetermined".to_string());
+                self.last_data_seq += landed_count as u64;
+                BatchLandingVerdict::Undetermined {
+                    landed_count,
+                    carried_epoch,
+                }
+            }
+            Err((landed_count, error)) => {
+                self.last_data_seq += landed_count as u64;
+                BatchLandingVerdict::PartialFailure {
+                    landed_count,
+                    error,
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
     fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
         self.read_all_count += 1;
         let handle = self.runtime.handle().clone();
