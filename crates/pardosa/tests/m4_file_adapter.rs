@@ -751,6 +751,13 @@ fn test_m4_append_batch_sync_error_marks_all_written_unresolved() {
     assert!(verdict.has_unresolved());
 
     assert_eq!(writer.rolling_commitment().frame_count(), 0);
+
+    let mut reader = adapter.open_read().expect("open reader");
+    let read_envs = reader.read_all_envelopes().expect("read");
+    assert!(
+        read_envs.len() <= 1,
+        "env2 was never attempted and must not be in file"
+    );
 }
 
 #[test]

@@ -595,11 +595,14 @@ impl<E: StorageEngine> Store<E> {
                 next_attempt,
                 unattempted_count,
             } => {
-                if landed_count >= payloads.len() {
+                let total_accounted = landed_count
+                    .checked_add(1)
+                    .and_then(|sum| sum.checked_add(unattempted_count));
+                if total_accounted != Some(payloads.len()) {
                     return Err(OperationFailure::new(
                         FailureCondition::PrecursorChainBroken(None),
                         format!(
-                            "engine reported impossible batch landed_count {landed_count} for partial progress on batch of length {}",
+                            "engine reported inconsistent batch partition: landed {landed_count} + next 1 + unattempted {unattempted_count} != batch length {}",
                             payloads.len()
                         ),
                     ));

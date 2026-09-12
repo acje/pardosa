@@ -1980,10 +1980,9 @@ fn test_m4_impossible_engine_batch_count_is_refused_by_store() {
         *err.condition(),
         FailureCondition::PrecursorChainBroken(None)
     );
-    assert!(err
-        .diagnostic_detail()
-        .message()
-        .contains("impossible batch landed_count 5"));
+    assert!(err.diagnostic_detail().message().contains(
+        "inconsistent batch partition: landed 5 + next 1 + unattempted 0 != batch length 1"
+    ));
 }
 
 #[test]
