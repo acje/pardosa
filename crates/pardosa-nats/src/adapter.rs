@@ -1593,13 +1593,13 @@ impl StorageEngine for NatsEngine {
         if self.simulate_indeterminate {
             self.uncertain = true;
             self.uncertain_diagnostic = Some("simulated indeterminate write landing".to_string());
-            let receipts = vec![
-                ItemLandingStatus::Unresolved {
+            return BatchLandingVerdict::PartialProgress {
+                landed_count: 0,
+                next_attempt: NextAttemptStatus::Undetermined {
                     carried_epoch: self.carried_epoch,
-                };
-                blocks.len()
-            ];
-            return BatchLandingVerdict::Receipts { receipts };
+                },
+                unattempted_count: blocks.len().saturating_sub(1),
+            };
         }
 
         let handle = self.runtime.handle().clone();
@@ -1611,100 +1611,116 @@ impl StorageEngine for NatsEngine {
         let blocks_owned: Vec<Vec<u8>> = blocks.iter().map(|b| b.to_vec()).collect();
         let total_blocks = blocks.len();
 
-        let (receipts, final_seq, has_uncertainty) = run_future(&handle, async move {
-            let mut receipts: Vec<ItemLandingStatus<u64>> =
-                vec![ItemLandingStatus::Unattempted; total_blocks];
+        let (verdict, final_seq, has_uncertainty) = run_future(&handle, async move {
             let mut current_seq = last_seq;
-            let mut global_idx = 0usize;
-            let mut has_uncertainty = false;
-            let mut stop_pipeline = false;
 
-            for chunk in blocks_owned.chunks(64) {
-                if stop_pipeline {
-                    break;
-                }
-                let mut futures = Vec::with_capacity(chunk.len());
-                let chunk_start_idx = global_idx;
+            for (i, block) in blocks_owned.iter().enumerate() {
+                let expected_seq = match current_seq.checked_add(1) {
+                    Some(_) => current_seq,
+                    None => {
+                        return (
+                            BatchLandingVerdict::PartialProgress {
+                                landed_count: i,
+                                next_attempt: NextAttemptStatus::Rejected(OperationFailure::new(
+                                    FailureCondition::ValueConstraintViolated {
+                                        constraint: ValueConstraint::TooLong,
+                                    },
+                                    "sequence number overflow",
+                                )),
+                                unattempted_count: total_blocks.saturating_sub(i + 1),
+                            },
+                            current_seq,
+                            false,
+                        );
+                    }
+                };
 
-                for (offset, block) in chunk.iter().enumerate() {
-                    let idx = chunk_start_idx + offset;
-                    let expected_seq = match current_seq.checked_add(offset as u64) {
-                        Some(seq) => seq,
-                        None => {
-                            receipts[idx] = ItemLandingStatus::Rejected(OperationFailure::new(
-                                FailureCondition::ValueConstraintViolated {
-                                    constraint: ValueConstraint::TooLong,
+                let mut headers = async_nats::HeaderMap::new();
+                headers.insert(
+                    async_nats::header::NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
+                    async_nats::HeaderValue::from(expected_seq),
+                );
+
+                let pub_future = match js
+                    .publish_with_headers(data_subject.clone(), headers, block.clone().into())
+                    .await
+                {
+                    Ok(f) => f,
+                    Err(err) => {
+                        let failure = if is_wrong_last_sequence(&err) {
+                            OperationFailure::new(
+                                FailureCondition::ConcurrencyConflict,
+                                "two-writer concurrency collision: expected sequence mismatch",
+                            )
+                        } else {
+                            OperationFailure::new(
+                                FailureCondition::TransportUnavailable,
+                                format!("failed to initiate publish to data stream: {err}"),
+                            )
+                        };
+                        return (
+                            BatchLandingVerdict::PartialProgress {
+                                landed_count: i,
+                                next_attempt: NextAttemptStatus::Rejected(failure),
+                                unattempted_count: total_blocks.saturating_sub(i + 1),
+                            },
+                            current_seq,
+                            false,
+                        );
+                    }
+                };
+
+                match tokio::time::timeout(timeout, pub_future).await {
+                    Ok(Ok(ack)) => {
+                        current_seq = ack.sequence;
+                    }
+                    Ok(Err(err)) => {
+                        if is_wrong_last_sequence(&err) {
+                            return (
+                                BatchLandingVerdict::PartialProgress {
+                                    landed_count: i,
+                                    next_attempt: NextAttemptStatus::Rejected(OperationFailure::new(
+                                        FailureCondition::ConcurrencyConflict,
+                                        "two-writer concurrency collision: expected sequence mismatch",
+                                    )),
+                                    unattempted_count: total_blocks.saturating_sub(i + 1),
                                 },
-                                "sequence number overflow",
-                            ));
-                            stop_pipeline = true;
-                            break;
-                        }
-                    };
-
-                    let mut headers = async_nats::HeaderMap::new();
-                    headers.insert(
-                        async_nats::header::NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
-                        async_nats::HeaderValue::from(expected_seq),
-                    );
-
-                    let pub_future = match js
-                        .publish_with_headers(data_subject.clone(), headers, block.clone().into())
-                        .await
-                    {
-                        Ok(f) => {
-                            receipts[idx] = ItemLandingStatus::Unresolved { carried_epoch };
-                            f
-                        }
-                        Err(err) => {
-                            let failure = if is_wrong_last_sequence(&err) {
-                                OperationFailure::new(
-                                    FailureCondition::ConcurrencyConflict,
-                                    "two-writer concurrency collision: expected sequence mismatch",
-                                )
-                            } else {
-                                OperationFailure::new(
-                                    FailureCondition::PrecursorChainBroken(None),
-                                    format!("failed to initiate publish to data stream: {err}"),
-                                )
-                            };
-                            receipts[idx] = ItemLandingStatus::Rejected(failure);
-                            stop_pipeline = true;
-                            break;
-                        }
-                    };
-                    futures.push((idx, pub_future));
-                }
-
-                for (idx, pub_future) in futures {
-                    match tokio::time::timeout(timeout, pub_future).await {
-                        Ok(Ok(ack)) => {
-                            receipts[idx] = ItemLandingStatus::Landed(ack.sequence);
-                            current_seq = ack.sequence;
-                        }
-                        Ok(Err(err)) => {
-                            has_uncertainty = true;
-                            stop_pipeline = true;
-                            if is_wrong_last_sequence(&err) {
-                                receipts[idx] = ItemLandingStatus::Rejected(OperationFailure::new(
-                                    FailureCondition::ConcurrencyConflict,
-                                    "two-writer concurrency collision: expected sequence mismatch",
-                                ));
-                            } else {
-                                receipts[idx] = ItemLandingStatus::Unresolved { carried_epoch };
-                            }
-                        }
-                        Err(_) => {
-                            has_uncertainty = true;
-                            stop_pipeline = true;
-                            receipts[idx] = ItemLandingStatus::Unresolved { carried_epoch };
+                                current_seq,
+                                false,
+                            );
+                        } else {
+                            return (
+                                BatchLandingVerdict::PartialProgress {
+                                    landed_count: i,
+                                    next_attempt: NextAttemptStatus::Undetermined { carried_epoch },
+                                    unattempted_count: total_blocks.saturating_sub(i + 1),
+                                },
+                                current_seq,
+                                true,
+                            );
                         }
                     }
+                    Err(_) => {
+                        return (
+                            BatchLandingVerdict::PartialProgress {
+                                landed_count: i,
+                                next_attempt: NextAttemptStatus::Undetermined { carried_epoch },
+                                unattempted_count: total_blocks.saturating_sub(i + 1),
+                            },
+                            current_seq,
+                            true,
+                        );
+                    }
                 }
-                global_idx = chunk_start_idx + chunk.len();
             }
 
-            (receipts, current_seq, has_uncertainty)
+            (
+                BatchLandingVerdict::LandedAll {
+                    final_position: current_seq,
+                },
+                current_seq,
+                false,
+            )
         });
 
         if has_uncertainty {
@@ -1712,17 +1728,7 @@ impl StorageEngine for NatsEngine {
             self.uncertain_diagnostic = Some("batch publish encountered uncertainty".to_string());
         }
         self.last_data_seq = final_seq;
-
-        let all_landed = receipts
-            .iter()
-            .all(|r| matches!(r, ItemLandingStatus::Landed(_)));
-        if all_landed {
-            BatchLandingVerdict::LandedAll {
-                final_position: final_seq,
-            }
-        } else {
-            BatchLandingVerdict::Receipts { receipts }
-        }
+        verdict
     }
 
     fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {

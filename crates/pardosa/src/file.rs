@@ -1288,13 +1288,13 @@ impl StorageEngine for FileEngine {
         if self.simulate_indeterminate {
             self.uncertain = true;
             self.uncertain_diagnostic = Some("simulated indeterminate write landing".to_string());
-            let receipts = vec![
-                crate::store::ItemLandingStatus::Unresolved {
+            return crate::store::BatchLandingVerdict::PartialProgress {
+                landed_count: 0,
+                next_attempt: crate::store::NextAttemptStatus::Undetermined {
                     carried_epoch: self.carried_epoch,
-                };
-                blocks.len()
-            ];
-            return crate::store::BatchLandingVerdict::Receipts { receipts };
+                },
+                unattempted_count: blocks.len().saturating_sub(1),
+            };
         }
 
         let Some(file) = &mut self.file else {
@@ -1309,25 +1309,23 @@ impl StorageEngine for FileEngine {
         if let Err(err) = file.seek(SeekFrom::End(0)) {
             return crate::store::BatchLandingVerdict::PreAttemptRefusal {
                 error: OperationFailure::new(
-                    FailureCondition::PrecursorChainBroken(None),
+                    FailureCondition::TransportUnavailable,
                     format!("failed to seek to end of container: {err}"),
                 ),
             };
         }
 
-        let mut receipts = Vec::with_capacity(blocks.len());
         let mut written_blocks = 0usize;
         let mut early_exit = None;
 
         for (i, block) in blocks.iter().enumerate() {
             if let Some(limit) = self.fail_after_n_blocks {
                 if (self.frame_count as usize) + i >= limit {
-                    early_exit = Some((
-                        i,
-                        crate::store::ItemLandingStatus::Rejected(OperationFailure::new(
+                    early_exit = Some(crate::store::NextAttemptStatus::Rejected(
+                        OperationFailure::new(
                             FailureCondition::PrecursorChainBroken(None),
                             "simulated write failure after limit",
-                        )),
+                        ),
                     ));
                     break;
                 }
@@ -1336,12 +1334,9 @@ impl StorageEngine for FileEngine {
                 if (self.frame_count as usize) + i >= undet {
                     self.uncertain = true;
                     self.uncertain_diagnostic = Some("simulated undetermined".to_string());
-                    early_exit = Some((
-                        i,
-                        crate::store::ItemLandingStatus::Unresolved {
-                            carried_epoch: self.carried_epoch,
-                        },
-                    ));
+                    early_exit = Some(crate::store::NextAttemptStatus::Undetermined {
+                        carried_epoch: self.carried_epoch,
+                    });
                     break;
                 }
             }
@@ -1356,12 +1351,9 @@ impl StorageEngine for FileEngine {
                 self.uncertain_diagnostic = Some(format!(
                     "write_all failed; write landing undetermined: {err}"
                 ));
-                early_exit = Some((
-                    i,
-                    crate::store::ItemLandingStatus::Unresolved {
-                        carried_epoch: self.carried_epoch,
-                    },
-                ));
+                early_exit = Some(crate::store::NextAttemptStatus::Undetermined {
+                    carried_epoch: self.carried_epoch,
+                });
                 break;
             }
             written_blocks += 1;
@@ -1378,31 +1370,23 @@ impl StorageEngine for FileEngine {
             self.uncertain_diagnostic = Some(format!(
                 "sync_data failed; write landing undetermined: {err}"
             ));
-            for _ in 0..written_blocks {
-                receipts.push(crate::store::ItemLandingStatus::Unresolved {
+            return crate::store::BatchLandingVerdict::PartialProgress {
+                landed_count: 0,
+                next_attempt: crate::store::NextAttemptStatus::Undetermined {
                     carried_epoch: self.carried_epoch,
-                });
-            }
-            if let Some((_, status)) = early_exit {
-                receipts.push(status);
-            }
-            while receipts.len() < blocks.len() {
-                receipts.push(crate::store::ItemLandingStatus::Unattempted);
-            }
-            return crate::store::BatchLandingVerdict::Receipts { receipts };
+                },
+                unattempted_count: blocks.len().saturating_sub(1),
+            };
         }
 
-        for _ in 0..written_blocks {
-            self.frame_count += 1;
-            receipts.push(crate::store::ItemLandingStatus::Landed(self.frame_count));
-        }
+        self.frame_count += written_blocks as u64;
 
-        if let Some((_, status)) = early_exit {
-            receipts.push(status);
-            while receipts.len() < blocks.len() {
-                receipts.push(crate::store::ItemLandingStatus::Unattempted);
+        if let Some(next_attempt) = early_exit {
+            crate::store::BatchLandingVerdict::PartialProgress {
+                landed_count: written_blocks,
+                next_attempt,
+                unattempted_count: blocks.len().saturating_sub(written_blocks + 1),
             }
-            crate::store::BatchLandingVerdict::Receipts { receipts }
         } else {
             crate::store::BatchLandingVerdict::LandedAll {
                 final_position: self.frame_count,

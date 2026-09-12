@@ -1659,17 +1659,19 @@ fn test_c5_12_and_c5_16_bounded_batch_landing_verdicts() {
         .append_batch_envelopes_detailed(&batch)
         .expect("verdict undet");
     match &v_undet {
-        BatchLandingVerdict::Receipts { receipts } => {
-            assert_eq!(receipts.len(), 4);
-            assert_eq!(receipts[0], ItemLandingStatus::Landed(1));
-            assert_eq!(receipts[1], ItemLandingStatus::Landed(2));
+        BatchLandingVerdict::PartialProgress {
+            landed_count,
+            next_attempt,
+            unattempted_count,
+        } => {
+            assert_eq!(*landed_count, 2);
             assert_eq!(
-                receipts[2],
-                ItemLandingStatus::Unresolved { carried_epoch: 42 }
+                *next_attempt,
+                NextAttemptStatus::Undetermined { carried_epoch: 42 }
             );
-            assert_eq!(receipts[3], ItemLandingStatus::Unattempted);
+            assert_eq!(*unattempted_count, 1);
         }
-        other => panic!("expected Receipts, got {other:?}"),
+        other => panic!("expected PartialProgress, got {other:?}"),
     }
     assert_eq!(v_undet.landed_count(4), 2);
     assert_eq!(v_undet.unresolved_count(), 1);
@@ -1704,19 +1706,21 @@ fn test_c5_12_and_c5_16_bounded_batch_landing_verdicts() {
         .append_batch_envelopes_detailed(&batch)
         .expect("verdict fail");
     match &v_fail {
-        BatchLandingVerdict::Receipts { receipts } => {
-            assert_eq!(receipts.len(), 4);
-            assert_eq!(receipts[0], ItemLandingStatus::Landed(1));
-            match &receipts[1] {
-                ItemLandingStatus::Rejected(error) => {
+        BatchLandingVerdict::PartialProgress {
+            landed_count,
+            next_attempt,
+            unattempted_count,
+        } => {
+            assert_eq!(*landed_count, 1);
+            match next_attempt {
+                NextAttemptStatus::Rejected(error) => {
                     assert_eq!(*error.condition(), FailureCondition::ConcurrencyConflict);
                 }
                 other => panic!("expected Rejected, got {other:?}"),
             }
-            assert_eq!(receipts[2], ItemLandingStatus::Unattempted);
-            assert_eq!(receipts[3], ItemLandingStatus::Unattempted);
+            assert_eq!(*unattempted_count, 2);
         }
-        other => panic!("expected Receipts, got {other:?}"),
+        other => panic!("expected PartialProgress, got {other:?}"),
     }
     assert_eq!(v_fail.landed_count(4), 1);
     assert_eq!(v_fail.rejected_count(), 1);
@@ -1916,13 +1920,12 @@ fn test_m4_impossible_engine_batch_count_is_refused_by_store() {
             Ok(WriteLandingVerdict::Landed(1))
         }
         fn append_batch_detailed(&mut self, _blocks: &[&[u8]]) -> BatchLandingVerdict<u64> {
-            BatchLandingVerdict::Receipts {
-                receipts: vec![
-                    ItemLandingStatus::Landed(1),
-                    ItemLandingStatus::Unresolved {
-                        carried_epoch: self.epoch,
-                    },
-                ],
+            BatchLandingVerdict::PartialProgress {
+                landed_count: 5,
+                next_attempt: NextAttemptStatus::Undetermined {
+                    carried_epoch: self.epoch,
+                },
+                unattempted_count: 0,
             }
         }
         fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
@@ -1980,7 +1983,7 @@ fn test_m4_impossible_engine_batch_count_is_refused_by_store() {
     assert!(err
         .diagnostic_detail()
         .message()
-        .contains("receipt count 2 mismatch with batch length 1"));
+        .contains("impossible batch landed_count 5"));
 }
 
 #[test]

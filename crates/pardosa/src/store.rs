@@ -1074,27 +1074,24 @@ pub enum WriteLandingVerdict<T> {
     },
 }
 
-/// Status of an individual block/item in a submitted batch write.
+/// Status of the attempt that interrupted a sequential batch append.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ItemLandingStatus<T> {
-    /// Confirmed durable and landed at sequence/position `position`.
-    Landed(T),
-    /// Submitted to the storage engine, but durable acknowledgement/sync is ambiguous or undetermined per C5.16.
+pub enum NextAttemptStatus {
+    /// Landing of the next item following the landed prefix is undetermined per C5.16.
     /// The item may or may not have landed on storage.
-    Unresolved {
+    Undetermined {
         /// Monotonic epoch carried by the write whose landing is undetermined.
         carried_epoch: u64,
     },
-    /// Positively rejected by the storage engine or pre-validation with a deterministic error.
+    /// The next item was positively rejected by the storage engine or pre-validation with a deterministic error.
     Rejected(OperationFailure),
-    /// Never submitted to the storage backend (e.g. pre-attempt refusal or stopped before dispatch).
-    Unattempted,
 }
 
-/// Structured outcome of a bounded batch-write operation per C5.12 and C5.16.
+/// Outcome of a bounded sequential batch-write operation per C5.12 and C5.16.
 ///
-/// Progress is structurally bound to the submitted batch, preserving individual item outcomes
-/// without count desynchronization or forced prefix assumptions.
+/// Progress is structurally bound to the submitted batch: either all items landed,
+/// the batch was refused before submission, or execution halted after a confirmed
+/// contiguous landed prefix with an explicit next attempt status and unattempted suffix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchLandingVerdict<T> {
     /// All items in the batch successfully landed durably.
@@ -1107,15 +1104,18 @@ pub enum BatchLandingVerdict<T> {
         /// Deterministic operation failure preventing attempt.
         error: OperationFailure,
     },
-    /// Partial, ambiguous, or error outcome with individual item receipts.
-    /// The length of `receipts` matches the number of submitted items.
-    Receipts {
-        /// Per-item landing receipts.
-        receipts: Vec<ItemLandingStatus<T>>,
+    /// Sequential execution landed a contiguous prefix before being interrupted.
+    PartialProgress {
+        /// Number of contiguous prefix items confirmed to have landed durably.
+        landed_count: usize,
+        /// Status of the specific attempt following the landed prefix.
+        next_attempt: NextAttemptStatus,
+        /// Number of items remaining in the batch that were never attempted.
+        unattempted_count: usize,
     },
 }
 
-impl<T: Copy> BatchLandingVerdict<T> {
+impl<T> BatchLandingVerdict<T> {
     /// Returns true if all items in the batch successfully landed.
     #[must_use]
     pub fn is_all_landed(&self) -> bool {
@@ -1128,10 +1128,7 @@ impl<T: Copy> BatchLandingVerdict<T> {
         match self {
             Self::LandedAll { .. } => total_submitted,
             Self::PreAttemptRefusal { .. } => 0,
-            Self::Receipts { receipts } => receipts
-                .iter()
-                .filter(|r| matches!(r, ItemLandingStatus::Landed(_)))
-                .count(),
+            Self::PartialProgress { landed_count, .. } => (*landed_count).min(total_submitted),
         }
     }
 
@@ -1140,10 +1137,13 @@ impl<T: Copy> BatchLandingVerdict<T> {
     pub fn unresolved_count(&self) -> usize {
         match self {
             Self::LandedAll { .. } | Self::PreAttemptRefusal { .. } => 0,
-            Self::Receipts { receipts } => receipts
-                .iter()
-                .filter(|r| matches!(r, ItemLandingStatus::Unresolved { .. }))
-                .count(),
+            Self::PartialProgress { next_attempt, .. } => {
+                if matches!(next_attempt, NextAttemptStatus::Undetermined { .. }) {
+                    1
+                } else {
+                    0
+                }
+            }
         }
     }
 
@@ -1152,10 +1152,13 @@ impl<T: Copy> BatchLandingVerdict<T> {
     pub fn rejected_count(&self) -> usize {
         match self {
             Self::LandedAll { .. } | Self::PreAttemptRefusal { .. } => 0,
-            Self::Receipts { receipts } => receipts
-                .iter()
-                .filter(|r| matches!(r, ItemLandingStatus::Rejected(_)))
-                .count(),
+            Self::PartialProgress { next_attempt, .. } => {
+                if matches!(next_attempt, NextAttemptStatus::Rejected(_)) {
+                    1
+                } else {
+                    0
+                }
+            }
         }
     }
 
@@ -1165,22 +1168,22 @@ impl<T: Copy> BatchLandingVerdict<T> {
         match self {
             Self::LandedAll { .. } => 0,
             Self::PreAttemptRefusal { .. } => total_submitted,
-            Self::Receipts { receipts } => receipts
-                .iter()
-                .filter(|r| matches!(r, ItemLandingStatus::Unattempted))
-                .count(),
+            Self::PartialProgress {
+                unattempted_count, ..
+            } => (*unattempted_count).min(total_submitted),
         }
     }
 
     /// Returns true if any item in the batch has an ambiguous/undetermined outcome.
     #[must_use]
     pub fn has_unresolved(&self) -> bool {
-        match self {
-            Self::LandedAll { .. } | Self::PreAttemptRefusal { .. } => false,
-            Self::Receipts { receipts } => receipts
-                .iter()
-                .any(|r| matches!(r, ItemLandingStatus::Unresolved { .. })),
-        }
+        matches!(
+            self,
+            Self::PartialProgress {
+                next_attempt: NextAttemptStatus::Undetermined { .. },
+                ..
+            }
+        )
     }
 }
 

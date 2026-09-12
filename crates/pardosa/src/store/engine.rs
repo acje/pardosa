@@ -5,7 +5,9 @@ use crate::encoding::{
     OwnershipClaimRecord, OwnershipRecord, RescuePolicyChoiceRecord,
 };
 use crate::schema::SchemaDescriptor;
-use crate::store::{BatchLandingVerdict, OpenAdmission, OperationFailure, WriteLandingVerdict};
+use crate::store::{
+    BatchLandingVerdict, NextAttemptStatus, OpenAdmission, OperationFailure, WriteLandingVerdict,
+};
 
 /// Callback invoked for each recovered frame during incremental recovery.
 pub type FrameRecoveryCallback<'a> = dyn FnMut(u64, &[u8]) -> Result<(), OperationFailure> + 'a;
@@ -39,41 +41,32 @@ pub trait StorageEngine {
         if blocks.is_empty() {
             return BatchLandingVerdict::LandedAll { final_position: 0 };
         }
-        let mut receipts = Vec::with_capacity(blocks.len());
         let mut last_position = 0;
-        let mut all_succeeded = true;
 
         for (i, block) in blocks.iter().enumerate() {
             match self.append_block(block) {
                 Ok(WriteLandingVerdict::Landed(seq)) => {
-                    receipts.push(crate::store::ItemLandingStatus::Landed(seq));
                     last_position = seq;
                 }
                 Ok(WriteLandingVerdict::Undetermined { carried_epoch }) => {
-                    receipts.push(crate::store::ItemLandingStatus::Unresolved { carried_epoch });
-                    all_succeeded = false;
-                    for _ in (i + 1)..blocks.len() {
-                        receipts.push(crate::store::ItemLandingStatus::Unattempted);
-                    }
-                    break;
+                    return BatchLandingVerdict::PartialProgress {
+                        landed_count: i,
+                        next_attempt: NextAttemptStatus::Undetermined { carried_epoch },
+                        unattempted_count: blocks.len().saturating_sub(i + 1),
+                    };
                 }
                 Err(error) => {
-                    receipts.push(crate::store::ItemLandingStatus::Rejected(error));
-                    all_succeeded = false;
-                    for _ in (i + 1)..blocks.len() {
-                        receipts.push(crate::store::ItemLandingStatus::Unattempted);
-                    }
-                    break;
+                    return BatchLandingVerdict::PartialProgress {
+                        landed_count: i,
+                        next_attempt: NextAttemptStatus::Rejected(error),
+                        unattempted_count: blocks.len().saturating_sub(i + 1),
+                    };
                 }
             }
         }
 
-        if all_succeeded {
-            BatchLandingVerdict::LandedAll {
-                final_position: last_position,
-            }
-        } else {
-            BatchLandingVerdict::Receipts { receipts }
+        BatchLandingVerdict::LandedAll {
+            final_position: last_position,
         }
     }
 
@@ -90,23 +83,14 @@ pub trait StorageEngine {
                 Ok(WriteLandingVerdict::Landed(final_position))
             }
             BatchLandingVerdict::PreAttemptRefusal { error } => Err(error),
-            BatchLandingVerdict::Receipts { receipts } => {
-                if let Some(carried_epoch) = receipts.iter().find_map(|r| match r {
-                    crate::store::ItemLandingStatus::Unresolved { carried_epoch } => {
-                        Some(*carried_epoch)
-                    }
-                    _ => None,
-                }) {
-                    Ok(WriteLandingVerdict::Undetermined { carried_epoch })
-                } else if let Some(err) = receipts.into_iter().find_map(|r| match r {
-                    crate::store::ItemLandingStatus::Rejected(err) => Some(err),
-                    _ => None,
-                }) {
-                    Err(err)
-                } else {
-                    Ok(WriteLandingVerdict::Landed(0))
-                }
-            }
+            BatchLandingVerdict::PartialProgress {
+                next_attempt: NextAttemptStatus::Undetermined { carried_epoch },
+                ..
+            } => Ok(WriteLandingVerdict::Undetermined { carried_epoch }),
+            BatchLandingVerdict::PartialProgress {
+                next_attempt: NextAttemptStatus::Rejected(err),
+                ..
+            } => Err(err),
         }
     }
 

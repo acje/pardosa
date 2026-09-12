@@ -926,14 +926,19 @@ fn test_nats_append_batch_detailed_outcomes_and_variable_sizes() {
         .expect("undet returns verdict");
 
     match &undet_v {
-        BatchLandingVerdict::Receipts { receipts } => {
-            assert_eq!(receipts.len(), 1);
+        BatchLandingVerdict::PartialProgress {
+            landed_count,
+            next_attempt,
+            unattempted_count,
+        } => {
+            assert_eq!(*landed_count, 0);
             assert_eq!(
-                receipts[0],
-                ItemLandingStatus::Unresolved { carried_epoch: 1 }
+                *next_attempt,
+                NextAttemptStatus::Undetermined { carried_epoch: 1 }
             );
+            assert_eq!(*unattempted_count, 0);
         }
-        other => panic!("expected Receipts with Unresolved, got {other:?}"),
+        other => panic!("expected PartialProgress with Undetermined, got {other:?}"),
     }
     assert_eq!(undet_v.landed_count(1), 0);
     assert_eq!(undet_v.unresolved_count(), 1);
