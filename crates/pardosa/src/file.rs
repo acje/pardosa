@@ -1325,8 +1325,9 @@ impl StorageEngine for FileEngine {
             }
             if let Err(err) = file.write_all(block) {
                 self.uncertain = true;
-                self.uncertain_diagnostic =
-                    Some(format!("write_all failed; write landing undetermined: {err}"));
+                self.uncertain_diagnostic = Some(format!(
+                    "write_all failed; write landing undetermined: {err}"
+                ));
                 return crate::store::BatchLandingVerdict::Undetermined {
                     landed_count: i,
                     carried_epoch: self.carried_epoch,
