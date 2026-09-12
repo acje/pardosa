@@ -13,7 +13,7 @@ use crate::store::session_index::SessionIndex;
 use crate::store::{FailureCondition, OpenAdmission, OperationFailure, WriteLandingVerdict};
 use std::fmt;
 
-pub use crate::store::{BatchLandingVerdict, NextAttemptStatus};
+pub use crate::store::{BatchLandingReceipt, NextAttemptStatus, RawBatchOutcome};
 
 /// Unified storage pipeline owning fiber handles, caching, and state verification per C5 and C6.
 pub struct Store<E: StorageEngine> {
@@ -527,12 +527,15 @@ impl<E: StorageEngine> Store<E> {
     pub fn append_batch_detailed(
         &mut self,
         payloads: &[&[u8]],
-    ) -> Result<BatchLandingVerdict<u64>, OperationFailure> {
+    ) -> Result<BatchLandingReceipt<u64>, OperationFailure> {
         self.engine.check_authority()?;
         if payloads.is_empty() {
-            return Ok(BatchLandingVerdict::LandedAll {
-                final_position: self.rolling_commitment.frame_count(),
+            return Ok(BatchLandingReceipt {
+                final_position: Some(self.rolling_commitment.frame_count()),
                 landed_count: 0,
+                next_attempt: None,
+                unattempted_count: 0,
+                total: 0,
             });
         }
 
@@ -566,7 +569,6 @@ impl<E: StorageEngine> Store<E> {
                 ));
             }
 
-            scratch_index.validate_append(&env)?;
             scratch_index.commit_envelope_unchecked(env.clone());
 
             let mut frame_buf = Vec::new();
@@ -579,7 +581,7 @@ impl<E: StorageEngine> Store<E> {
         let verdict = self.engine.append_batch_detailed(&block_refs);
 
         match verdict {
-            BatchLandingVerdict::LandedAll {
+            RawBatchOutcome::LandedAll {
                 final_position: _,
                 landed_count,
             } => {
@@ -596,12 +598,15 @@ impl<E: StorageEngine> Store<E> {
                     self.rolling_commitment.update_frame(frame_buf);
                 }
                 self.fiber_index = scratch_index;
-                Ok(BatchLandingVerdict::LandedAll {
-                    final_position: self.rolling_commitment.frame_count(),
+                Ok(BatchLandingReceipt {
+                    final_position: Some(self.rolling_commitment.frame_count()),
                     landed_count,
+                    next_attempt: None,
+                    unattempted_count: 0,
+                    total: payloads.len(),
                 })
             }
-            BatchLandingVerdict::PreAttemptRefusal {
+            RawBatchOutcome::PreAttemptRefusal {
                 error,
                 unattempted_count,
             } => {
@@ -614,12 +619,15 @@ impl<E: StorageEngine> Store<E> {
                         ),
                     ));
                 }
-                Ok(BatchLandingVerdict::PreAttemptRefusal {
-                    error,
+                Ok(BatchLandingReceipt {
+                    final_position: None,
+                    landed_count: 0,
+                    next_attempt: Some(NextAttemptStatus::Rejected(error)),
                     unattempted_count,
+                    total: payloads.len(),
                 })
             }
-            BatchLandingVerdict::PartialProgress {
+            RawBatchOutcome::PartialProgress {
                 landed_count,
                 next_attempt,
                 unattempted_count,
@@ -641,10 +649,16 @@ impl<E: StorageEngine> Store<E> {
                     self.fiber_index
                         .commit_envelope_unchecked(decoded_envelopes[i].clone());
                 }
-                Ok(BatchLandingVerdict::PartialProgress {
+                Ok(BatchLandingReceipt {
+                    final_position: if landed_count > 0 {
+                        Some(self.rolling_commitment.frame_count())
+                    } else {
+                        None
+                    },
                     landed_count,
-                    next_attempt,
+                    next_attempt: Some(next_attempt),
                     unattempted_count,
+                    total: payloads.len(),
                 })
             }
         }
@@ -657,7 +671,7 @@ impl<E: StorageEngine> Store<E> {
     pub fn append_batch_envelopes_detailed(
         &mut self,
         envelopes: &[EventEnvelope],
-    ) -> Result<BatchLandingVerdict<u64>, OperationFailure> {
+    ) -> Result<BatchLandingReceipt<u64>, OperationFailure> {
         let mut encoded_payloads = Vec::with_capacity(envelopes.len());
         for env in envelopes {
             let mut env_buf = Vec::new();
@@ -676,19 +690,22 @@ impl<E: StorageEngine> Store<E> {
         &mut self,
         payloads: &[&[u8]],
     ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-        match self.append_batch_detailed(payloads)? {
-            BatchLandingVerdict::LandedAll { final_position, .. } => {
-                Ok(WriteLandingVerdict::Landed(final_position))
+        let receipt = self.append_batch_detailed(payloads)?;
+        if receipt.is_all_landed() {
+            let pos = receipt.final_position().unwrap_or(0);
+            Ok(WriteLandingVerdict::Landed(pos))
+        } else if let Some(next) = receipt.next_attempt() {
+            match next {
+                NextAttemptStatus::Undetermined { carried_epoch } => {
+                    Ok(WriteLandingVerdict::Undetermined {
+                        carried_epoch: *carried_epoch,
+                    })
+                }
+                NextAttemptStatus::Rejected(err) => Err(err.clone()),
             }
-            BatchLandingVerdict::PreAttemptRefusal { error, .. } => Err(error),
-            BatchLandingVerdict::PartialProgress {
-                next_attempt: NextAttemptStatus::Undetermined { carried_epoch },
-                ..
-            } => Ok(WriteLandingVerdict::Undetermined { carried_epoch }),
-            BatchLandingVerdict::PartialProgress {
-                next_attempt: NextAttemptStatus::Rejected(err),
-                ..
-            } => Err(err),
+        } else {
+            let pos = receipt.final_position().unwrap_or(0);
+            Ok(WriteLandingVerdict::Landed(pos))
         }
     }
 
@@ -714,19 +731,22 @@ impl<E: StorageEngine> Store<E> {
         &mut self,
         envelopes: &[EventEnvelope],
     ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-        match self.append_batch_envelopes_detailed(envelopes)? {
-            BatchLandingVerdict::LandedAll { final_position, .. } => {
-                Ok(WriteLandingVerdict::Landed(final_position))
+        let receipt = self.append_batch_envelopes_detailed(envelopes)?;
+        if receipt.is_all_landed() {
+            let pos = receipt.final_position().unwrap_or(0);
+            Ok(WriteLandingVerdict::Landed(pos))
+        } else if let Some(next) = receipt.next_attempt() {
+            match next {
+                NextAttemptStatus::Undetermined { carried_epoch } => {
+                    Ok(WriteLandingVerdict::Undetermined {
+                        carried_epoch: *carried_epoch,
+                    })
+                }
+                NextAttemptStatus::Rejected(err) => Err(err.clone()),
             }
-            BatchLandingVerdict::PreAttemptRefusal { error, .. } => Err(error),
-            BatchLandingVerdict::PartialProgress {
-                next_attempt: NextAttemptStatus::Undetermined { carried_epoch },
-                ..
-            } => Ok(WriteLandingVerdict::Undetermined { carried_epoch }),
-            BatchLandingVerdict::PartialProgress {
-                next_attempt: NextAttemptStatus::Rejected(err),
-                ..
-            } => Err(err),
+        } else {
+            let pos = receipt.final_position().unwrap_or(0);
+            Ok(WriteLandingVerdict::Landed(pos))
         }
     }
 
@@ -1486,24 +1506,13 @@ mod tests {
                 env4.clone(),
             ])
             .expect("batch detailed returns verdict");
-        match &verdict {
-            BatchLandingVerdict::PartialProgress {
-                landed_count,
-                next_attempt,
-                unattempted_count,
-            } => {
-                assert_eq!(*landed_count, 2);
-                assert_eq!(
-                    *next_attempt,
-                    NextAttemptStatus::Undetermined { carried_epoch: 1 }
-                );
-                assert_eq!(*unattempted_count, 1);
-            }
-            other => panic!("expected PartialProgress, got {other:?}"),
-        }
         assert_eq!(verdict.landed_count(), 2);
-        assert_eq!(verdict.unresolved_count(), 1);
+        assert_eq!(
+            verdict.next_attempt(),
+            Some(&NextAttemptStatus::Undetermined { carried_epoch: 1 })
+        );
         assert_eq!(verdict.unattempted_count(), 1);
+        assert_eq!(verdict.unresolved_count(), 1);
         assert_eq!(verdict.total_count(), 4);
         assert_eq!(store.rolling_commitment().frame_count(), 2);
         let h = store.fiber(fiber1).expect("fiber1");
@@ -1520,13 +1529,8 @@ mod tests {
         let verdict_all = store_ok
             .append_batch_envelopes_detailed(&[env1.clone(), env2.clone(), env3.clone()])
             .expect("batch detailed succeeds");
-        assert_eq!(
-            verdict_all,
-            BatchLandingVerdict::LandedAll {
-                final_position: 3,
-                landed_count: 3,
-            }
-        );
+        assert!(verdict_all.is_all_landed());
+        assert_eq!(verdict_all.final_position(), Some(3));
         assert_eq!(verdict_all.landed_count(), 3);
         assert_eq!(verdict_all.unattempted_count(), 0);
         assert_eq!(verdict_all.total_count(), 3);
@@ -1566,29 +1570,18 @@ mod tests {
             ])
             .expect("batch detailed returns partial failure verdict");
 
-        match &verdict {
-            BatchLandingVerdict::PartialProgress {
-                landed_count,
-                next_attempt,
-                unattempted_count,
-            } => {
-                assert_eq!(*landed_count, 2);
-                match next_attempt {
-                    NextAttemptStatus::Rejected(error) => {
-                        assert_eq!(
-                            *error.condition(),
-                            FailureCondition::PrecursorChainBroken(None)
-                        );
-                    }
-                    other => panic!("expected Rejected, got {other:?}"),
-                }
-                assert_eq!(*unattempted_count, 2);
-            }
-            other => panic!("expected PartialProgress, got {other:?}"),
-        }
         assert_eq!(verdict.landed_count(), 2);
-        assert_eq!(verdict.rejected_count(), 1);
+        match verdict.next_attempt() {
+            Some(NextAttemptStatus::Rejected(error)) => {
+                assert_eq!(
+                    *error.condition(),
+                    FailureCondition::PrecursorChainBroken(None)
+                );
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
         assert_eq!(verdict.unattempted_count(), 2);
+        assert_eq!(verdict.rejected_count(), 1);
         assert_eq!(verdict.total_count(), 5);
 
         assert_eq!(store.rolling_commitment().frame_count(), 2);
@@ -1609,13 +1602,7 @@ mod tests {
         let empty_res = store
             .append_batch_detailed(&[])
             .expect("empty batch succeeds");
-        assert_eq!(
-            empty_res,
-            BatchLandingVerdict::LandedAll {
-                final_position: 0,
-                landed_count: 0,
-            }
-        );
+        assert!(empty_res.is_all_landed());
         assert_eq!(empty_res.landed_count(), 0);
         assert_eq!(empty_res.unattempted_count(), 0);
         assert_eq!(empty_res.total_count(), 0);

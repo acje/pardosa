@@ -1637,13 +1637,8 @@ fn test_c5_12_and_c5_16_bounded_batch_landing_verdicts() {
     let v_all = store_all
         .append_batch_envelopes_detailed(&batch)
         .expect("verdict all");
-    assert_eq!(
-        v_all,
-        BatchLandingVerdict::LandedAll {
-            final_position: 4,
-            landed_count: 4,
-        }
-    );
+    assert!(v_all.is_all_landed());
+    assert_eq!(v_all.final_position(), Some(4));
     assert_eq!(v_all.landed_count(), 4);
     assert_eq!(v_all.unattempted_count(), 0);
     assert_eq!(v_all.total_count(), 4);
@@ -1665,24 +1660,13 @@ fn test_c5_12_and_c5_16_bounded_batch_landing_verdicts() {
     let v_undet = store_undet
         .append_batch_envelopes_detailed(&batch)
         .expect("verdict undet");
-    match &v_undet {
-        BatchLandingVerdict::PartialProgress {
-            landed_count,
-            next_attempt,
-            unattempted_count,
-        } => {
-            assert_eq!(*landed_count, 2);
-            assert_eq!(
-                *next_attempt,
-                NextAttemptStatus::Undetermined { carried_epoch: 42 }
-            );
-            assert_eq!(*unattempted_count, 1);
-        }
-        other => panic!("expected PartialProgress, got {other:?}"),
-    }
     assert_eq!(v_undet.landed_count(), 2);
-    assert_eq!(v_undet.unresolved_count(), 1);
+    assert_eq!(
+        v_undet.next_attempt(),
+        Some(&NextAttemptStatus::Undetermined { carried_epoch: 42 })
+    );
     assert_eq!(v_undet.unattempted_count(), 1);
+    assert_eq!(v_undet.unresolved_count(), 1);
     assert_eq!(v_undet.total_count(), 4);
     assert_eq!(store_undet.rolling_commitment().frame_count(), 2);
     assert_eq!(
@@ -1713,23 +1697,14 @@ fn test_c5_12_and_c5_16_bounded_batch_landing_verdicts() {
     let v_fail = store_fail
         .append_batch_envelopes_detailed(&batch)
         .expect("verdict fail");
-    match &v_fail {
-        BatchLandingVerdict::PartialProgress {
-            landed_count,
-            next_attempt,
-            unattempted_count,
-        } => {
-            assert_eq!(*landed_count, 1);
-            match next_attempt {
-                NextAttemptStatus::Rejected(error) => {
-                    assert_eq!(*error.condition(), FailureCondition::ConcurrencyConflict);
-                }
-                other => panic!("expected Rejected, got {other:?}"),
-            }
-            assert_eq!(*unattempted_count, 2);
+    assert_eq!(v_fail.landed_count(), 1);
+    match v_fail.next_attempt() {
+        Some(NextAttemptStatus::Rejected(error)) => {
+            assert_eq!(*error.condition(), FailureCondition::ConcurrencyConflict);
         }
-        other => panic!("expected PartialProgress, got {other:?}"),
+        other => panic!("expected Rejected, got {other:?}"),
     }
+    assert_eq!(v_fail.unattempted_count(), 2);
     assert_eq!(v_fail.landed_count(), 1);
     assert_eq!(v_fail.rejected_count(), 1);
     assert_eq!(v_fail.unattempted_count(), 2);
@@ -2374,11 +2349,67 @@ fn test_m4_inconsistent_refusal_count_is_refused() {
 fn test_m4_batch_landing_verdict_total_count_checked_arithmetic_overflow() {
     use pardosa::store::{BatchLandingVerdict, NextAttemptStatus};
 
-    let verdict: BatchLandingVerdict<u64> = BatchLandingVerdict::PartialProgress {
+    let v_overflow_pos1: BatchLandingVerdict<u64> = BatchLandingVerdict::PartialProgress {
         landed_count: usize::MAX,
         next_attempt: NextAttemptStatus::Undetermined { carried_epoch: 1 },
         unattempted_count: 0,
     };
-    assert_eq!(verdict.total_count(), usize::MAX);
-    assert_eq!(verdict.checked_total_count(), None);
+    assert_eq!(v_overflow_pos1.checked_total_count(), None);
+
+    let v_overflow_pos2: BatchLandingVerdict<u64> = BatchLandingVerdict::PartialProgress {
+        landed_count: usize::MAX - 1,
+        next_attempt: NextAttemptStatus::Undetermined { carried_epoch: 1 },
+        unattempted_count: 1,
+    };
+    assert_eq!(v_overflow_pos2.checked_total_count(), None);
+
+    let v_legal_boundary: BatchLandingVerdict<u64> = BatchLandingVerdict::PartialProgress {
+        landed_count: usize::MAX - 2,
+        next_attempt: NextAttemptStatus::Undetermined { carried_epoch: 1 },
+        unattempted_count: 1,
+    };
+    assert_eq!(v_legal_boundary.checked_total_count(), Some(usize::MAX));
+}
+
+#[test]
+fn test_compile_fail_batch_landing_receipt_private_construction() {
+    let invalid_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_test() {
+            let _receipt = BatchLandingReceipt {
+                final_position: Some(1u64),
+                landed_count: 1,
+                next_attempt: None,
+                unattempted_count: 0,
+                total: 1,
+            };
+        }
+    "#;
+    let (ok, stderr) = run_rustc(invalid_code);
+    assert!(
+        !ok,
+        "direct construction of BatchLandingReceipt must fail compilation"
+    );
+    assert!(
+        stderr.contains("private"),
+        "error must cite private fields:\n{stderr}"
+    );
+
+    let positive_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_test(receipt: &BatchLandingReceipt<u64>) {
+            let _all = receipt.is_all_landed();
+            let _pos = receipt.final_position();
+            let _landed = receipt.landed_count();
+            let _unresolved = receipt.unresolved_count();
+            let _rejected = receipt.rejected_count();
+            let _unattempted = receipt.unattempted_count();
+            let _total = receipt.total_count();
+        }
+    "#;
+    let (pos_ok, pos_stderr) = run_rustc(positive_code);
+    assert!(
+        pos_ok,
+        "valid accessors on BatchLandingReceipt must compile cleanly:\n{pos_stderr}"
+    );
 }

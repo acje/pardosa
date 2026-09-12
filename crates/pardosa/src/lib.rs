@@ -66,7 +66,24 @@
 //!
 //! Per C4.21, an artefact is read only by the major line that wrote it. Cross-major data export is the operator's
 //! responsibility via the migration subsystem.
-
+//!
+//! # Resource Allocation and Accounting Disclosure (R12 / M9)
+//!
+//! Pardosa operates as an in-process library without autonomous memory sandboxing or background thread runtime:
+//! - **Caller-Budgeted Ingestion**: Heap allocations during batch operations are directly proportional to caller batch
+//!   parameters: batch size $N$ and item payload byte lengths. Specifically, [`store::Store::append_batch_detailed`]
+//!   clones the session index ([`store::SessionIndex`]) into a scratch index ($O(F)$ where $F \le 4096$ active fibers)
+//!   and retains $N$ encoded frame buffers and $N$ decoded envelopes in memory until submission.
+//! - **Bounded Session State**: In-memory fiber indexing is bounded by `MAX_ACTIVE_FIBERS` (4,096) active fiber handles
+//!   and `MAX_EVENTS_PER_FIBER` (65,535) events per fiber. Seen event IDs, broken fiber tombstones, and pending
+//!   reservations are tracked in heap-allocated maps within [`store::SessionIndex`].
+//! - **Transport Isolation**: Transport operations execute synchronously with sequential durability. `NatsEngine`
+//!   drains each publish future sequentially before initiating subsequent requests; no unbounded in-flight publish
+//!   queues exist within the storage engine.
+//! - **Process Admission Boundary**: Overall memory ceilings, worker concurrency (e.g. `DEFAULT_MAX_WORKERS`), and
+//!   operational timeouts (e.g. `COLLECTION_TIMEOUT_SECS`) are owned and enforced by the host application caller,
+//!   not by internal runtime sandboxes.
+//!
 #![deny(missing_docs)]
 
 pub mod encoding;

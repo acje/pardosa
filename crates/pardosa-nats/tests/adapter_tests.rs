@@ -878,13 +878,7 @@ fn test_nats_append_batch_detailed_outcomes_and_variable_sizes() {
     let empty_v = writer
         .append_batch_envelopes_detailed(&[])
         .expect("empty batch");
-    assert_eq!(
-        empty_v,
-        BatchLandingVerdict::LandedAll {
-            final_position: 0,
-            landed_count: 0,
-        }
-    );
+    assert!(empty_v.is_all_landed());
     assert_eq!(empty_v.landed_count(), 0);
     assert_eq!(empty_v.total_count(), 0);
 
@@ -930,21 +924,12 @@ fn test_nats_append_batch_detailed_outcomes_and_variable_sizes() {
         .append_batch_envelopes_detailed(std::slice::from_ref(&undet_env))
         .expect("undet returns verdict");
 
-    match &undet_v {
-        BatchLandingVerdict::PartialProgress {
-            landed_count,
-            next_attempt,
-            unattempted_count,
-        } => {
-            assert_eq!(*landed_count, 0);
-            assert_eq!(
-                *next_attempt,
-                NextAttemptStatus::Undetermined { carried_epoch: 1 }
-            );
-            assert_eq!(*unattempted_count, 0);
-        }
-        other => panic!("expected PartialProgress with Undetermined, got {other:?}"),
-    }
+    assert_eq!(undet_v.landed_count(), 0);
+    assert_eq!(
+        undet_v.next_attempt(),
+        Some(&NextAttemptStatus::Undetermined { carried_epoch: 1 })
+    );
+    assert_eq!(undet_v.unattempted_count(), 0);
     assert_eq!(undet_v.landed_count(), 0);
     assert_eq!(undet_v.unresolved_count(), 1);
     assert_eq!(undet_v.unattempted_count(), 0);

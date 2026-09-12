@@ -619,24 +619,13 @@ fn test_m4_append_batch_detailed_partial_landing_undetermined_and_failure() {
         .append_batch_envelopes_detailed(&[env1.clone(), env2.clone(), env3.clone(), env4.clone()])
         .expect("append batch detailed returns verdict");
 
-    match &verdict {
-        BatchLandingVerdict::PartialProgress {
-            landed_count,
-            next_attempt,
-            unattempted_count,
-        } => {
-            assert_eq!(*landed_count, 2);
-            assert_eq!(
-                *next_attempt,
-                NextAttemptStatus::Undetermined { carried_epoch: 1 }
-            );
-            assert_eq!(*unattempted_count, 1);
-        }
-        other => panic!("expected PartialProgress, got {other:?}"),
-    }
     assert_eq!(verdict.landed_count(), 2);
-    assert_eq!(verdict.unresolved_count(), 1);
+    assert_eq!(
+        verdict.next_attempt(),
+        Some(&NextAttemptStatus::Undetermined { carried_epoch: 1 })
+    );
     assert_eq!(verdict.unattempted_count(), 1);
+    assert_eq!(verdict.unresolved_count(), 1);
     assert_eq!(verdict.total_count(), 4);
     assert_eq!(writer_undetermined.rolling_commitment().frame_count(), 2);
     let h = writer_undetermined
@@ -672,26 +661,17 @@ fn test_m4_append_batch_detailed_partial_landing_undetermined_and_failure() {
         .append_batch_envelopes_detailed(&[env1.clone(), env2.clone(), env3.clone()])
         .expect("returns partial failure verdict");
 
-    match &verdict_fail {
-        BatchLandingVerdict::PartialProgress {
-            landed_count,
-            next_attempt,
-            unattempted_count,
-        } => {
-            assert_eq!(*landed_count, 1);
-            match next_attempt {
-                NextAttemptStatus::Rejected(error) => {
-                    assert_eq!(
-                        *error.condition(),
-                        FailureCondition::PrecursorChainBroken(None)
-                    );
-                }
-                other => panic!("expected Rejected, got {other:?}"),
-            }
-            assert_eq!(*unattempted_count, 1);
+    assert_eq!(verdict_fail.landed_count(), 1);
+    match verdict_fail.next_attempt() {
+        Some(NextAttemptStatus::Rejected(error)) => {
+            assert_eq!(
+                *error.condition(),
+                FailureCondition::PrecursorChainBroken(None)
+            );
         }
-        other => panic!("expected PartialProgress, got {other:?}"),
+        other => panic!("expected Rejected, got {other:?}"),
     }
+    assert_eq!(verdict_fail.unattempted_count(), 1);
     assert_eq!(verdict_fail.landed_count(), 1);
     assert_eq!(verdict_fail.rejected_count(), 1);
     assert_eq!(verdict_fail.unattempted_count(), 1);
@@ -732,21 +712,12 @@ fn test_m4_append_batch_sync_error_stops_before_subsequent_blocks() {
         .append_batch_envelopes_detailed(&[env1.clone(), env2.clone()])
         .expect("returns verdict");
 
-    match &verdict {
-        BatchLandingVerdict::PartialProgress {
-            landed_count,
-            next_attempt,
-            unattempted_count,
-        } => {
-            assert_eq!(*landed_count, 0);
-            assert_eq!(
-                *next_attempt,
-                NextAttemptStatus::Undetermined { carried_epoch: 1 }
-            );
-            assert_eq!(*unattempted_count, 1);
-        }
-        other => panic!("expected PartialProgress with Undetermined, got {other:?}"),
-    }
+    assert_eq!(verdict.landed_count(), 0);
+    assert_eq!(
+        verdict.next_attempt(),
+        Some(&NextAttemptStatus::Undetermined { carried_epoch: 1 })
+    );
+    assert_eq!(verdict.unattempted_count(), 1);
     assert_eq!(verdict.landed_count(), 0);
     assert_eq!(verdict.unresolved_count(), 1);
     assert_eq!(verdict.unattempted_count(), 1);

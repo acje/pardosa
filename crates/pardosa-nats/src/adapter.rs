@@ -2385,4 +2385,65 @@ mod tests {
         let failure = map_nats_stream_open_error("test_stream", &err);
         assert_eq!(*failure.condition(), FailureCondition::TransportUnavailable);
     }
+
+    #[test]
+    fn test_map_nats_raw_message_error_jetstream_sequence_not_found_is_broken_chain() {
+        let js_err: async_nats::jetstream::Error = serde_json::from_str(
+            r#"{"code": 404, "err_code": 10043, "description": "sequence not found"}"#,
+        )
+        .unwrap();
+        let err = RawMessageError::new(RawMessageErrorKind::JetStream(js_err));
+        let failure = map_nats_raw_message_error(42, &err);
+        assert_eq!(
+            *failure.condition(),
+            FailureCondition::PrecursorChainBroken(None)
+        );
+    }
+
+    #[test]
+    fn test_map_nats_raw_message_error_jetstream_no_message_found_is_broken_chain() {
+        let js_err: async_nats::jetstream::Error = serde_json::from_str(
+            r#"{"code": 404, "err_code": 10037, "description": "no message found"}"#,
+        )
+        .unwrap();
+        let err = RawMessageError::new(RawMessageErrorKind::JetStream(js_err));
+        let failure = map_nats_raw_message_error(42, &err);
+        assert_eq!(
+            *failure.condition(),
+            FailureCondition::PrecursorChainBroken(None)
+        );
+    }
+
+    #[test]
+    fn test_map_nats_raw_message_error_jetstream_unrelated_code_is_transport_unavailable() {
+        let js_err: async_nats::jetstream::Error = serde_json::from_str(
+            r#"{"code": 500, "err_code": 10000, "description": "internal server error"}"#,
+        )
+        .unwrap();
+        let err = RawMessageError::new(RawMessageErrorKind::JetStream(js_err));
+        let failure = map_nats_raw_message_error(42, &err);
+        assert_eq!(*failure.condition(), FailureCondition::TransportUnavailable);
+    }
+
+    #[test]
+    fn test_map_nats_stream_open_error_jetstream_stream_not_found_is_no_artefact() {
+        let js_err: async_nats::jetstream::Error = serde_json::from_str(
+            r#"{"code": 404, "err_code": 10059, "description": "stream not found"}"#,
+        )
+        .unwrap();
+        let err = GetStreamError::new(GetStreamErrorKind::JetStream(js_err));
+        let failure = map_nats_stream_open_error("test_stream", &err);
+        assert_eq!(*failure.condition(), FailureCondition::NoArtefactExists);
+    }
+
+    #[test]
+    fn test_map_nats_stream_open_error_jetstream_unrelated_code_is_transport_unavailable() {
+        let js_err: async_nats::jetstream::Error = serde_json::from_str(
+            r#"{"code": 500, "err_code": 10000, "description": "internal server error"}"#,
+        )
+        .unwrap();
+        let err = GetStreamError::new(GetStreamErrorKind::JetStream(js_err));
+        let failure = map_nats_stream_open_error("test_stream", &err);
+        assert_eq!(*failure.condition(), FailureCondition::TransportUnavailable);
+    }
 }

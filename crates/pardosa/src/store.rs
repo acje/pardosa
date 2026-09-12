@@ -1087,13 +1087,12 @@ pub enum NextAttemptStatus {
     Rejected(OperationFailure),
 }
 
-/// Outcome of a bounded sequential batch-write operation per C5.12 and C5.16.
+/// Raw outcome of a sequential batch-write operation reported by a [`StorageEngine`].
 ///
-/// Progress is structurally bound to the submitted batch: either all items landed,
-/// the batch was refused before submission, or execution halted after a confirmed
-/// contiguous landed prefix with an explicit next attempt status and unattempted suffix.
+/// This unvalidated DTO carries raw item counts reported by the underlying storage engine
+/// across crate boundaries before validation by [`Store`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BatchLandingVerdict<T> {
+pub enum RawBatchOutcome<T> {
     /// All items in the batch successfully landed durably.
     LandedAll {
         /// Position or sequence of the final landed item.
@@ -1101,7 +1100,7 @@ pub enum BatchLandingVerdict<T> {
         /// Number of items confirmed landed.
         landed_count: usize,
     },
-    /// The batch was refused before any item was submitted to storage (e.g. invalid authority or empty batch).
+    /// The batch was refused before any item was submitted to storage.
     PreAttemptRefusal {
         /// Deterministic operation failure preventing attempt.
         error: OperationFailure,
@@ -1119,7 +1118,10 @@ pub enum BatchLandingVerdict<T> {
     },
 }
 
-impl<T> BatchLandingVerdict<T> {
+/// Backwards-compatible alias for the raw engine batch outcome.
+pub type BatchLandingVerdict<T> = RawBatchOutcome<T>;
+
+impl<T> RawBatchOutcome<T> {
     /// Returns true if all items in the batch successfully landed.
     #[must_use]
     pub fn is_all_landed(&self) -> bool {
@@ -1181,24 +1183,21 @@ impl<T> BatchLandingVerdict<T> {
         }
     }
 
-    /// Returns the total number of items accounted for in this batch outcome.
-    ///
-    /// Uses saturating addition to prevent arithmetic overflow on untrusted external values.
-    #[must_use]
-    pub fn total_count(&self) -> usize {
-        self.landed_count()
-            .saturating_add(self.unresolved_count())
-            .saturating_add(self.rejected_count())
-            .saturating_add(self.unattempted_count())
-    }
-
     /// Checked total item count. Returns `None` if counts overflow `usize`.
     #[must_use]
     pub fn checked_total_count(&self) -> Option<usize> {
-        self.landed_count()
-            .checked_add(self.unresolved_count())
-            .and_then(|sum| sum.checked_add(self.rejected_count()))
-            .and_then(|sum| sum.checked_add(self.unattempted_count()))
+        let (l, n, u) = match self {
+            Self::LandedAll { landed_count, .. } => (*landed_count, 0, 0),
+            Self::PreAttemptRefusal {
+                unattempted_count, ..
+            } => (0, 0, *unattempted_count),
+            Self::PartialProgress {
+                landed_count,
+                unattempted_count,
+                ..
+            } => (*landed_count, 1, *unattempted_count),
+        };
+        l.checked_add(n).and_then(|sum| sum.checked_add(u))
     }
 
     /// Returns true if any item in the batch has an ambiguous/undetermined outcome.
@@ -1210,6 +1209,89 @@ impl<T> BatchLandingVerdict<T> {
                 next_attempt: NextAttemptStatus::Undetermined { .. },
                 ..
             }
+        )
+    }
+}
+
+/// Validated outcome of a bounded sequential batch-write operation per C5.12 and C5.16.
+///
+/// Progress is structurally bound to the submitted batch: item counts are validated
+/// against the submitted batch length before any store state or index mutation occurs.
+/// All fields are private; instances cannot be externally constructed or mutated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchLandingReceipt<T> {
+    pub(crate) final_position: Option<T>,
+    pub(crate) landed_count: usize,
+    pub(crate) next_attempt: Option<NextAttemptStatus>,
+    pub(crate) unattempted_count: usize,
+    pub(crate) total: usize,
+}
+
+impl<T: Copy> BatchLandingReceipt<T> {
+    /// Returns true if all items in the batch successfully landed.
+    #[must_use]
+    pub fn is_all_landed(&self) -> bool {
+        self.landed_count == self.total
+            && self.unattempted_count == 0
+            && self.next_attempt.is_none()
+    }
+
+    /// Returns the sequence or position of the final landed item, if any items landed.
+    #[must_use]
+    pub fn final_position(&self) -> Option<T> {
+        self.final_position
+    }
+
+    /// Returns the number of items verified to have landed from the submitted batch.
+    #[must_use]
+    pub fn landed_count(&self) -> usize {
+        self.landed_count
+    }
+
+    /// Returns the number of items whose durability is ambiguous/undetermined.
+    #[must_use]
+    pub fn unresolved_count(&self) -> usize {
+        match &self.next_attempt {
+            Some(NextAttemptStatus::Undetermined { .. }) => 1,
+            _ => 0,
+        }
+    }
+
+    /// Returns the number of items positively rejected with a deterministic error.
+    #[must_use]
+    pub fn rejected_count(&self) -> usize {
+        match &self.next_attempt {
+            Some(NextAttemptStatus::Rejected(_)) => 1,
+            _ => 0,
+        }
+    }
+
+    /// Returns the number of items remaining in the batch that were never submitted.
+    #[must_use]
+    pub fn unattempted_count(&self) -> usize {
+        self.unattempted_count
+    }
+
+    /// Returns the status of the specific attempt following the landed prefix, if interrupted.
+    #[must_use]
+    pub fn next_attempt(&self) -> Option<&NextAttemptStatus> {
+        self.next_attempt.as_ref()
+    }
+
+    /// Returns the total number of items accounted for in this batch outcome.
+    ///
+    /// Guaranteed to equal the submitted batch length by construction.
+    #[must_use]
+    pub fn total_count(&self) -> usize {
+        self.total
+    }
+
+    /// Returns true if any item in the batch has an ambiguous/undetermined outcome.
+    #[must_use]
+    pub fn has_unresolved(&self) -> bool {
+        matches!(
+            self.next_attempt,
+            Some(NextAttemptStatus::Undetermined { .. })
         )
     }
 }
