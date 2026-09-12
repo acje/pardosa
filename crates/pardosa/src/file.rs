@@ -1203,7 +1203,7 @@ impl StorageEngine for FileEngine {
         }
 
         if let Some(limit) = self.undetermined_after_n_blocks {
-            if (self.frame_count as usize) >= limit {
+            if self.frame_count >= limit as u64 {
                 self.uncertain = true;
                 self.uncertain_diagnostic = Some(
                     "write landing undetermined: simulated indeterminate write landing".to_string(),
@@ -1215,7 +1215,7 @@ impl StorageEngine for FileEngine {
         }
 
         if let Some(limit) = self.fail_after_n_blocks {
-            if (self.frame_count as usize) >= limit {
+            if self.frame_count >= limit as u64 {
                 return Err(OperationFailure::new(
                     FailureCondition::PrecursorChainBroken(None),
                     "simulated write failure after limit",

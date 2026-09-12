@@ -532,6 +532,7 @@ impl<E: StorageEngine> Store<E> {
         if payloads.is_empty() {
             return Ok(BatchLandingVerdict::LandedAll {
                 final_position: self.rolling_commitment.frame_count(),
+                landed_count: 0,
             });
         }
 
@@ -578,18 +579,26 @@ impl<E: StorageEngine> Store<E> {
         let verdict = self.engine.append_batch_detailed(&block_refs);
 
         match verdict {
-            BatchLandingVerdict::LandedAll { final_position: _ } => {
+            BatchLandingVerdict::LandedAll {
+                final_position: _,
+                landed_count,
+            } => {
                 for frame_buf in &frame_buffers {
                     self.rolling_commitment.update_frame(frame_buf);
                 }
                 self.fiber_index = scratch_index;
                 Ok(BatchLandingVerdict::LandedAll {
                     final_position: self.rolling_commitment.frame_count(),
+                    landed_count,
                 })
             }
-            BatchLandingVerdict::PreAttemptRefusal { error } => {
-                Ok(BatchLandingVerdict::PreAttemptRefusal { error })
-            }
+            BatchLandingVerdict::PreAttemptRefusal {
+                error,
+                unattempted_count,
+            } => Ok(BatchLandingVerdict::PreAttemptRefusal {
+                error,
+                unattempted_count,
+            }),
             BatchLandingVerdict::PartialProgress {
                 landed_count,
                 next_attempt,
@@ -648,10 +657,10 @@ impl<E: StorageEngine> Store<E> {
         payloads: &[&[u8]],
     ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
         match self.append_batch_detailed(payloads)? {
-            BatchLandingVerdict::LandedAll { final_position } => {
+            BatchLandingVerdict::LandedAll { final_position, .. } => {
                 Ok(WriteLandingVerdict::Landed(final_position))
             }
-            BatchLandingVerdict::PreAttemptRefusal { error } => Err(error),
+            BatchLandingVerdict::PreAttemptRefusal { error, .. } => Err(error),
             BatchLandingVerdict::PartialProgress {
                 next_attempt: NextAttemptStatus::Undetermined { carried_epoch },
                 ..
@@ -686,10 +695,10 @@ impl<E: StorageEngine> Store<E> {
         envelopes: &[EventEnvelope],
     ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
         match self.append_batch_envelopes_detailed(envelopes)? {
-            BatchLandingVerdict::LandedAll { final_position } => {
+            BatchLandingVerdict::LandedAll { final_position, .. } => {
                 Ok(WriteLandingVerdict::Landed(final_position))
             }
-            BatchLandingVerdict::PreAttemptRefusal { error } => Err(error),
+            BatchLandingVerdict::PreAttemptRefusal { error, .. } => Err(error),
             BatchLandingVerdict::PartialProgress {
                 next_attempt: NextAttemptStatus::Undetermined { carried_epoch },
                 ..
@@ -1472,9 +1481,10 @@ mod tests {
             }
             other => panic!("expected PartialProgress, got {other:?}"),
         }
-        assert_eq!(verdict.landed_count(4), 2);
+        assert_eq!(verdict.landed_count(), 2);
         assert_eq!(verdict.unresolved_count(), 1);
-        assert_eq!(verdict.unattempted_count(4), 1);
+        assert_eq!(verdict.unattempted_count(), 1);
+        assert_eq!(verdict.total_count(), 4);
         assert_eq!(store.rolling_commitment().frame_count(), 2);
         let h = store.fiber(fiber1).expect("fiber1");
         assert_eq!(h.event_count(), 2);
@@ -1492,10 +1502,14 @@ mod tests {
             .expect("batch detailed succeeds");
         assert_eq!(
             verdict_all,
-            BatchLandingVerdict::LandedAll { final_position: 3 }
+            BatchLandingVerdict::LandedAll {
+                final_position: 3,
+                landed_count: 3,
+            }
         );
-        assert_eq!(verdict_all.landed_count(3), 3);
-        assert_eq!(verdict_all.unattempted_count(3), 0);
+        assert_eq!(verdict_all.landed_count(), 3);
+        assert_eq!(verdict_all.unattempted_count(), 0);
+        assert_eq!(verdict_all.total_count(), 3);
         assert_eq!(store_ok.rolling_commitment().frame_count(), 3);
         let h_ok = store_ok.fiber(fiber1).expect("fiber1");
         assert_eq!(h_ok.event_count(), 3);
@@ -1552,9 +1566,10 @@ mod tests {
             }
             other => panic!("expected PartialProgress, got {other:?}"),
         }
-        assert_eq!(verdict.landed_count(5), 2);
+        assert_eq!(verdict.landed_count(), 2);
         assert_eq!(verdict.rejected_count(), 1);
-        assert_eq!(verdict.unattempted_count(5), 2);
+        assert_eq!(verdict.unattempted_count(), 2);
+        assert_eq!(verdict.total_count(), 5);
 
         assert_eq!(store.rolling_commitment().frame_count(), 2);
         let h = store.fiber(fiber1).expect("fiber1");
@@ -1576,10 +1591,14 @@ mod tests {
             .expect("empty batch succeeds");
         assert_eq!(
             empty_res,
-            BatchLandingVerdict::LandedAll { final_position: 0 }
+            BatchLandingVerdict::LandedAll {
+                final_position: 0,
+                landed_count: 0,
+            }
         );
-        assert_eq!(empty_res.landed_count(0), 0);
-        assert_eq!(empty_res.unattempted_count(0), 0);
+        assert_eq!(empty_res.landed_count(), 0);
+        assert_eq!(empty_res.unattempted_count(), 0);
+        assert_eq!(empty_res.total_count(), 0);
 
         let short_payload = [0u8; 10];
         let short_err = store.append_batch_detailed(&[&short_payload]).unwrap_err();

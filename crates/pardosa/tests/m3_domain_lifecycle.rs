@@ -1637,9 +1637,16 @@ fn test_c5_12_and_c5_16_bounded_batch_landing_verdicts() {
     let v_all = store_all
         .append_batch_envelopes_detailed(&batch)
         .expect("verdict all");
-    assert_eq!(v_all, BatchLandingVerdict::LandedAll { final_position: 4 });
-    assert_eq!(v_all.landed_count(4), 4);
-    assert_eq!(v_all.unattempted_count(4), 0);
+    assert_eq!(
+        v_all,
+        BatchLandingVerdict::LandedAll {
+            final_position: 4,
+            landed_count: 4,
+        }
+    );
+    assert_eq!(v_all.landed_count(), 4);
+    assert_eq!(v_all.unattempted_count(), 0);
+    assert_eq!(v_all.total_count(), 4);
     assert_eq!(store_all.rolling_commitment().frame_count(), 4);
     assert_eq!(
         store_all
@@ -1673,9 +1680,10 @@ fn test_c5_12_and_c5_16_bounded_batch_landing_verdicts() {
         }
         other => panic!("expected PartialProgress, got {other:?}"),
     }
-    assert_eq!(v_undet.landed_count(4), 2);
+    assert_eq!(v_undet.landed_count(), 2);
     assert_eq!(v_undet.unresolved_count(), 1);
-    assert_eq!(v_undet.unattempted_count(4), 1);
+    assert_eq!(v_undet.unattempted_count(), 1);
+    assert_eq!(v_undet.total_count(), 4);
     assert_eq!(store_undet.rolling_commitment().frame_count(), 2);
     assert_eq!(
         store_undet
@@ -1722,9 +1730,10 @@ fn test_c5_12_and_c5_16_bounded_batch_landing_verdicts() {
         }
         other => panic!("expected PartialProgress, got {other:?}"),
     }
-    assert_eq!(v_fail.landed_count(4), 1);
+    assert_eq!(v_fail.landed_count(), 1);
     assert_eq!(v_fail.rejected_count(), 1);
-    assert_eq!(v_fail.unattempted_count(4), 2);
+    assert_eq!(v_fail.unattempted_count(), 2);
+    assert_eq!(v_fail.total_count(), 4);
     assert_eq!(store_fail.rolling_commitment().frame_count(), 1);
     assert_eq!(
         store_fail
@@ -1982,6 +1991,87 @@ fn test_m4_impossible_engine_batch_count_is_refused_by_store() {
     );
     assert!(err.diagnostic_detail().message().contains(
         "inconsistent batch partition: landed 5 + next 1 + unattempted 0 != batch length 1"
+    ));
+}
+
+#[test]
+fn test_m4_inconsistent_suffix_partition_rejected() {
+    struct SuffixRogueEngine {
+        epoch: u64,
+    }
+    impl StorageEngine for SuffixRogueEngine {
+        fn carried_epoch(&self) -> u64 {
+            self.epoch
+        }
+        fn append_block(
+            &mut self,
+            _b: &[u8],
+        ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
+            Ok(WriteLandingVerdict::Landed(1))
+        }
+        fn append_batch_detailed(&mut self, _blocks: &[&[u8]]) -> BatchLandingVerdict<u64> {
+            BatchLandingVerdict::PartialProgress {
+                landed_count: 0,
+                next_attempt: NextAttemptStatus::Undetermined {
+                    carried_epoch: self.epoch,
+                },
+                unattempted_count: 99,
+            }
+        }
+        fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
+            Ok(Vec::new())
+        }
+        fn is_retired(&self) -> Result<bool, OperationFailure> {
+            Ok(false)
+        }
+        fn sync(&mut self) -> Result<(), OperationFailure> {
+            Ok(())
+        }
+        fn uncertain_diagnostic(&self) -> Option<&str> {
+            None
+        }
+        fn claim(&self) -> Option<&OwnershipClaimRecord> {
+            None
+        }
+        fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
+            None
+        }
+        fn set_schema_descriptor(&mut self, _d: &SchemaDescriptor) -> Result<(), OperationFailure> {
+            Ok(())
+        }
+        fn record_meta_record(&mut self, _r: &OwnershipRecord) -> Result<(), OperationFailure> {
+            Ok(())
+        }
+        fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
+            None
+        }
+        fn inbound_pointer(&self) -> Option<&InboundPointerRecord> {
+            None
+        }
+        fn migration_start(&self) -> Option<&MigrationStartRecord> {
+            None
+        }
+        fn migration_end(&self) -> Option<&MigrationEndRecord> {
+            None
+        }
+        fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
+            None
+        }
+    }
+
+    let fiber = [0x55; 16];
+    let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"valid-1").unwrap();
+    let mut e1_buf = Vec::new();
+    e1.encode(&mut e1_buf);
+
+    let mut store = Store::open_writer(SuffixRogueEngine { epoch: 1 }).unwrap();
+    let err = store.append_batch_detailed(&[&e1_buf]).unwrap_err();
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::PrecursorChainBroken(None)
+    );
+    assert!(err.diagnostic_detail().message().contains(
+        "inconsistent batch partition: landed 0 + next 1 + unattempted 99 != batch length 1"
     ));
 }
 

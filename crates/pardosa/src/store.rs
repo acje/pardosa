@@ -1098,11 +1098,15 @@ pub enum BatchLandingVerdict<T> {
     LandedAll {
         /// Position or sequence of the final landed item.
         final_position: T,
+        /// Number of items confirmed landed.
+        landed_count: usize,
     },
     /// The batch was refused before any item was submitted to storage (e.g. invalid authority or empty batch).
     PreAttemptRefusal {
         /// Deterministic operation failure preventing attempt.
         error: OperationFailure,
+        /// Number of unattempted items in the refused batch.
+        unattempted_count: usize,
     },
     /// Sequential execution landed a contiguous prefix before being interrupted.
     PartialProgress {
@@ -1124,11 +1128,12 @@ impl<T> BatchLandingVerdict<T> {
 
     /// Returns the number of items verified to have landed from the submitted batch.
     #[must_use]
-    pub fn landed_count(&self, total_submitted: usize) -> usize {
+    pub fn landed_count(&self) -> usize {
         match self {
-            Self::LandedAll { .. } => total_submitted,
+            Self::LandedAll { landed_count, .. } | Self::PartialProgress { landed_count, .. } => {
+                *landed_count
+            }
             Self::PreAttemptRefusal { .. } => 0,
-            Self::PartialProgress { landed_count, .. } => (*landed_count).min(total_submitted),
         }
     }
 
@@ -1164,14 +1169,25 @@ impl<T> BatchLandingVerdict<T> {
 
     /// Returns the number of items that remained unattempted in the submitted batch.
     #[must_use]
-    pub fn unattempted_count(&self, total_submitted: usize) -> usize {
+    pub fn unattempted_count(&self) -> usize {
         match self {
             Self::LandedAll { .. } => 0,
-            Self::PreAttemptRefusal { .. } => total_submitted,
-            Self::PartialProgress {
+            Self::PreAttemptRefusal {
                 unattempted_count, ..
-            } => (*unattempted_count).min(total_submitted),
+            }
+            | Self::PartialProgress {
+                unattempted_count, ..
+            } => *unattempted_count,
         }
+    }
+
+    /// Returns the total number of items accounted for in this batch outcome.
+    #[must_use]
+    pub fn total_count(&self) -> usize {
+        self.landed_count()
+            + self.unresolved_count()
+            + self.rejected_count()
+            + self.unattempted_count()
     }
 
     /// Returns true if any item in the batch has an ambiguous/undetermined outcome.

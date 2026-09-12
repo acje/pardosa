@@ -36,10 +36,16 @@ pub trait StorageEngine {
     /// Appends a batch of raw frame blocks, returning detailed landing progress.
     fn append_batch_detailed(&mut self, blocks: &[&[u8]]) -> BatchLandingVerdict<u64> {
         if let Err(error) = self.check_authority() {
-            return BatchLandingVerdict::PreAttemptRefusal { error };
+            return BatchLandingVerdict::PreAttemptRefusal {
+                error,
+                unattempted_count: blocks.len(),
+            };
         }
         if blocks.is_empty() {
-            return BatchLandingVerdict::LandedAll { final_position: 0 };
+            return BatchLandingVerdict::LandedAll {
+                final_position: 0,
+                landed_count: 0,
+            };
         }
         let mut last_position = 0;
 
@@ -67,6 +73,7 @@ pub trait StorageEngine {
 
         BatchLandingVerdict::LandedAll {
             final_position: last_position,
+            landed_count: blocks.len(),
         }
     }
 
@@ -79,10 +86,10 @@ pub trait StorageEngine {
         blocks: &[&[u8]],
     ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
         match self.append_batch_detailed(blocks) {
-            BatchLandingVerdict::LandedAll { final_position } => {
+            BatchLandingVerdict::LandedAll { final_position, .. } => {
                 Ok(WriteLandingVerdict::Landed(final_position))
             }
-            BatchLandingVerdict::PreAttemptRefusal { error } => Err(error),
+            BatchLandingVerdict::PreAttemptRefusal { error, .. } => Err(error),
             BatchLandingVerdict::PartialProgress {
                 next_attempt: NextAttemptStatus::Undetermined { carried_epoch },
                 ..

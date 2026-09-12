@@ -1507,6 +1507,15 @@ impl StorageEngine for NatsEngine {
             });
         }
 
+        if self.last_data_seq == u64::MAX {
+            return Err(OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                },
+                "sequence number overflow",
+            ));
+        }
+
         let handle = self.runtime.handle().clone();
         let mut headers = async_nats::HeaderMap::new();
         headers.insert(
@@ -1532,7 +1541,7 @@ impl StorageEngine for NatsEngine {
                         )
                     } else {
                         OperationFailure::new(
-                            FailureCondition::PrecursorChainBroken(None),
+                            FailureCondition::TransportUnavailable,
                             format!("failed to initiate publish to data stream: {err}"),
                         )
                     }
@@ -1583,11 +1592,15 @@ impl StorageEngine for NatsEngine {
 
     fn append_batch_detailed(&mut self, blocks: &[&[u8]]) -> BatchLandingVerdict<u64> {
         if let Err(error) = self.check_authority() {
-            return BatchLandingVerdict::PreAttemptRefusal { error };
+            return BatchLandingVerdict::PreAttemptRefusal {
+                error,
+                unattempted_count: blocks.len(),
+            };
         }
         if blocks.is_empty() {
             return BatchLandingVerdict::LandedAll {
                 final_position: self.last_data_seq,
+                landed_count: 0,
             };
         }
         if self.simulate_indeterminate {
@@ -1717,6 +1730,7 @@ impl StorageEngine for NatsEngine {
             (
                 BatchLandingVerdict::LandedAll {
                     final_position: current_seq,
+                    landed_count: total_blocks,
                 },
                 current_seq,
                 false,

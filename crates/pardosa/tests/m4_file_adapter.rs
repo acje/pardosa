@@ -634,9 +634,10 @@ fn test_m4_append_batch_detailed_partial_landing_undetermined_and_failure() {
         }
         other => panic!("expected PartialProgress, got {other:?}"),
     }
-    assert_eq!(verdict.landed_count(4), 2);
+    assert_eq!(verdict.landed_count(), 2);
     assert_eq!(verdict.unresolved_count(), 1);
-    assert_eq!(verdict.unattempted_count(4), 1);
+    assert_eq!(verdict.unattempted_count(), 1);
+    assert_eq!(verdict.total_count(), 4);
     assert_eq!(writer_undetermined.rolling_commitment().frame_count(), 2);
     let h = writer_undetermined
         .session_index()
@@ -691,9 +692,10 @@ fn test_m4_append_batch_detailed_partial_landing_undetermined_and_failure() {
         }
         other => panic!("expected PartialProgress, got {other:?}"),
     }
-    assert_eq!(verdict_fail.landed_count(3), 1);
+    assert_eq!(verdict_fail.landed_count(), 1);
     assert_eq!(verdict_fail.rejected_count(), 1);
-    assert_eq!(verdict_fail.unattempted_count(3), 1);
+    assert_eq!(verdict_fail.unattempted_count(), 1);
+    assert_eq!(verdict_fail.total_count(), 3);
 
     assert_eq!(writer_fail.rolling_commitment().frame_count(), 1);
     let h_fail = writer_fail.fiber(fiber1).expect("fiber1 handle");
@@ -712,7 +714,7 @@ fn test_m4_append_batch_detailed_partial_landing_undetermined_and_failure() {
 }
 
 #[test]
-fn test_m4_append_batch_sync_error_marks_all_written_unresolved() {
+fn test_m4_append_batch_sync_error_stops_before_subsequent_blocks() {
     let dir = TestDir::new("batch_sync_error");
     let store_path = dir.path().join("store_sync_err");
     let adapter = FileStorageAdapter::new(&store_path);
@@ -745,9 +747,10 @@ fn test_m4_append_batch_sync_error_marks_all_written_unresolved() {
         }
         other => panic!("expected PartialProgress with Undetermined, got {other:?}"),
     }
-    assert_eq!(verdict.landed_count(2), 0);
+    assert_eq!(verdict.landed_count(), 0);
     assert_eq!(verdict.unresolved_count(), 1);
-    assert_eq!(verdict.unattempted_count(2), 1);
+    assert_eq!(verdict.unattempted_count(), 1);
+    assert_eq!(verdict.total_count(), 2);
     assert!(verdict.has_unresolved());
 
     assert_eq!(writer.rolling_commitment().frame_count(), 0);
