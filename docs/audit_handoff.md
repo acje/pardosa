@@ -1,26 +1,50 @@
 # Pardosa v0.5.5 Senior Engineering Audit Handoff
 
-> **STATUS: NOT APPROVED / IMPLEMENTATION INCOMPLETE**  
-> **Linus Round 8 Verdict (`pardosa-lvdk`)**: `Standard: NEEDS WORK / Security: FAIL` (`Critical=0, High=0, Medium=6, Low=0, Info=1`).  
-> While all historical High-severity defect classes (`R4-H1`, `R4-H2`, `R4-H3`, `R5-H1`, `R5-H2`, `R6-H1`) have been resolved, repeated Medium-severity defect classes (`M4` public type binding / count overflow, `M1` typed NATS error classification, `M10`/`M11` guard proof & TDD chronology, `M9` resource contracts) remain open.
+> **STATUS: DEPLOYED BUT NOT INDEPENDENTLY APPROVED**  
+> **Linus Round 10 Verdict (`pardosa-ev4t`)**: `Standard: NEEDS WORK / Security: FAIL` (`Critical=0, High=0, Medium=4, Low=1, Info=1`).  
+> **Gate Violation Disclosure**: Deployed to production under explicit user operational authorization to establish live feedback on fresh stream namespace `v21`, but the final independent Linus review gate was NOT approved.
+> While typed NATS error mappings (`R9-M1a`, `R9-M1b`) and Store batch length validation (`R8-M1`) were implemented and tested, Linus flagged carried Medium issues: `M4` (public raw DTO vs. validated domain outcome conflation), `M9` (resource contract documentation gap), `M10` (absence of historical TDD execution ledger), and `M11` (unrecorded formal 4-step mutation proof ledger in review request).
 
 ---
 
-## 1. Candidate Identity & Commit Ranges
+## 1. Candidate Identity, Commits & Production Deployments
 
-| Repository | Baseline Commit | Candidate Commit | Git Status |
-|---|---|---|---|
-| **`pardosa`** | `c9437c5` | `d386fae` | 13 commits ahead of `origin/main` (source clean; `.beads/interactions.jsonl` dirty) |
-| **`gh-report`** | `a760d6f` | `868d38b` | 4 commits ahead of `origin/main` (source clean; pre-existing tools/backups untracked) |
+| Repository | Branch | Tag | Head Commit | Production Status |
+|---|---|---|---|---|
+| **`pardosa`** | `main` | - | `d1fd21a` | Pushed to `https://github.com/acje/pardosa.git` |
+| **`gh-report`** | `main` | `v0.1.81` | `199ed8f` (tagged) / `aa94fed` (`main`) | Built to GAR and deployed to Cloud Run |
 
-### Key Candidate Commits in `pardosa`
-- `acd6a50`: Fix `TransportUnavailable` mapping in Cleanroom Spec & Store.
-- `84efa2b`: Fix reader corruption isolation and recovery bounds (`take(file_len)` & snapshot `(first, last)`).
-- `c837595`: Batch landing initial implementation (superseded by `9ad1a0e` and `668ed95`).
-- `9ad1a0e`: Truthful batch receipts, file durability on sync, and drained NATS futures.
-- `668ed95`: Enforce sound contiguous prefix batch semantics and sequential engines.
-- `55a10fb`: Inherit sequential block write+sync in FileEngine (resolving `R6-H1`) and enforce batch partition consistency (resolving `M4` Store boundary).
-- `d386fae`: Make batch outcome counts intrinsic on `BatchLandingVerdict`, add suffix partition guard test (`M11`), map single-event NATS initiation to `TransportUnavailable` (`M1`), and remove 32-bit cast narrowing (`L6`).
+### Live Deployment Facts (2026-09-12)
+- **Cloud Run Service**: `ghreport` in region `europe-north1`, project `ghreport-d302`.
+- **Active Revision**: `ghreport-00102-2ln` (built from `v0.1.81` commit `199ed8f`).
+- **Container Image Digest**:
+  `europe-north1-docker.pkg.dev/artifacts-352708/stabsec/gh-report@sha256:02d8084b3669e8bfe5a1aa2ac5bf37ab7d8071de1eba597a712bdbdc9e98c2de`
+- **Traffic Routing**: 100% routed to `ghreport-00102-2ln` via workflow run `34707037320` (`Cutover Traffic`).
+- **Previous Revision**: `ghreport-00101-bzs` (v0.1.80 on `v20`) serving 0% traffic; preserved for instant rollback if needed.
+- **Service Ingress**: Restricted behind Google IAP / Cloud Load Balancer (`https://ghreport-nbd4qrr5oa-lz.a.run.app` returns 403 to unauthenticated requests).
+
+### Live NATS JetStream State (connect.nats.mattilsynet.io:4222)
+- **Fresh `v21` Namespace**:
+  - `gh-report-org_4d617474696c73796e6574-v21_data`: 654 messages (427 KiB). First sequence 1, last sequence 654 written at 19:07:58 UTC. Initial collection sweep completed.
+  - `gh-report-org_4d617474696c73796e6574-v21-team-team_data`: 38 messages (16 KiB).
+  - `gh-report-org_4d617474696c73796e6574-v21-org-org_data`: 1 message (151 B).
+  - `gh-report-org_4d617474696c73796e6574-v21_meta`: 2 messages (366 B).
+- **Archival `v20` Namespace (Untouched & Preserved)**:
+  - `gh-report-org_4d617474696c73796e6574-v20_data`: 812 messages (532 KiB). Zero messages purged, mutated, or deleted.
+  - `gh-report-org_4d617474696c73796e6574-v20_meta`: 2 messages (366 B).
+- **Rollback Divergence Note**: Rolling back to `ghreport-00101-bzs` (`v20`) is possible, but will NOT carry the 654 events written to `v21`. Forward reconciliation would be required.
+
+---
+
+## 2. Key Candidate Commits in `pardosa`
+- `7806125`: Replace substring matching with typed downcast checks in NatsEngine (`is_wrong_last_sequence`).
+- `d1fd21a`: Resolve Linus round 9 findings:
+  - Match `RawMessageErrorKind::NoMessageFound` and `JetStream(NO_MESSAGE_FOUND/SEQUENCE_NOT_FOUND)` directly (`R9-M1a`).
+  - Match `GetStreamErrorKind::JetStream(STREAM_NOT_FOUND)` directly; zero Display string scanning (`R9-M1b`).
+  - Enforce `LandedAll` and `PreAttemptRefusal` batch length validation in `Store::append_batch_detailed` (`R8-M1`).
+  - Use `saturating_add` for `total_count()` and add `checked_total_count()` returning `Option<usize>` (`M4`).
+  - Remove duplicate ErrorCode numeric literals (`R9-L1`).
+  - Add unit and integration tests with guard assertions (`M10`, `M11`).
 
 ---
 
