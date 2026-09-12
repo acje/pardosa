@@ -1648,6 +1648,19 @@ fn test_c5_12_and_c5_16_landing_verdicts() {
     );
     assert_eq!(store_undet.rolling_commitment().frame_count(), 0);
 
+    let mut store_undet_env = Store::open_writer(MockEngine {
+        undetermined_at_block: Some(0),
+        ..Default::default()
+    })
+    .expect("store open");
+    let env_err = store_undet_env.append_envelope(&e1).unwrap_err();
+    assert_ne!(
+        *env_err.condition(),
+        FailureCondition::OwnershipRecordUnreadable
+    );
+    assert_eq!(*env_err.condition(), FailureCondition::TransportUnavailable);
+    assert!(env_err.to_string().contains("write landing undetermined"));
+
     let mut store_fail = Store::open_writer(MockEngine {
         fail_at_block: Some(0),
         ..Default::default()
@@ -1935,6 +1948,35 @@ fn test_compile_fail_batch_api_removed() {
     assert!(
         stderr.contains("no method named `append_batch_detailed`"),
         "error must cite missing method:\n{stderr}"
+    );
+
+    let code_append_batch = r#"
+        use pardosa::prelude::*;
+        pub fn run_test<E: StorageEngine>(mut store: Store<E>) {
+            let _ = store.append_batch(&[]);
+        }
+    "#;
+    let (ok_batch, stderr_batch) = run_rustc(code_append_batch);
+    assert!(!ok_batch, "Store::append_batch must not exist on Store");
+    assert!(
+        stderr_batch.contains("no method named `append_batch`"),
+        "error must cite missing method:\n{stderr_batch}"
+    );
+
+    let code_batch_envelopes = r#"
+        use pardosa::prelude::*;
+        pub fn run_test<E: StorageEngine>(mut store: Store<E>) {
+            let _ = store.append_batch_envelopes_detailed(&[]);
+        }
+    "#;
+    let (ok_env, stderr_env) = run_rustc(code_batch_envelopes);
+    assert!(
+        !ok_env,
+        "Store::append_batch_envelopes_detailed must not exist on Store"
+    );
+    assert!(
+        stderr_env.contains("no method named `append_batch_envelopes_detailed`"),
+        "error must cite missing method:\n{stderr_env}"
     );
 
     let code_batch_type = r#"

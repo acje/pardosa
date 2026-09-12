@@ -334,6 +334,8 @@ where
             rescue_policy_tag: self.rescue_policy.to_u8(),
         };
         self.target
+            .record_meta(&OwnershipRecord::MigrationStart(start_record.clone()))?;
+        self.source
             .record_meta(&OwnershipRecord::MigrationStart(start_record))
     }
 
@@ -359,6 +361,7 @@ where
         }
 
         let mut envelopes_to_migrate = Vec::new();
+        let mut staged_known_source_commitments = self.known_source_commitments.clone();
         for (relative_idx, env) in new_source_slice.iter().enumerate() {
             let global_idx = self.processed_source_count + relative_idx;
             let fiber_id = env.header.fiber_id;
@@ -369,8 +372,7 @@ where
                 .unwrap_or(self.default_fiber_policy);
 
             let comm = env.commitment();
-            self.known_source_commitments
-                .insert(env.header.event_id, (fiber_id, comm));
+            staged_known_source_commitments.insert(env.header.event_id, (fiber_id, comm));
 
             match policy {
                 FiberMigrationPolicy::Purge => {}
@@ -386,6 +388,9 @@ where
         }
 
         let mut target_envelopes = Vec::with_capacity(envelopes_to_migrate.len());
+        let mut staged_target_event_counter = self.target_event_counter;
+        let mut staged_fiber_identity_map = self.fiber_identity_map.clone();
+        let mut staged_fiber_chain_state = self.fiber_chain_state.clone();
 
         for env in envelopes_to_migrate {
             let old_event_id = env.header.event_id;
@@ -396,15 +401,14 @@ where
                 .copied()
                 .unwrap_or(self.default_fiber_policy);
 
-            self.target_event_counter += 1;
-            let target_fiber_id = *self
-                .fiber_identity_map
+            staged_target_event_counter += 1;
+            let target_fiber_id = *staged_fiber_identity_map
                 .entry(old_fiber_id)
                 .or_insert_with(|| mint_fresh_identity(self.target_generation, &old_fiber_id, 0));
             let target_event_id = mint_fresh_identity(
                 self.target_generation,
                 &old_event_id,
-                self.target_event_counter,
+                staged_target_event_counter,
             );
 
             let new_payload = match (self.transformer)(&env.payload) {
@@ -420,21 +424,21 @@ where
             let is_source_genesis =
                 env.header.precursor == [0u8; 16] && env.header.precursor_hash == [0u8; 32];
 
-            let (precursor, precursor_hash) = match self.fiber_chain_state.get(&old_fiber_id) {
+            let (precursor, precursor_hash) = match staged_fiber_chain_state.get(&old_fiber_id) {
                 None => ([0u8; 16], [0u8; 32]),
                 Some(&(prev_target_id, prev_target_comm)) => {
                     if is_source_genesis {
                         ([0u8; 16], [0u8; 32])
                     } else {
                         let source_precursor_id = env.header.precursor;
-                        let predecessor_valid =
-                            match self.known_source_commitments.get(&source_precursor_id) {
-                                Some(&(pred_fiber, pred_comm)) => {
-                                    pred_fiber == old_fiber_id
-                                        && pred_comm == env.header.precursor_hash
-                                }
-                                None => false,
-                            };
+                        let predecessor_valid = match staged_known_source_commitments
+                            .get(&source_precursor_id)
+                        {
+                            Some(&(pred_fiber, pred_comm)) => {
+                                pred_fiber == old_fiber_id && pred_comm == env.header.precursor_hash
+                            }
+                            None => false,
+                        };
 
                         if predecessor_valid {
                             (prev_target_id, prev_target_comm)
@@ -473,8 +477,7 @@ where
             };
 
             let new_comm = new_envelope.commitment();
-            self.fiber_chain_state
-                .insert(old_fiber_id, (target_event_id, new_comm));
+            staged_fiber_chain_state.insert(old_fiber_id, (target_event_id, new_comm));
             target_envelopes.push(new_envelope);
         }
 
@@ -482,6 +485,10 @@ where
         if !target_envelopes.is_empty() {
             self.target.append_envelopes(&target_envelopes)?;
         }
+        self.target_event_counter = staged_target_event_counter;
+        self.fiber_identity_map = staged_fiber_identity_map;
+        self.fiber_chain_state = staged_fiber_chain_state;
+        self.known_source_commitments = staged_known_source_commitments;
         self.processed_source_count = all_source_envelopes.len();
 
         Ok(migrated_count)
@@ -507,6 +514,13 @@ where
         if self.phase == MigrationPhase::Initial {
             self.record_start_if_needed()?;
         }
+        let source_meta = self.source.read_meta()?;
+        if source_meta.migration_start.is_none() && self.phase != MigrationPhase::Freeze {
+            return Err(OperationFailure::new(
+                FailureCondition::MigrationExclusionAbsent,
+                "offline freeze precondition not established: source missing MigrationStart record",
+            ));
+        }
         self.phase = MigrationPhase::Freeze;
         self.drain_batch()
     }
@@ -518,6 +532,13 @@ where
     pub fn cutover(mut self) -> Result<CutoverSummary, OperationFailure> {
         if self.phase == MigrationPhase::Initial {
             self.record_start_if_needed()?;
+        }
+        let source_meta = self.source.read_meta()?;
+        if source_meta.migration_start.is_none() && self.phase != MigrationPhase::Freeze {
+            return Err(OperationFailure::new(
+                FailureCondition::MigrationExclusionAbsent,
+                "offline freeze precondition not established: source missing MigrationStart record",
+            ));
         }
         self.phase = MigrationPhase::Freeze;
         let _ = self.drain_batch()?;

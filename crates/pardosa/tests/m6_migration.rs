@@ -489,3 +489,66 @@ fn test_m6_chase_phase_concurrent_source_appends() {
     assert_eq!(migrated[2].payload, b"chase3");
     assert_eq!(migrated[3].payload, b"chase4");
 }
+
+#[test]
+fn test_m6_transform_failure_retry_does_not_leak_staged_state() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = FileStorageAdapter::new(dir.path().join("source_retry"));
+    let target = FileStorageAdapter::new(dir.path().join("target_retry"));
+
+    let claim = sample_claim(1);
+    source.create(&claim).expect("create source");
+    target.create(&claim).expect("create target");
+
+    let mut writer = source.open_write(1).expect("open write source");
+    let env1 = sample_genesis_envelope(1, 0x22, b"event1");
+    let comm1 = env1.commitment();
+    let env2 = sample_chained_envelope(2, 0x22, 1, comm1, b"event2");
+    writer.append_envelope(&env1).expect("append env1");
+    writer.append_envelope(&env2).expect("append env2");
+
+    let should_fail = Arc::new(AtomicBool::new(true));
+    let should_fail_clone = should_fail.clone();
+
+    let mut manager = MigrationManager::new(source.clone(), target.clone())
+        .with_default_fiber_policy(FiberMigrationPolicy::Keep)
+        .with_generations(1, 2)
+        .with_transformer(move |payload: &[u8]| {
+            if payload == b"event2" && should_fail_clone.swap(false, Ordering::SeqCst) {
+                Err(OperationFailure::new(
+                    FailureCondition::TransformationRefused,
+                    "simulated transform failure on event2",
+                ))
+            } else {
+                Ok(payload.to_vec())
+            }
+        });
+
+    let first_attempt = manager.chase();
+    assert!(first_attempt.is_err());
+    let err = first_attempt.unwrap_err();
+    assert_eq!(*err.condition(), FailureCondition::TransformationRefused);
+
+    let second_attempt = manager.chase().expect("retry chase must succeed");
+    assert_eq!(second_attempt, 2);
+
+    let frozen = manager.freeze().expect("freeze");
+    assert_eq!(frozen, 0);
+
+    let summary = manager.cutover().expect("cutover");
+    assert_eq!(summary.total_migrated_events, 2);
+    assert_eq!(summary.surviving_fibers, 1);
+
+    let mut target_reader = target.open_read().expect("open target reader");
+    let migrated = target_reader
+        .read_all_envelopes()
+        .expect("read target envelopes");
+    assert_eq!(migrated.len(), 2);
+    assert_eq!(migrated[0].payload, b"event1");
+    assert_eq!(migrated[1].payload, b"event2");
+    assert_eq!(migrated[1].header.precursor, migrated[0].header.event_id);
+    assert_eq!(migrated[1].header.precursor_hash, migrated[0].commitment());
+}

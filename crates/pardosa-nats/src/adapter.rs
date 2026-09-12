@@ -534,6 +534,11 @@ async fn read_range_async(
 }
 
 /// JetStream storage adapter managing container artefacts in NATS JetStream per C5.10, C5.11, and C10.3.
+///
+/// # Deployment Constraint
+/// Deployments must ensure a single-writer topology per stream stem (`{stem}_data` and
+/// `{stem}_meta`). When authority divergence occurs (OCC collision or epoch supersession), the
+/// active session is marked uncertain and refuses subsequent writes per H2.
 #[derive(Clone)]
 pub struct NatsStorageAdapter {
     url: String,
@@ -1639,7 +1644,15 @@ impl StorageEngine for NatsEngine {
     }
 
     fn append_block(&mut self, block: &[u8]) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-        self.check_authority()?;
+        if let Err(err) = self.check_authority() {
+            if *err.condition() == FailureCondition::StaleEpoch
+                || *err.condition() == FailureCondition::RetiredMigrationSource
+            {
+                self.uncertain = true;
+                self.uncertain_diagnostic = Some(format!("authority divergence: {err}"));
+            }
+            return Err(err);
+        }
 
         if self.simulate_indeterminate {
             self.uncertain = true;
@@ -1673,7 +1686,7 @@ impl StorageEngine for NatsEngine {
         let carried_epoch = self.carried_epoch;
         let block_bytes = block.to_vec();
 
-        let (ack, diagnostic) = run_future(&handle, async move {
+        let (ack, diagnostic) = match run_future(&handle, async move {
             let pub_future = js
                 .publish_with_headers(data_subject, headers, block_bytes.into())
                 .await
@@ -1715,7 +1728,19 @@ impl StorageEngine for NatsEngine {
                     )),
                 )),
             }
-        })?;
+        }) {
+            Ok(pair) => pair,
+            Err(err) => {
+                if *err.condition() == FailureCondition::ConcurrencyConflict {
+                    self.uncertain = true;
+                    self.uncertain_diagnostic = Some(
+                        "two-writer concurrency collision: expected sequence mismatch; session marked uncertain per H2"
+                            .to_string(),
+                    );
+                }
+                return Err(err);
+            }
+        };
 
         match ack {
             WriteLandingVerdict::Landed(pub_ack) => {
@@ -2078,6 +2103,11 @@ impl StorageEngine for NatsEngine {
 }
 
 /// Active JetStream writer session holding append authority with OCC sequence checks.
+///
+/// # Session-Exclusive Writer Contract
+/// Enforces a session-exclusive writer contract against the target stream. If authority diverges
+/// due to OCC sequence collision or epoch supersession, the session is marked uncertain and
+/// refuses subsequent write operations per H2.
 #[derive(Debug)]
 pub struct NatsWriterSession {
     store: Store<NatsEngine>,

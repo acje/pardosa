@@ -2100,10 +2100,7 @@ fn test_nats_routing_stream_mismatch_marks_session_uncertain() {
     let err = mismatched_writer
         .append_raw_frame(b"mismatched-payload")
         .expect_err("mismatched stream ack must yield undetermined landing");
-    assert_eq!(
-        *err.condition(),
-        FailureCondition::OwnershipRecordUnreadable
-    );
+    assert_eq!(*err.condition(), FailureCondition::TransportUnavailable);
     assert!(mismatched_writer.uncertain_diagnostic().is_some());
     assert!(mismatched_writer
         .uncertain_diagnostic()

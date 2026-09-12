@@ -946,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_index_bounded_reservations_limit_1024() {
+    fn test_session_index_active_fibers_capacity_limit() {
         let mut index = SessionIndex::new();
         for i in 0..MAX_ACTIVE_FIBERS as u32 {
             let mut fiber_id = [0u8; 16];
@@ -967,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_index_pending_reservation_bytes_capacity_and_drop_release() {
+    fn test_session_index_multiple_commits_on_fiber() {
         let mut index = SessionIndex::new();
         let fiber_id = [0x99; 16];
         let env1 = EventEnvelope::genesis([0x01; 16], fiber_id, vec![0xaa; 100]).unwrap();
@@ -990,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_fiber_broken_respects_pending_reservation_bytes() {
+    fn test_mark_fiber_broken_transitions_fiber_to_broken() {
         let mut index = SessionIndex::new();
         let fiber_id = [0x99; 16];
         let env1 = EventEnvelope::genesis([0x01; 16], fiber_id, vec![0xaa; 100]).unwrap();
@@ -1047,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_has_raw_frames_revokes_prepare_append_and_outstanding_reservation() {
+    fn test_mark_has_raw_frames_revokes_validate_append() {
         let mut index = SessionIndex::new();
         let fiber_id = [0x88; 16];
         let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"payload").unwrap();

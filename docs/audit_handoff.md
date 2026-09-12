@@ -51,8 +51,8 @@
 ## 2. Release Scope vs. Deferred Scope
 
 ### In v0.5.5 Candidate Release Scope
-1. **Synchronous Storage Primitives**: `append_block` and `append_to_fiber` returning discrete `WriteLandingVerdict<T>` (`Landed` vs `Undetermined`) and typed `OperationFailure` per C5.16 and PGN-0010:R5.
-2. **Sequential Batch Convenience**: `append_batch` and `append_batch_envelopes_detailed` returning `BatchLandingVerdict<T>` (`LandedAll`, `PreAttemptRefusal`, `PartialProgress`). Commits strictly the contiguous landed prefix `0..landed_count` to in-memory `fiber_index` and `rolling_commitment`. *(Caveat: Store boundary validates partition counts, but public enum fields permit arbitrary external construction; M4 carried).*
+1. **Synchronous Storage Primitives**: `append_block`, `append_to_fiber`, `append_envelope_verdict`, and `append_frame_verdict` returning discrete `WriteLandingVerdict<T>` (`Landed` vs `Undetermined`) and typed `OperationFailure` per C5.16 and PGN-0010:R5.
+2. **Single-Event Foundation (L2)**: Batch ingestion APIs (`append_batch`, `append_batch_detailed`, `append_batch_envelopes_detailed`, `BatchLandingVerdict`) are removed from the public API in favor of the strict single-event foundation (`append_to_fiber`, `append_envelope_verdict`). Each event is validated, sequenced, and committed individually, eliminating multi-event partial landing ambiguity and invalid external construction (`M4` resolved by removal).
 3. **Durability Truthfulness**:
    - `FileEngine`: Each block is written and synchronized via `append_block`. On sync failure, halts before subsequent blocks; zero unattempted items touch disk (`R6-H1` resolved).
    - `NatsEngine`: Sequential single-message execution with OCC expected sequence matching (`expected_last_subject_sequence`). Sequence overflow checked pre-attempt at `u64::MAX`.
@@ -72,11 +72,12 @@
    - In `gh-report` (`crates/gh-report/tests/bench_projection.rs` @ `868d38b`): Removed handwritten unsafe `extern "C" fn getrusage` and hardcoded `< 60s` performance assertions. Made 100K/1M benchmarks explicit opt-ins (`BENCH_SCALE=1`, `BENCH_1M=1`). This cleans up fragile test instrumentation, not a claim that performance optimization is complete.
 
 ### Deferred Post-v0.5.5
-1. **NATS In-Flight Pipelining**: 64-item concurrent pipelined publishing deferred due to multi-future timeout and drainage complexity.
-2. **TigerBeetle Queue Coalescing**: Demand-driven queue coalescing deferred due to background worker state-machine complexity (not facade violation).
-3. **NATS ADR-50 Atomic Publishing**: Requires NATS Server v2.12+/v2.14+ streams with `AllowAtomicPublish=true` and custom header mapping in `async-nats`.
-4. **Unconstrained Per-Item Receipt Vectors**: Fine-grained per-item receipt vectors deferred in favor of sound contiguous prefix progress.
-5. **1M Event Performance Targets**: Exploratory 1M stress runs deferred; standard integration suite focuses on correctness and fault injection at modest volumes.
+1. **Batch Ingestion API**: Batch primitives deferred/removed from 1.0 scope; single-event ingestion is the sole admitted write path.
+2. **NATS In-Flight Pipelining**: 64-item concurrent pipelined publishing deferred due to multi-future timeout and drainage complexity.
+3. **TigerBeetle Queue Coalescing**: Demand-driven queue coalescing deferred due to background worker state-machine complexity (not facade violation).
+4. **NATS ADR-50 Atomic Publishing**: Requires NATS Server v2.12+/v2.14+ streams with `AllowAtomicPublish=true` and custom header mapping in `async-nats`.
+5. **Unconstrained Per-Item Receipt Vectors**: Fine-grained per-item receipt vectors deferred in favor of sound contiguous prefix progress.
+6. **1M Event Performance Targets**: Exploratory 1M stress runs deferred; standard integration suite focuses on correctness and fault injection at modest volumes.
 
 ---
 
@@ -89,16 +90,15 @@
 ### High-Severity Findings Resolution Ledger
 - `R4-H1` / `R4-H2`: RESOLVED. Sequential NATS execution eliminates in-flight pipelining ambiguity and drains all sent futures.
 - `R4-H3`: RESOLVED. Written blocks are never reported `Landed` unless `sync_data()` succeeds.
-- `R5-H1`: RESOLVED. `Store::append_batch_detailed` commits strictly the contiguous landed prefix `0..landed_count`, preserving causal hash chain integrity.
-- `R5-H2`: RESOLVED. Compatibility wrappers exhaustively handle `PartialProgress`; false success on unattempted batches is eliminated.
+- `R5-H1` / `R5-H2`: SUPERSEDED BY REMOVAL. Batch ingestion APIs were removed; single-event foundation eliminates multi-item partial progress ambiguity.
 - `R5-L1`: WITHDRAWN. Linus confirmed spec C4.5/C4.6 closed enum doctrine; no `#[non_exhaustive]` on domain enums.
 - `R6-H1`: RESOLVED. `FileEngine` inherits sequential `append_block` write+sync; zero unattempted items touch disk on sync failure.
 
 ### Open Residual Findings (Medium)
-1. `M4` (Medium): While `BatchLandingVerdict` carries intrinsic counts and Store boundary validates partition counts, public enum fields permit arbitrary external construction that could overflow `total_count()` arithmetic.
+1. `M4` (Medium): RESOLVED BY REMOVAL. `BatchLandingVerdict` removed; single-event foundation eliminates batch count overflow vectors.
 2. `M1` (Medium): NATS single-event publish initiation and raw recovery error mappings still retain diagnostic string scanning rather than pure typed enum matches across all error paths.
 3. `M10` / `M11` (Medium): Formal four-step guard proofs (plant/fail/revert/clean) and historical TDD chronology were not retained for every incremental branch.
-4. `M9` (Medium): In-memory caller batch buffers (cloned block bytes, decoded envelopes) do not carry an explicit application-level byte quota.
+4. `M9` (Medium): In-memory caller batch buffers (cloned block bytes, decoded envelopes) do not carry an explicit application-level byte quota; disclosed in rustdoc.
 
 ---
 

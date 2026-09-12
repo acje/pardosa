@@ -31,7 +31,7 @@
 //! - [`store::FailureCondition::InvariantBreakingConfiguration`]: Unrecoverable protocol or storage violation encountered.
 //!   Remedy: Close the store; inspect error details and execute migration or rescue recovery per C4.7.
 //!
-//! # Truthful Seal Limits (S5)
+//! # Truthful Seal Limits (S5 / I2)
 //!
 //! Per C4.24 and C6.35:
 //! - Pardosa establishes that a schema descriptor was produced by one of the fixed producers recognized by this
@@ -40,8 +40,12 @@
 //!   Pardosa establishes. Pardosa states this boundary honestly wherever descriptors are consumed: structural
 //!   validity and producer authenticity are verified, but runtime semantic fidelity of user fields cannot be
 //!   proven by the storage engine.
-//! - Storage adapter traits remain sealed (C4.9, C4.10): Only internal adapters are admitted at 1.0. Third parties
-//!   establish conformance against public obligations rather than providing arbitrary external adapter implementations.
+//! - **Present Open vs Planned 1.0 Sealed Traits**: During the 0.5.x foundation line, [`store::StorageEngine`]
+//!   remains an open trait within workspace crates to permit adapter development and verification across both
+//!   filesystem and JetStream backends. At the 1.0 freeze, storage adapter traits are planned to be sealed
+//!   (C4.9, C4.10) so only official internal adapters (`FileStorageAdapter`, `NatsStorageAdapter`) are admitted.
+//!   Third parties establish conformance against public facade specifications rather than implementing external
+//!   storage driver engines.
 //!
 //! # Shipped Producer Inventory (S10)
 //!
@@ -67,19 +71,30 @@
 //! Per C4.21, an artefact is read only by the major line that wrote it. Cross-major data export is the operator's
 //! responsibility via the migration subsystem.
 //!
-//! # Resource Allocation and Accounting Disclosure (R12 / M9)
+//! # Resource Allocation and Accounting Disclosure (R12 / M6 / M9)
 //!
-//! Pardosa operates as an in-process library without autonomous memory sandboxing:
-//! - **Single-Event Ingestion**: Writes execute synchronously one event at a time via [`store::Store::append_to_fiber`].
-//!   Frame encoding allocates a local buffer proportional to payload length, verified and durably committed
-//!   prior to subsequent writes.
-//! - **Session State Accounting**: In-memory fiber indexing tracks active fiber state in heap-allocated maps within
-//!   [`store::SessionIndex`]. Session limits are bounded by `MAX_ACTIVE_FIBERS` (100,000) active fiber handles and
-//!   `MAX_EVENTS_PER_FIBER` (100,000) events per fiber.
+//! Pardosa operates as an in-process library without autonomous memory sandboxing or background workers:
+//! - **Single-Event Ingestion**: Writes execute synchronously one event at a time via [`store::Store::append_to_fiber`],
+//!   [`store::Store::append_envelope_verdict`], or [`store::Store::append_frame_verdict`].
+//! - **Buffer Allocations**: Frame encoding allocates a local buffer proportional to payload length, verified and
+//!   durably committed prior to subsequent writes. Point lookups and event decoding allocate single envelope
+//!   structures on the caller heap. Bulk reads (`read_all`, `build_from_frames`) allocate contiguous frame vectors
+//!   sized to the requested chunk or container history.
+//! - **Session State and Event ID Accounting**: In-memory fiber indexing in [`store::SessionIndex`] tracks active
+//!   fiber state in heap-allocated maps. Session limits are bounded by `MAX_ACTIVE_FIBERS` (100,000) active fiber
+//!   handles and `MAX_EVENTS_PER_FIBER` (100,000) events per fiber. In addition, `seen_event_ids` retains every
+//!   observed event identifier across the entire session in a heap-allocated hash set for generation-wide duplicate
+//!   rejection (C5.23 / H2); its memory overhead grows monotonically with unique event arrivals up to session bounds.
+//! - **Broken Slot Accounting**: When a fiber is marked broken or invalid history is discovered during recovery,
+//!   `SessionIndex` retains a `FiberSlot::Broken` entry rather than removing the fiber. This preserves error diagnostics
+//!   and event counts while refusing further appends or point lookups. Broken slots count against active fiber capacity
+//!   when new fibers are added.
+//! - **Caller Backpressure Responsibilities**: Pardosa provides no asynchronous queues, worker pools, or automatic
+//!   rate-limiting. The calling host application is strictly responsible for managing thread concurrency, applying
+//!   backpressure to upstream event producers, enforcing global process memory quotas, and establishing collection
+//!   deadlines.
 //! - **Transport Isolation**: Transport operations execute synchronously with sequential durability. `NatsEngine`
 //!   drains each publish future sequentially before initiating subsequent requests.
-//! - **Caller Admission Responsibility**: Overall process memory bounds, worker concurrency, and collection timeouts
-//!   are owned and enforced by the host application caller, not by internal library quotas.
 //!
 #![deny(missing_docs)]
 

@@ -1177,9 +1177,8 @@ impl FileEngine {
                 "writer session in uncertain state; reconciliation required",
             ));
         }
-        if self.file.is_some()
-            && !self.locked
-            && self.exclusion_policy == FileExclusionPolicy::Standard
+        if self.exclusion_policy == FileExclusionPolicy::Standard
+            && (self.file.is_none() || !self.locked)
         {
             return Err(OperationFailure::new(
                 FailureCondition::AnotherOwnerHoldsExclusion,
@@ -1220,6 +1219,14 @@ impl StorageEngine for FileEngine {
 
     fn append_block(&mut self, block: &[u8]) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
         self.check_authority()?;
+        if self.exclusion_policy == FileExclusionPolicy::Standard
+            && (self.file.is_none() || !self.locked)
+        {
+            return Err(OperationFailure::new(
+                FailureCondition::AnotherOwnerHoldsExclusion,
+                "writer session has released or does not hold required file exclusion across append per C5.6 and C5.65",
+            ));
+        }
 
         if self.simulate_indeterminate {
             self.uncertain = true;

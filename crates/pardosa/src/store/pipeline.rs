@@ -383,10 +383,20 @@ impl<E: StorageEngine> Store<E> {
                 self.rolling_commitment.update_frame(&frame_buf);
                 Ok(self.rolling_commitment.frame_count())
             }
-            WriteLandingVerdict::Undetermined { .. } => Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                "write landing undetermined",
-            )),
+            WriteLandingVerdict::Undetermined { .. } => {
+                let diag = self
+                    .engine
+                    .uncertain_diagnostic()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| {
+                        "write landing undetermined: operation may or may not have landed; transport/sync confirmation failed"
+                            .to_string()
+                    });
+                Err(OperationFailure::new(
+                    FailureCondition::TransportUnavailable,
+                    diag,
+                ))
+            }
         }
     }
 
@@ -484,10 +494,20 @@ impl<E: StorageEngine> Store<E> {
     pub fn append_frame(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
         match self.append_frame_verdict(payload)? {
             WriteLandingVerdict::Landed(count) => Ok(count),
-            WriteLandingVerdict::Undetermined { .. } => Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                "write landing undetermined: operation may or may not have landed",
-            )),
+            WriteLandingVerdict::Undetermined { .. } => {
+                let diag = self
+                    .engine
+                    .uncertain_diagnostic()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| {
+                        "write landing undetermined: operation may or may not have landed; use append_envelope_verdict to preserve landing certainty per C5.16"
+                            .to_string()
+                    });
+                Err(OperationFailure::new(
+                    FailureCondition::TransportUnavailable,
+                    diag,
+                ))
+            }
         }
     }
 
@@ -511,10 +531,20 @@ impl<E: StorageEngine> Store<E> {
     pub fn append_envelope(&mut self, envelope: &EventEnvelope) -> Result<u64, OperationFailure> {
         match self.append_envelope_verdict(envelope)? {
             WriteLandingVerdict::Landed(count) => Ok(count),
-            WriteLandingVerdict::Undetermined { .. } => Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                "write landing undetermined: operation may or may not have landed",
-            )),
+            WriteLandingVerdict::Undetermined { .. } => {
+                let diag = self
+                    .engine
+                    .uncertain_diagnostic()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| {
+                        "write landing undetermined: operation may or may not have landed; use append_envelope_verdict to preserve landing certainty per C5.16"
+                            .to_string()
+                    });
+                Err(OperationFailure::new(
+                    FailureCondition::TransportUnavailable,
+                    diag,
+                ))
+            }
         }
     }
 

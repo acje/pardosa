@@ -40,6 +40,16 @@
 //!   `https://github.com/acje/pardosa/security/advisories` or contact `security@pardosa.dev`.
 //! - **Withdrawal Posture (C5.38)**: Yanks occur strictly for correctness or safety defects.
 //!
+//! # Single-Writer Deployment Constraint (H2)
+//!
+//! NATS JetStream enforces optimistic concurrency control (`NATS_EXPECTED_LAST_SUBJECT_SEQUENCE`) and
+//! epoch fencing, but does not provide operating system level file locking across separate processes.
+//! Consequently, deployments must enforce a single-writer topology per stream stem (`{stem}_data` and
+//! `{stem}_meta`). Exactly one active writer process or task must be deployed per stream pair at any time.
+//! When authority divergence occurs (due to OCC sequence conflict or epoch supersession), [`NatsEngine`]
+//! enforces a session-exclusive writer contract by marking the session uncertain, refusing all subsequent
+//! appends until external reconciliation occurs.
+//!
 //! # Major-Line Read Limits
 //!
 //! Per C4.21, an artefact is read only by the major line that wrote it. Cross-major data export is the operator's
