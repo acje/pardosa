@@ -73,7 +73,7 @@ fn test_m6_migration_on_nats_adapter() {
         *err_mgr.condition(),
         FailureCondition::InvariantBreakingConfiguration
     );
-    assert!(err_mgr.to_string().contains("live migration is disabled in this release per C5.18; use offline administrative migration"));
+    assert!(err_mgr.to_string().contains("live migration is disabled in this release per approved constrained release decision; use offline administrative migration"));
 
     let source_locator = source.locator_id();
     let target_locator = target.locator_id();
@@ -162,7 +162,7 @@ fn test_m6_migration_cross_adapter_file_to_nats() {
         *err_mgr.condition(),
         FailureCondition::InvariantBreakingConfiguration
     );
-    assert!(err_mgr.to_string().contains("live migration is disabled in this release per C5.18; use offline administrative migration"));
+    assert!(err_mgr.to_string().contains("live migration is disabled in this release per approved constrained release decision; use offline administrative migration"));
 
     target.delete_streams().expect("cleanup dst");
 }
@@ -245,7 +245,7 @@ fn test_m6_nats_policies_and_dense_rechaining() {
         *err_mgr.condition(),
         FailureCondition::InvariantBreakingConfiguration
     );
-    assert!(err_mgr.to_string().contains("live migration is disabled in this release per C5.18; use offline administrative migration"));
+    assert!(err_mgr.to_string().contains("live migration is disabled in this release per approved constrained release decision; use offline administrative migration"));
 
     source.delete_streams().expect("cleanup src");
     target.delete_streams().expect("cleanup dst");

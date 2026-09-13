@@ -12,8 +12,11 @@
 //!   `Concluded`, `Retired`) governing event admission, cursor progression, and deterministic recovery.
 //! - **Single-Writer Ownership Fencing**: Monotonic epochs, machine/boot/process identity vectors, and fencing
 //!   guarantees ensuring at most one active writer session per artefact.
-//! - **Migration and Cutover**: Online chase/freeze/cutover lifecycle with caller-selected migration policies
-//!   and immutable predecessor/successor generation pointers.
+//! - **Migration and Cutover**: Live migration execution is disabled in this release per approved
+//!   constrained release decision (offline administrative migration only); historical migration records
+//!   ([`encoding::InboundPointerRecord`], [`encoding::OutboundPointerRecord`]) remain readable for lineage audit,
+//!   and strict `n -> n+1` compile-time verified migration contracts ([`migration::MigrationWitness`],
+//!   [`migration::VersionMigration`], [`migration::AdjacentMigration`]) enforce declared schema version transitions.
 //!
 //! # Per-Condition Remedies
 //!
@@ -28,8 +31,9 @@
 //!   Remedy: Relinquish writer session; do not retry without re-establishing mutual exclusion.
 //! - [`store::FailureCondition::OwnershipUnestablished`]: Writer session cannot conclusively prove current ownership.
 //!   Remedy: Refresh ownership claim or inspect operator fence state before retrying.
-//! - [`store::FailureCondition::InvariantBreakingConfiguration`]: Unrecoverable protocol or storage violation encountered.
-//!   Remedy: Close the store; inspect error details and execute migration or rescue recovery per C4.7.
+//! - [`store::FailureCondition::InvariantBreakingConfiguration`]: Unrecoverable protocol or storage violation encountered,
+//!   or invocation of disabled live migration execution.
+//!   Remedy: Close the store; inspect error details and execute offline administrative migration per approved release decision.
 //!
 //! # Truthful Seal Limits (S5 / I2)
 //!
@@ -100,6 +104,9 @@
 //!   rate-limiting. The calling host application is strictly responsible for managing thread concurrency, applying
 //!   backpressure to upstream event producers, enforcing global process memory quotas, and establishing collection
 //!   deadlines.
+//! - **EventVec Decode Work Bounds**: [`encoding::EventVec`] decoding bounds initial heap allocation by
+//!   `remaining_wire.min(count)` and enforces that every decoded element consumes at least one wire byte,
+//!   ensuring zero-wire or tiny wire inputs cannot drive unbounded loop iterations or unbudgeted heap growth.
 //! - **Transport Isolation**: Transport operations execute synchronously with sequential durability. `NatsEngine`
 //!   drains each publish future sequentially before initiating subsequent requests.
 //!

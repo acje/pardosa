@@ -13,8 +13,8 @@ pub use crate::file::{
     FileWriterSession, MetaRecords, RollingCommitment,
 };
 pub use crate::migration::{
-    BrokenChainElection, CutoverSummary, MigrationManager, MigrationPhase, MigrationSource,
-    MigrationTarget,
+    AdjacentMigration, BrokenChainElection, CutoverSummary, MigrationManager, MigrationPhase,
+    MigrationSource, MigrationTarget, MigrationWitness, VersionMigration,
 };
 pub use crate::schema::{
     derive_fiber_id, AdmittedDescriptor, DescriptorNode, EventF32, EventF64, FieldDescriptor,

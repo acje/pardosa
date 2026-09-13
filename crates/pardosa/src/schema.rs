@@ -921,8 +921,13 @@ pub fn derive_fiber_id(domain_key: &str) -> [u8; 16] {
 
 /// Trait implemented by payload types declaring schema descriptor and codecs.
 pub trait PardosaSchema: Sized {
+    /// Declared schema version constant.
+    const SCHEMA_VERSION: u32 = 1;
+
     /// Returns declared schema version.
-    fn schema_version() -> u32;
+    fn schema_version() -> u32 {
+        Self::SCHEMA_VERSION
+    }
 
     /// Returns root schema descriptor AST node.
     fn schema_descriptor() -> DescriptorNode;
@@ -1308,11 +1313,18 @@ impl<T: PardosaType, const MAX: usize> PardosaType for EventVec<T, MAX> {
         if count > MAX {
             return Err(DecodeError::ItemCountExceeded { count, max: MAX });
         }
-        let initial_capacity = (buf.len() - 4).min(count);
+        let remaining_wire = buf.len() - 4;
+        let initial_capacity = remaining_wire.min(count);
         let mut cursor = 4;
         let mut items = Vec::with_capacity(initial_capacity);
         for _ in 0..count {
             let (item, consumed) = T::decode_type(&buf[cursor..])?;
+            if consumed == 0 {
+                return Err(DecodeError::TruncatedPayload {
+                    expected: 1,
+                    available: 0,
+                });
+            }
             cursor += consumed;
             items.push(item);
         }
@@ -1580,6 +1592,47 @@ mod tests {
             err,
             DecodeError::TruncatedPayload {
                 expected: 8,
+                available: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn test_event_vec_decode_zero_wire_loop_bounds() {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct ZeroWire;
+
+        impl PardosaType for ZeroWire {
+            fn descriptor_node() -> DescriptorNode {
+                DescriptorNode::Struct {
+                    name: "ZeroWire".to_string(),
+                    fields: vec![],
+                }
+            }
+            fn encode_type(&self, _buf: &mut Vec<u8>) -> Result<(), EncodeError> {
+                Ok(())
+            }
+            fn decode_type(_buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+                Ok((ZeroWire, 0))
+            }
+        }
+
+        let mut buf = vec![0xe8, 0x03, 0x00, 0x00];
+        let err = EventVec::<ZeroWire, 1000>::decode_type(&buf).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::TruncatedPayload {
+                expected: 1,
+                available: 0
+            }
+        ));
+
+        buf.extend_from_slice(&[0x01, 0x02]);
+        let err2 = EventVec::<ZeroWire, 1000>::decode_type(&buf).unwrap_err();
+        assert!(matches!(
+            err2,
+            DecodeError::TruncatedPayload {
+                expected: 1,
                 available: 0
             }
         ));

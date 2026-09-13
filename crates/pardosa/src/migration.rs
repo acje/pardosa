@@ -1,15 +1,153 @@
 //! Migration lifecycle, recovery, cutover, and dense re-chaining per C5.63, C6.16-20, and C12.2.
 
-use crate::encoding::{EnvelopeHeader, EventEnvelope, OwnershipRecord};
+use crate::encoding::{EventEnvelope, OwnershipRecord};
 pub use crate::encoding::{
     InboundPointerRecord, MigrationEndRecord, MigrationStartRecord, MigrationStatus,
     OutboundPointerRecord, RescuePolicy, RescuePolicyChoiceRecord,
 };
 use crate::file::{FileStorageAdapter, MetaRecords};
-use crate::schema::{AdmittedDescriptor, SchemaDescriptor};
-use crate::store::{CausalChainError, FailureCondition, FiberMigrationPolicy, OperationFailure};
+use crate::schema::{AdmittedDescriptor, PardosaSchema, SchemaDescriptor};
+use crate::store::{FailureCondition, FiberMigrationPolicy, OperationFailure};
 use std::collections::HashMap;
 use std::fmt;
+
+mod private {
+    pub trait Sealed {}
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct InternalSeal;
+    impl Sealed for InternalSeal {}
+}
+
+/// Sealed marker trait implemented only by officially witnessed migration contracts.
+pub trait SealedMigrationWitness: private::Sealed {}
+
+/// Compile-time witness proving that `Target` schema version is strictly `Source` version + 1.
+///
+/// # Compile-time Guarantees
+/// This witness statically verifies the exact declared source/target schema version pairing
+/// (`n -> n+1`) and transformer type. It does **not** guarantee semantic transform correctness,
+/// backend stream identity, or external writer exclusion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrationWitness<Source: PardosaSchema, Target: PardosaSchema> {
+    _marker: std::marker::PhantomData<(Source, Target)>,
+    _seal: private::InternalSeal,
+}
+
+impl<Source: PardosaSchema, Target: PardosaSchema> private::Sealed
+    for MigrationWitness<Source, Target>
+{
+}
+
+impl<Source: PardosaSchema, Target: PardosaSchema> SealedMigrationWitness
+    for MigrationWitness<Source, Target>
+{
+}
+
+impl<Source: PardosaSchema, Target: PardosaSchema> Default for MigrationWitness<Source, Target> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<Source: PardosaSchema, Target: PardosaSchema> MigrationWitness<Source, Target> {
+    /// Compile-time constant assertion that `Target` is adjacent (`n -> n+1`) to `Source`.
+    pub const ADJACENCY_ASSERTION: () = {
+        assert!(
+            Source::SCHEMA_VERSION < u32::MAX,
+            "Source schema version must be less than u32::MAX"
+        );
+        assert!(
+            Target::SCHEMA_VERSION == Source::SCHEMA_VERSION + 1,
+            "Migration must be strict n -> n+1"
+        );
+    };
+
+    /// Enforces at compile time that `Target` schema version is strictly `Source` version + 1.
+    pub const fn assert_adjacent() {
+        let () = Self::ADJACENCY_ASSERTION;
+    }
+
+    /// Creates a sealed migration witness after statically asserting version adjacency.
+    #[must_use]
+    pub const fn new() -> Self {
+        const {
+            Self::assert_adjacent();
+        }
+        Self {
+            _marker: std::marker::PhantomData,
+            _seal: private::InternalSeal,
+        }
+    }
+}
+
+/// Typed migration contract transforming events from [`Self::SourceEvent`] to [`Self::TargetEvent`].
+///
+/// # Compile-time Guarantees
+/// Implementations declare typed source and target schema types. Compile-time guarantees
+/// exact declared source/target schema/version pairing (`n -> n+1`) and transformer type,
+/// NOT semantic transform correctness, backend stream identity, or external writer exclusion.
+pub trait VersionMigration {
+    /// Source event schema type.
+    type SourceEvent: PardosaSchema;
+    /// Target event schema type.
+    type TargetEvent: PardosaSchema;
+    /// Error returned if event transformation fails.
+    type Error;
+
+    /// Transforms a source event into a target event.
+    ///
+    /// # Errors
+    /// Returns `Self::Error` if transformation fails.
+    fn transform(&self, event: &Self::SourceEvent) -> Result<Self::TargetEvent, Self::Error>;
+}
+
+/// Wrapper around a [`VersionMigration`] whose source and target versions are verified
+/// adjacent (`n -> n+1`) at compile time.
+///
+/// # Compile-time Guarantees
+/// Construction enforces that `M::TargetEvent::SCHEMA_VERSION == M::SourceEvent::SCHEMA_VERSION + 1`
+/// via [`MigrationWitness`]. Compile-time guarantees exact declared source/target schema/version pairing
+/// (`n -> n+1`) and transformer type, NOT semantic transform correctness, backend stream identity,
+/// or external writer exclusion.
+#[derive(Debug, Clone)]
+pub struct AdjacentMigration<M: VersionMigration> {
+    migration: M,
+    _witness: MigrationWitness<M::SourceEvent, M::TargetEvent>,
+}
+
+impl<M: VersionMigration> AdjacentMigration<M> {
+    /// Creates a new adjacent migration wrapper, enforcing `MigrationWitness` adjacency at compile time.
+    #[must_use]
+    pub fn new(migration: M) -> Self {
+        const {
+            MigrationWitness::<M::SourceEvent, M::TargetEvent>::assert_adjacent();
+        }
+        Self {
+            migration,
+            _witness: MigrationWitness::new(),
+        }
+    }
+
+    /// Returns a reference to the inner migration.
+    #[must_use]
+    pub fn migration(&self) -> &M {
+        &self.migration
+    }
+
+    /// Consumes the wrapper and returns the inner migration.
+    #[must_use]
+    pub fn into_inner(self) -> M {
+        self.migration
+    }
+
+    /// Transforms a source event into a target event via the inner migration.
+    ///
+    /// # Errors
+    /// Returns `M::Error` if transformation fails.
+    pub fn transform(&self, event: &M::SourceEvent) -> Result<M::TargetEvent, M::Error> {
+        self.migration.transform(event)
+    }
+}
 
 /// Caller election on broken precursor chain handling per C5.28 and T3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,20 +331,8 @@ impl MigrationTarget for FileStorageAdapter {
     }
 }
 
-#[allow(dead_code)]
-fn mint_fresh_identity(generation: u32, original_id: &[u8; 16], counter: u64) -> [u8; 16] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"PARDOSA_GENERATION_BOUNDARY_MINT_V1");
-    hasher.update(&generation.to_le_bytes());
-    hasher.update(original_id);
-    hasher.update(&counter.to_le_bytes());
-    let hash = hasher.finalize();
-    let mut id = [0u8; 16];
-    id.copy_from_slice(&hash.as_bytes()[0..16]);
-    id
-}
-
 /// Migration manager coordinating chase, freeze, transformation, and cutover per C5.63 and C6.16-20.
+#[allow(dead_code)]
 pub struct MigrationManager<S, T, F> {
     source: S,
     target: T,
@@ -215,16 +341,10 @@ pub struct MigrationManager<S, T, F> {
     rescue_policy: RescuePolicy,
     rescue_policy_parameters: Vec<u8>,
     broken_chain_election: BrokenChainElection,
-    #[allow(dead_code)]
     transformer: F,
     source_generation: u32,
     target_generation: u32,
     phase: MigrationPhase,
-    processed_source_count: usize,
-    target_event_counter: u64,
-    fiber_identity_map: HashMap<[u8; 16], [u8; 16]>,
-    fiber_chain_state: HashMap<[u8; 16], ([u8; 16], [u8; 32])>,
-    known_source_commitments: HashMap<[u8; 16], ([u8; 16], [u8; 32])>,
 }
 
 impl<S: fmt::Debug, T: fmt::Debug, F> fmt::Debug for MigrationManager<S, T, F> {
@@ -249,36 +369,13 @@ impl<S: MigrationSource, T: MigrationTarget>
     ///
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::InvariantBreakingConfiguration`]
-    /// because live migration is disabled per C5.18.
+    /// because live migration is disabled per approved constrained release decision.
     pub fn new(source: S, target: T) -> Result<Self, OperationFailure> {
         let _ = (source, target);
         Err(OperationFailure::new(
             FailureCondition::InvariantBreakingConfiguration,
-            "live migration is disabled in this release per C5.18; use offline administrative migration",
+            "live migration is disabled in this release per approved constrained release decision; use offline administrative migration",
         ))
-    }
-
-    #[doc(hidden)]
-    #[must_use]
-    pub fn new_for_test(source: S, target: T) -> Self {
-        Self {
-            source,
-            target,
-            default_fiber_policy: FiberMigrationPolicy::Keep,
-            fiber_policies: HashMap::new(),
-            rescue_policy: RescuePolicy::Strict,
-            rescue_policy_parameters: Vec::new(),
-            broken_chain_election: BrokenChainElection::RefuseOnBreak,
-            transformer: identity_transformer,
-            source_generation: 1,
-            target_generation: 2,
-            phase: MigrationPhase::Initial,
-            processed_source_count: 0,
-            target_event_counter: 0,
-            fiber_identity_map: HashMap::new(),
-            fiber_chain_state: HashMap::new(),
-            known_source_commitments: HashMap::new(),
-        }
     }
 }
 
@@ -303,11 +400,6 @@ where
             source_generation: self.source_generation,
             target_generation: self.target_generation,
             phase: self.phase,
-            processed_source_count: self.processed_source_count,
-            target_event_counter: self.target_event_counter,
-            fiber_identity_map: self.fiber_identity_map,
-            fiber_chain_state: self.fiber_chain_state,
-            known_source_commitments: self.known_source_commitments,
         }
     }
 
@@ -354,197 +446,15 @@ where
         self.phase
     }
 
-    #[allow(dead_code)]
-    fn record_start_if_needed(&self) -> Result<(), OperationFailure> {
-        let start_record = MigrationStartRecord {
-            source_generation: self.source_generation,
-            target_generation: self.target_generation,
-            start_time_ns: 1_000_000_000,
-            rescue_policy_tag: self.rescue_policy.to_u8(),
-        };
-        self.target
-            .record_meta(&OwnershipRecord::MigrationStart(start_record.clone()))?;
-        self.source
-            .record_meta(&OwnershipRecord::MigrationStart(start_record))
-    }
-
-    #[allow(dead_code)]
-    fn drain_batch(&mut self) -> Result<usize, OperationFailure> {
-        let all_source_envelopes = self.source.read_envelopes()?;
-        if all_source_envelopes.len() <= self.processed_source_count {
-            return Ok(0);
-        }
-
-        let new_source_slice = &all_source_envelopes[self.processed_source_count..];
-
-        let mut last_event_indices: HashMap<[u8; 16], usize> = HashMap::new();
-        for (idx, env) in all_source_envelopes.iter().enumerate() {
-            let fiber_id = env.header.fiber_id;
-            let policy = self
-                .fiber_policies
-                .get(&fiber_id)
-                .copied()
-                .unwrap_or(self.default_fiber_policy);
-            if policy == FiberMigrationPolicy::LockAndPrune {
-                last_event_indices.insert(fiber_id, idx);
-            }
-        }
-
-        let mut envelopes_to_migrate = Vec::new();
-        let mut staged_known_source_commitments = self.known_source_commitments.clone();
-        for (relative_idx, env) in new_source_slice.iter().enumerate() {
-            let global_idx = self.processed_source_count + relative_idx;
-            let fiber_id = env.header.fiber_id;
-            let policy = self
-                .fiber_policies
-                .get(&fiber_id)
-                .copied()
-                .unwrap_or(self.default_fiber_policy);
-
-            let comm = env.commitment();
-            staged_known_source_commitments.insert(env.header.event_id, (fiber_id, comm));
-
-            match policy {
-                FiberMigrationPolicy::Purge => {}
-                FiberMigrationPolicy::Keep => {
-                    envelopes_to_migrate.push(env.clone());
-                }
-                FiberMigrationPolicy::LockAndPrune => {
-                    if last_event_indices.get(&fiber_id) == Some(&global_idx) {
-                        envelopes_to_migrate.push(env.clone());
-                    }
-                }
-            }
-        }
-
-        let mut target_envelopes = Vec::with_capacity(envelopes_to_migrate.len());
-        let mut staged_target_event_counter = self.target_event_counter;
-        let mut staged_fiber_identity_map = self.fiber_identity_map.clone();
-        let mut staged_fiber_chain_state = self.fiber_chain_state.clone();
-
-        for env in envelopes_to_migrate {
-            let old_event_id = env.header.event_id;
-            let old_fiber_id = env.header.fiber_id;
-            let policy = self
-                .fiber_policies
-                .get(&old_fiber_id)
-                .copied()
-                .unwrap_or(self.default_fiber_policy);
-
-            staged_target_event_counter += 1;
-            let target_fiber_id = *staged_fiber_identity_map
-                .entry(old_fiber_id)
-                .or_insert_with(|| mint_fresh_identity(self.target_generation, &old_fiber_id, 0));
-            let target_event_id = mint_fresh_identity(
-                self.target_generation,
-                &old_event_id,
-                staged_target_event_counter,
-            );
-
-            let new_payload = match (self.transformer)(&env.payload) {
-                Ok(p) => p,
-                Err(err) => {
-                    return Err(OperationFailure::new(
-                        FailureCondition::TransformationRefused,
-                        format!("transformation refused: {err}"),
-                    ));
-                }
-            };
-
-            let is_source_genesis =
-                env.header.precursor == [0u8; 16] && env.header.precursor_hash == [0u8; 32];
-
-            let (precursor, precursor_hash) = match staged_fiber_chain_state.get(&old_fiber_id) {
-                None => ([0u8; 16], [0u8; 32]),
-                Some(&(prev_target_id, prev_target_comm)) => {
-                    if is_source_genesis {
-                        ([0u8; 16], [0u8; 32])
-                    } else {
-                        let source_precursor_id = env.header.precursor;
-                        let predecessor_valid = match staged_known_source_commitments
-                            .get(&source_precursor_id)
-                        {
-                            Some(&(pred_fiber, pred_comm)) => {
-                                pred_fiber == old_fiber_id && pred_comm == env.header.precursor_hash
-                            }
-                            None => false,
-                        };
-
-                        if predecessor_valid {
-                            (prev_target_id, prev_target_comm)
-                        } else {
-                            match self.broken_chain_election {
-                                BrokenChainElection::RefuseOnBreak => {
-                                    return Err(OperationFailure::new(
-                                        FailureCondition::PrecursorChainBroken(Some(
-                                            CausalChainError::PrecursorOutOfRange,
-                                        )),
-                                        "precursor chain broken in source; refused per C5.28",
-                                    ));
-                                }
-                                BrokenChainElection::PermitBrokenHistory => ([0u8; 16], [0u8; 32]),
-                            }
-                        }
-                    }
-                }
-            };
-
-            let detached = if policy == FiberMigrationPolicy::LockAndPrune {
-                true
-            } else {
-                env.header.detached
-            };
-
-            let new_envelope = EventEnvelope {
-                header: EnvelopeHeader {
-                    event_id: target_event_id,
-                    fiber_id: target_fiber_id,
-                    detached,
-                    precursor,
-                    precursor_hash,
-                },
-                payload: new_payload,
-            };
-
-            let new_comm = new_envelope.commitment();
-            staged_fiber_chain_state.insert(old_fiber_id, (target_event_id, new_comm));
-            target_envelopes.push(new_envelope);
-        }
-
-        let migrated_count = target_envelopes.len();
-        if !target_envelopes.is_empty() {
-            self.target.append_envelopes(&target_envelopes)?;
-        }
-        self.target_event_counter = staged_target_event_counter;
-        self.fiber_identity_map = staged_fiber_identity_map;
-        self.fiber_chain_state = staged_fiber_chain_state;
-        self.known_source_commitments = staged_known_source_commitments;
-        self.processed_source_count = all_source_envelopes.len();
-
-        Ok(migrated_count)
-    }
-
-    /// Performs the chase phase: ingests events currently available in source while source appends.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::InvariantBreakingConfiguration`]
-    /// because live migration is disabled per C5.18.
-    pub fn chase(&mut self) -> Result<usize, OperationFailure> {
-        Err(OperationFailure::new(
-            FailureCondition::InvariantBreakingConfiguration,
-            "live migration is disabled in this release per C5.18; use offline administrative migration",
-        ))
-    }
-
     /// Performs the freeze phase: drains remainder of events from source while source takes no appends.
     ///
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::InvariantBreakingConfiguration`]
-    /// because live migration is disabled per C5.18.
+    /// because live migration is disabled per approved constrained release decision.
     pub fn freeze(&mut self) -> Result<usize, OperationFailure> {
         Err(OperationFailure::new(
             FailureCondition::InvariantBreakingConfiguration,
-            "live migration is disabled in this release per C5.18; use offline administrative migration",
+            "live migration is disabled in this release per approved constrained release decision; use offline administrative migration",
         ))
     }
 
@@ -552,12 +462,12 @@ where
     ///
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::InvariantBreakingConfiguration`]
-    /// because live migration is disabled per C5.18.
+    /// because live migration is disabled per approved constrained release decision.
     pub fn cutover(mut self) -> Result<CutoverSummary, OperationFailure> {
         let _ = &mut self;
         Err(OperationFailure::new(
             FailureCondition::InvariantBreakingConfiguration,
-            "live migration is disabled in this release per C5.18; use offline administrative migration",
+            "live migration is disabled in this release per approved constrained release decision; use offline administrative migration",
         ))
     }
 
@@ -565,12 +475,68 @@ where
     ///
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::InvariantBreakingConfiguration`]
-    /// because live migration is disabled per C5.18.
+    /// because live migration is disabled per approved constrained release decision.
     pub fn run_all(mut self) -> Result<CutoverSummary, OperationFailure> {
         let _ = &mut self;
         Err(OperationFailure::new(
             FailureCondition::InvariantBreakingConfiguration,
-            "live migration is disabled in this release per C5.18; use offline administrative migration",
+            "live migration is disabled in this release per approved constrained release decision; use offline administrative migration",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_migration_manager_stub_failures() {
+        let mut mgr = MigrationManager {
+            source: FileStorageAdapter::new(std::path::PathBuf::from("/tmp/test_src")),
+            target: FileStorageAdapter::new(std::path::PathBuf::from("/tmp/test_dst")),
+            default_fiber_policy: FiberMigrationPolicy::Keep,
+            fiber_policies: HashMap::new(),
+            rescue_policy: RescuePolicy::Strict,
+            rescue_policy_parameters: Vec::new(),
+            broken_chain_election: BrokenChainElection::RefuseOnBreak,
+            transformer: identity_transformer,
+            source_generation: 1,
+            target_generation: 2,
+            phase: MigrationPhase::Initial,
+        };
+
+        let err_freeze = mgr.freeze().unwrap_err();
+        assert_eq!(
+            *err_freeze.condition(),
+            FailureCondition::InvariantBreakingConfiguration
+        );
+        assert!(err_freeze.to_string().contains("live migration is disabled in this release per approved constrained release decision; use offline administrative migration"));
+
+        let err_cutover = mgr.cutover().unwrap_err();
+        assert_eq!(
+            *err_cutover.condition(),
+            FailureCondition::InvariantBreakingConfiguration
+        );
+        assert!(err_cutover.to_string().contains("live migration is disabled in this release per approved constrained release decision; use offline administrative migration"));
+
+        let mgr2 = MigrationManager {
+            source: FileStorageAdapter::new(std::path::PathBuf::from("/tmp/test_src")),
+            target: FileStorageAdapter::new(std::path::PathBuf::from("/tmp/test_dst")),
+            default_fiber_policy: FiberMigrationPolicy::Keep,
+            fiber_policies: HashMap::new(),
+            rescue_policy: RescuePolicy::Strict,
+            rescue_policy_parameters: Vec::new(),
+            broken_chain_election: BrokenChainElection::RefuseOnBreak,
+            transformer: identity_transformer,
+            source_generation: 1,
+            target_generation: 2,
+            phase: MigrationPhase::Initial,
+        };
+        let err_run = mgr2.run_all().unwrap_err();
+        assert_eq!(
+            *err_run.condition(),
+            FailureCondition::InvariantBreakingConfiguration
+        );
+        assert!(err_run.to_string().contains("live migration is disabled in this release per approved constrained release decision; use offline administrative migration"));
     }
 }

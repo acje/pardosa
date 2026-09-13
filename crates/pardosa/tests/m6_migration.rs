@@ -58,15 +58,29 @@ fn test_m6_live_migration_manager_and_freeze_refused() {
         *err_new.condition(),
         FailureCondition::InvariantBreakingConfiguration
     );
-    assert!(err_new.to_string().contains("live migration is disabled in this release per C5.18; use offline administrative migration"));
+    assert!(err_new.to_string().contains("live migration is disabled in this release per approved constrained release decision; use offline administrative migration"));
+}
 
-    let mut manager = MigrationManager::new_for_test(source, target);
-    let err_freeze = manager.freeze().unwrap_err();
-    assert_eq!(
-        *err_freeze.condition(),
-        FailureCondition::InvariantBreakingConfiguration
+#[test]
+fn test_compile_fail_migration_new_for_test_removed() {
+    let code = r#"
+        use pardosa::file::FileStorageAdapter;
+        use pardosa::migration::MigrationManager;
+
+        pub fn check() {
+            let dir = std::path::PathBuf::from("/tmp");
+            let source = FileStorageAdapter::new(dir.join("src"));
+            let target = FileStorageAdapter::new(dir.join("dst"));
+            let _ = MigrationManager::new_for_test(source, target);
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(!ok, "MigrationManager::new_for_test must not exist");
+    assert!(
+        stderr.contains("new_for_test")
+            && (stderr.contains("not found") || stderr.contains("no associated function")),
+        "stderr must indicate new_for_test is absent:\n{stderr}"
     );
-    assert!(err_freeze.to_string().contains("live migration is disabled in this release per C5.18; use offline administrative migration"));
 }
 
 #[test]
@@ -95,7 +109,7 @@ fn test_m6_migration_basic_lifecycle_and_cutover() {
         *err_mgr.condition(),
         FailureCondition::InvariantBreakingConfiguration
     );
-    assert!(err_mgr.to_string().contains("live migration is disabled in this release per C5.18; use offline administrative migration"));
+    assert!(err_mgr.to_string().contains("live migration is disabled in this release per approved constrained release decision; use offline administrative migration"));
 
     let source_locator = source.locator_id();
     let target_locator = target.locator_id();
@@ -362,7 +376,7 @@ fn test_m6_chase_phase_concurrent_source_appends() {
         *err.condition(),
         FailureCondition::InvariantBreakingConfiguration
     );
-    assert!(err.to_string().contains("live migration is disabled in this release per C5.18; use offline administrative migration"));
+    assert!(err.to_string().contains("live migration is disabled in this release per approved constrained release decision; use offline administrative migration"));
 }
 
 #[test]
@@ -376,5 +390,320 @@ fn test_m6_transform_failure_retry_does_not_leak_staged_state() {
         *err.condition(),
         FailureCondition::InvariantBreakingConfiguration
     );
-    assert!(err.to_string().contains("live migration is disabled in this release per C5.18; use offline administrative migration"));
+    assert!(err.to_string().contains("live migration is disabled in this release per approved constrained release decision; use offline administrative migration"));
+}
+
+fn run_rustc(code: &str) -> (bool, String) {
+    use std::io::Write;
+    use std::process::Command;
+
+    let deps_dir = std::env::current_exe()
+        .expect("current test executable")
+        .parent()
+        .expect("parent deps directory")
+        .to_path_buf();
+
+    let entries = std::fs::read_dir(&deps_dir)
+        .unwrap_or_else(|e| panic!("failed to read deps dir {}: {e}", deps_dir.display()));
+    let mut rlibs = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.unwrap_or_else(|e| panic!("failed to read entry in {}: {e}", deps_dir.display()));
+        let p = entry.path();
+        if let Some(s) = p.file_name().and_then(|n| n.to_str()) {
+            if s.starts_with("libpardosa-") && s.ends_with(".rlib") {
+                rlibs.push(p.clone());
+            }
+        }
+    }
+    let rlib = match rlibs.len() {
+        0 => panic!(
+            "could not locate libpardosa rlib in deps directory: {}",
+            deps_dir.display()
+        ),
+        1 => rlibs.remove(0),
+        _ => {
+            rlibs.sort_by_key(|p| {
+                std::fs::metadata(p)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+            });
+            rlibs.pop().unwrap()
+        }
+    };
+
+    let rustc_cmd = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let mut cmd = Command::new(&rustc_cmd);
+    cmd.arg("--edition")
+        .arg("2021")
+        .arg("-L")
+        .arg(&deps_dir)
+        .arg("--extern")
+        .arg(format!("pardosa={}", rlib.display()));
+    let mut child = cmd
+        .arg("--crate-type")
+        .arg("lib")
+        .arg("--emit")
+        .arg("mir=-")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rustc");
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(code.as_bytes())
+            .expect("write code to rustc stdin");
+    }
+    let output = child.wait_with_output().expect("wait rustc");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    (output.status.success(), stderr)
+}
+
+#[test]
+fn test_compile_success_strict_adjacent_migration() {
+    let code = r#"
+        use pardosa::migration::{AdjacentMigration, MigrationWitness, VersionMigration};
+        use pardosa::schema::{DescriptorNode, PardosaSchema};
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct EventV1 {
+            pub value: u32,
+        }
+
+        impl PardosaSchema for EventV1 {
+            const SCHEMA_VERSION: u32 = 1;
+            fn schema_descriptor() -> DescriptorNode {
+                DescriptorNode::U32
+            }
+            fn encode_payload(&self, buf: &mut Vec<u8>) -> Result<(), pardosa::encoding::EncodeError> {
+                buf.extend_from_slice(&self.value.to_le_bytes());
+                Ok(())
+            }
+            fn decode_payload(buf: &[u8]) -> Result<Self, pardosa::encoding::DecodeError> {
+                if buf.len() < 4 {
+                    return Err(pardosa::encoding::DecodeError::TruncatedPayload {
+                        expected: 4,
+                        available: buf.len(),
+                    });
+                }
+                let value = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                Ok(Self { value })
+            }
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct EventV2 {
+            pub value: u64,
+        }
+
+        impl PardosaSchema for EventV2 {
+            const SCHEMA_VERSION: u32 = 2;
+            fn schema_descriptor() -> DescriptorNode {
+                DescriptorNode::U64
+            }
+            fn encode_payload(&self, buf: &mut Vec<u8>) -> Result<(), pardosa::encoding::EncodeError> {
+                buf.extend_from_slice(&self.value.to_le_bytes());
+                Ok(())
+            }
+            fn decode_payload(buf: &[u8]) -> Result<Self, pardosa::encoding::DecodeError> {
+                if buf.len() < 8 {
+                    return Err(pardosa::encoding::DecodeError::TruncatedPayload {
+                        expected: 8,
+                        available: buf.len(),
+                    });
+                }
+                let value = u64::from_le_bytes([
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                ]);
+                Ok(Self { value })
+            }
+        }
+
+        pub struct MigrateV1ToV2;
+
+        impl VersionMigration for MigrateV1ToV2 {
+            type SourceEvent = EventV1;
+            type TargetEvent = EventV2;
+            type Error = std::convert::Infallible;
+
+            fn transform(&self, event: &Self::SourceEvent) -> Result<Self::TargetEvent, Self::Error> {
+                Ok(EventV2 {
+                    value: event.value as u64,
+                })
+            }
+        }
+
+        pub fn check() {
+            MigrationWitness::<EventV1, EventV2>::assert_adjacent();
+            let migration = AdjacentMigration::new(MigrateV1ToV2);
+            let v1 = EventV1 { value: 42 };
+            let v2 = migration.transform(&v1).unwrap();
+            assert_eq!(v2.value, 42);
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(ok, "strict n->n+1 positive control must compile:\n{stderr}");
+}
+
+#[test]
+fn test_compile_fail_migration_skip_version_n_to_n_plus_2() {
+    let code = r#"
+        use pardosa::migration::{AdjacentMigration, VersionMigration};
+        use pardosa::schema::{DescriptorNode, PardosaSchema};
+
+        pub struct EventV1;
+        impl PardosaSchema for EventV1 {
+            const SCHEMA_VERSION: u32 = 1;
+            fn schema_descriptor() -> DescriptorNode { DescriptorNode::U8 }
+            fn encode_payload(&self, _: &mut Vec<u8>) -> Result<(), pardosa::encoding::EncodeError> { Ok(()) }
+            fn decode_payload(_: &[u8]) -> Result<Self, pardosa::encoding::DecodeError> { Ok(Self) }
+        }
+
+        pub struct EventV3;
+        impl PardosaSchema for EventV3 {
+            const SCHEMA_VERSION: u32 = 3;
+            fn schema_descriptor() -> DescriptorNode { DescriptorNode::U8 }
+            fn encode_payload(&self, _: &mut Vec<u8>) -> Result<(), pardosa::encoding::EncodeError> { Ok(()) }
+            fn decode_payload(_: &[u8]) -> Result<Self, pardosa::encoding::DecodeError> { Ok(Self) }
+        }
+
+        pub struct SkipMigration;
+        impl VersionMigration for SkipMigration {
+            type SourceEvent = EventV1;
+            type TargetEvent = EventV3;
+            type Error = std::convert::Infallible;
+            fn transform(&self, _: &Self::SourceEvent) -> Result<Self::TargetEvent, Self::Error> { Ok(EventV3) }
+        }
+
+        pub fn check() {
+            let _ = AdjacentMigration::new(SkipMigration);
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(!ok, "n -> n+2 migration must fail compilation");
+    assert!(
+        stderr.contains("Migration must be strict n -> n+1"),
+        "stderr must cite strict n -> n+1 invariant:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_compile_fail_migration_backwards_version() {
+    let code = r#"
+        use pardosa::migration::{AdjacentMigration, VersionMigration};
+        use pardosa::schema::{DescriptorNode, PardosaSchema};
+
+        pub struct EventV2;
+        impl PardosaSchema for EventV2 {
+            const SCHEMA_VERSION: u32 = 2;
+            fn schema_descriptor() -> DescriptorNode { DescriptorNode::U8 }
+            fn encode_payload(&self, _: &mut Vec<u8>) -> Result<(), pardosa::encoding::EncodeError> { Ok(()) }
+            fn decode_payload(_: &[u8]) -> Result<Self, pardosa::encoding::DecodeError> { Ok(Self) }
+        }
+
+        pub struct EventV1;
+        impl PardosaSchema for EventV1 {
+            const SCHEMA_VERSION: u32 = 1;
+            fn schema_descriptor() -> DescriptorNode { DescriptorNode::U8 }
+            fn encode_payload(&self, _: &mut Vec<u8>) -> Result<(), pardosa::encoding::EncodeError> { Ok(()) }
+            fn decode_payload(_: &[u8]) -> Result<Self, pardosa::encoding::DecodeError> { Ok(Self) }
+        }
+
+        pub struct BackwardMigration;
+        impl VersionMigration for BackwardMigration {
+            type SourceEvent = EventV2;
+            type TargetEvent = EventV1;
+            type Error = std::convert::Infallible;
+            fn transform(&self, _: &Self::SourceEvent) -> Result<Self::TargetEvent, Self::Error> { Ok(EventV1) }
+        }
+
+        pub fn check() {
+            let _ = AdjacentMigration::new(BackwardMigration);
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(!ok, "backwards migration must fail compilation");
+    assert!(
+        stderr.contains("Migration must be strict n -> n+1"),
+        "stderr must cite strict n -> n+1 invariant:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_compile_fail_migration_same_version() {
+    let code = r#"
+        use pardosa::migration::{AdjacentMigration, VersionMigration};
+        use pardosa::schema::{DescriptorNode, PardosaSchema};
+
+        pub struct EventV1;
+        impl PardosaSchema for EventV1 {
+            const SCHEMA_VERSION: u32 = 1;
+            fn schema_descriptor() -> DescriptorNode { DescriptorNode::U8 }
+            fn encode_payload(&self, _: &mut Vec<u8>) -> Result<(), pardosa::encoding::EncodeError> { Ok(()) }
+            fn decode_payload(_: &[u8]) -> Result<Self, pardosa::encoding::DecodeError> { Ok(Self) }
+        }
+
+        pub struct SameVersionMigration;
+        impl VersionMigration for SameVersionMigration {
+            type SourceEvent = EventV1;
+            type TargetEvent = EventV1;
+            type Error = std::convert::Infallible;
+            fn transform(&self, _: &Self::SourceEvent) -> Result<Self::TargetEvent, Self::Error> { Ok(EventV1) }
+        }
+
+        pub fn check() {
+            let _ = AdjacentMigration::new(SameVersionMigration);
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(!ok, "same-version migration must fail compilation");
+    assert!(
+        stderr.contains("Migration must be strict n -> n+1"),
+        "stderr must cite strict n -> n+1 invariant:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_compile_fail_migration_source_schema_version_max() {
+    let code = r#"
+        use pardosa::migration::{AdjacentMigration, VersionMigration};
+        use pardosa::schema::{DescriptorNode, PardosaSchema};
+
+        pub struct EventMax;
+        impl PardosaSchema for EventMax {
+            const SCHEMA_VERSION: u32 = u32::MAX;
+            fn schema_descriptor() -> DescriptorNode { DescriptorNode::U8 }
+            fn encode_payload(&self, _: &mut Vec<u8>) -> Result<(), pardosa::encoding::EncodeError> { Ok(()) }
+            fn decode_payload(_: &[u8]) -> Result<Self, pardosa::encoding::DecodeError> { Ok(Self) }
+        }
+
+        pub struct EventWrapped;
+        impl PardosaSchema for EventWrapped {
+            const SCHEMA_VERSION: u32 = 0;
+            fn schema_descriptor() -> DescriptorNode { DescriptorNode::U8 }
+            fn encode_payload(&self, _: &mut Vec<u8>) -> Result<(), pardosa::encoding::EncodeError> { Ok(()) }
+            fn decode_payload(_: &[u8]) -> Result<Self, pardosa::encoding::DecodeError> { Ok(Self) }
+        }
+
+        pub struct OverflowMigration;
+        impl VersionMigration for OverflowMigration {
+            type SourceEvent = EventMax;
+            type TargetEvent = EventWrapped;
+            type Error = std::convert::Infallible;
+            fn transform(&self, _: &Self::SourceEvent) -> Result<Self::TargetEvent, Self::Error> { Ok(EventWrapped) }
+        }
+
+        pub fn check() {
+            let _ = AdjacentMigration::new(OverflowMigration);
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(!ok, "u32::MAX source schema version must fail compilation");
+    assert!(
+        stderr.contains("Source schema version must be less than u32::MAX"),
+        "stderr must cite u32::MAX constraint:\n{stderr}"
+    );
 }

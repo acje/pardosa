@@ -400,8 +400,10 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
 
     Ok(quote! {
         impl ::pardosa::schema::PardosaSchema for #enum_name {
+            const SCHEMA_VERSION: u32 = #schema_version;
+
             fn schema_version() -> u32 {
-                #schema_version
+                Self::SCHEMA_VERSION
             }
 
             fn schema_descriptor() -> ::pardosa::schema::DescriptorNode {
