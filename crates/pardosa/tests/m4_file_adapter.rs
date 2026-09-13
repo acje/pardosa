@@ -525,19 +525,21 @@ fn test_m4_adapter_retirement_and_generation_records() {
         .record_outbound_pointer_for_test(&outbound)
         .expect("record outbound pointer");
 
-    let err_new_writer = adapter
-        .open_write(1)
-        .expect_err("new writer must be rejected");
-    assert_eq!(
-        *err_new_writer.condition(),
-        FailureCondition::RetiredMigrationSource
-    );
-
     let err_append = writer
         .append_envelope_verdict(&env)
         .expect_err("existing writer append must be rejected");
     assert_eq!(
         *err_append.condition(),
+        FailureCondition::RetiredMigrationSource
+    );
+
+    drop(writer);
+
+    let err_new_writer = adapter
+        .open_write(1)
+        .expect_err("new writer must be rejected");
+    assert_eq!(
+        *err_new_writer.condition(),
         FailureCondition::RetiredMigrationSource
     );
 
@@ -919,4 +921,32 @@ fn test_file_open_write_concurrent_writer_rejected_while_holding_lock() {
         .open_write(1)
         .expect("open write succeeds after lock released");
     drop(writer2);
+}
+
+#[test]
+fn test_file_open_write_acquires_lock_before_authority_metadata_read() {
+    let dir = TestDir::new("lock_before_authority_read");
+    let base_path = dir.path().join("store");
+    let adapter = FileStorageAdapter::new(&base_path);
+    let claim = sample_claim(1);
+
+    let writer = adapter.create(&claim).expect("create");
+    drop(writer);
+
+    let writer1 = adapter
+        .open_write(1)
+        .expect("first open write holds exclusion");
+
+    let meta_path = dir.path().join("store.meta");
+    std::fs::write(&meta_path, b"corrupted-metadata-payload").expect("corrupt meta");
+
+    let err = adapter
+        .open_write(1)
+        .expect_err("open_write must acquire lock before reading authority metadata");
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::AnotherOwnerHoldsExclusion
+    );
+
+    drop(writer1);
 }

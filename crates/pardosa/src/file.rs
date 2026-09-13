@@ -914,14 +914,6 @@ impl FileStorageAdapter {
             ArtefactPresence::Both => {}
         }
 
-        let meta = read_meta_records(&self.meta_path)?;
-        if meta.outbound_pointer.is_some() {
-            return Err(OperationFailure::new(
-                FailureCondition::RetiredMigrationSource,
-                "artefact append authority permanently retired via outbound pointer per C5.63",
-            ));
-        }
-
         let mut pgno_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -934,6 +926,14 @@ impl FileStorageAdapter {
             })?;
 
         acquire_file_exclusion(&pgno_file, self.exclusion_policy)?;
+
+        let meta = read_meta_records(&self.meta_path)?;
+        if meta.outbound_pointer.is_some() {
+            return Err(OperationFailure::new(
+                FailureCondition::RetiredMigrationSource,
+                "artefact append authority permanently retired via outbound pointer per C5.63",
+            ));
+        }
 
         let claim = meta.latest_claim.clone().ok_or_else(|| {
             OperationFailure::new(

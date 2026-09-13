@@ -137,17 +137,19 @@ fn test_m6_migration_basic_lifecycle_and_cutover() {
 
     assert!(source.is_retired_source().expect("query retired"));
 
-    let err_new = source.open_write(1).expect_err("source must be retired");
-    assert_eq!(
-        *err_new.condition(),
-        FailureCondition::RetiredMigrationSource
-    );
-
     let err_append = writer
         .append_envelope_verdict(&env1)
         .expect_err("source writer retired");
     assert_eq!(
         *err_append.condition(),
+        FailureCondition::RetiredMigrationSource
+    );
+
+    drop(writer);
+
+    let err_new = source.open_write(1).expect_err("source must be retired");
+    assert_eq!(
+        *err_new.condition(),
         FailureCondition::RetiredMigrationSource
     );
 

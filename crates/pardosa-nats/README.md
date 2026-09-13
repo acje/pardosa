@@ -10,7 +10,7 @@ NATS JetStream storage adapter for [Pardosa](https://crates.io/crates/pardosa).
   - `{stem}_meta`: Key-value and message stream for ownership claims, monotonic epochs, and generation cutover pointers.
   - `{stem}_data`: Ordered, append-only event stream recording Pardosa container frames.
 - **Single-Writer Fencing & OCC**: Enforces linearizable single-writer ownership using JetStream sequence expectations and monotonic epoch fences. Stale writes and concurrent writers are rejected deterministically via optimistic concurrency control (OCC).
-- **Deterministic Subject Routing**: Stream and subject names are derived deterministically from the stem: `{stem}_meta` and `{stem}_data` streams binding `{stem}.meta` and `{stem}.data` subjects, with server expected-stream verification.
+- **Deterministic Subject Routing**: Stream and subject names are derived deterministically from the stem: `{stem}_meta` and `{stem}_data` streams binding `{stem}_meta` and `{stem}_data` subjects, with server expected-stream verification.
 - **Synchronous Session Facade**: Bridges asynchronous JetStream operations into Pardosa's synchronous pipeline contracts via `NatsWriterSession` and `NatsReaderSession`.
 
 ## Usage Example

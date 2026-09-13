@@ -351,6 +351,12 @@ async fn read_data_frames_async(
             "data stream is empty; missing container header per C10.3",
         ));
     }
+    if first > 1 {
+        return Err(OperationFailure::new(
+            FailureCondition::OwnershipRecordUnreadable,
+            format!("data stream {data_stream_name} sequence 1 ContainerHeader missing: first sequence is {first} > 1"),
+        ));
+    }
     let header_raw = stream
         .get_raw_message(first)
         .await
@@ -435,6 +441,12 @@ async fn read_chunk_async(
         return Err(OperationFailure::new(
             FailureCondition::PrecursorChainBroken(None),
             "data stream is empty; missing container header per C10.3",
+        ));
+    }
+    if first > 1 {
+        return Err(OperationFailure::new(
+            FailureCondition::OwnershipRecordUnreadable,
+            format!("data stream {data_stream_name} sequence 1 ContainerHeader missing: first sequence is {first} > 1"),
         ));
     }
     if let Some(t_seq) = terminal_seq {
@@ -652,8 +664,8 @@ impl NatsStorageAdapter {
     ) -> Self {
         let meta_stream_name = format!("{stem}_meta");
         let data_stream_name = format!("{stem}_data");
-        let meta_subject = format!("{stem}.meta");
-        let data_subject = format!("{stem}.data");
+        let meta_subject = format!("{stem}_meta");
+        let data_subject = format!("{stem}_data");
         let js = {
             let _guard = runtime.enter();
             async_nats::jetstream::new(client.clone())
@@ -671,20 +683,7 @@ impl NatsStorageAdapter {
         }
     }
 
-    /// Overrides the subjects used for publishing and stream routing.
-    #[deprecated(note = "subjects are derived deterministically ({stem}.meta, {stem}.data)")]
-    #[must_use]
-    pub fn with_subjects(
-        mut self,
-        meta_subject: impl Into<String>,
-        data_subject: impl Into<String>,
-    ) -> Self {
-        self.meta_subject = meta_subject.into();
-        self.data_subject = data_subject.into();
-        self
-    }
-
-    #[cfg(any(test, feature = "unstable-test-support"))]
+    #[cfg(feature = "unstable-test-support")]
     #[doc(hidden)]
     #[must_use]
     pub fn with_subjects_for_test(
@@ -739,13 +738,13 @@ impl NatsStorageAdapter {
         &self.data_stream_name
     }
 
-    /// Returns the ownership record subject name (`{stem}.meta`).
+    /// Returns the ownership record subject name (`{stem}_meta`).
     #[must_use]
     pub fn meta_subject(&self) -> &str {
         &self.meta_subject
     }
 
-    /// Returns the event data subject name (`{stem}.data`).
+    /// Returns the event data subject name (`{stem}_data`).
     #[must_use]
     pub fn data_subject(&self) -> &str {
         &self.data_subject
@@ -1397,6 +1396,12 @@ impl NatsStorageAdapter {
                     "data stream is empty; missing container header per C10.3",
                 ));
             }
+            if first_seq > 1 {
+                return Err(OperationFailure::new(
+                    FailureCondition::OwnershipRecordUnreadable,
+                    format!("data stream {data_name} sequence 1 ContainerHeader missing: first sequence is {first_seq} > 1"),
+                ));
+            }
             let header_raw = stream
                 .get_raw_message(first_seq)
                 .await
@@ -1996,6 +2001,12 @@ impl StorageEngine for NatsEngine {
                 return Err(OperationFailure::new(
                     FailureCondition::PrecursorChainBroken(None),
                     "data stream is empty; missing container header per C10.3",
+                ));
+            }
+            if first_seq > 1 {
+                return Err(OperationFailure::new(
+                    FailureCondition::OwnershipRecordUnreadable,
+                    format!("data stream {data_name} sequence 1 ContainerHeader missing: first sequence is {first_seq} > 1"),
                 ));
             }
             let first_msg = stream

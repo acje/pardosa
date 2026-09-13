@@ -646,6 +646,7 @@ fn test_m7_dimension_4_migration_cutover_and_permanent_source_retirement() {
         file_writer_err.condition(),
         &FailureCondition::RetiredMigrationSource
     );
+    drop(file_writer);
     let file_new_writer_err = file_source.open_write(1).unwrap_err();
     assert_eq!(
         file_new_writer_err.condition(),

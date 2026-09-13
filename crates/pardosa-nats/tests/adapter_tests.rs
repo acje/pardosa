@@ -791,6 +791,25 @@ fn test_compile_fail_nats_reader_transport_escape() {
 }
 
 #[test]
+fn test_compile_fail_with_subjects_removed() {
+    let invalid_code = r#"
+        use pardosa_nats::NatsStorageAdapter;
+        pub fn run_invalid(adapter: NatsStorageAdapter) {
+            let _ = adapter.with_subjects("meta", "data");
+        }
+    "#;
+    let (ok, stderr) = run_rustc_nats(invalid_code);
+    assert!(
+        !ok,
+        "NatsStorageAdapter::with_subjects must not exist in public API"
+    );
+    assert!(
+        stderr.contains("no method named `with_subjects`") || stderr.contains("E0599"),
+        "rejection must cite missing with_subjects method: {stderr}"
+    );
+}
+
+#[test]
 fn test_nats_c8_2_schema_completeness() {
     let valid_schema = SchemaDescriptor::new(
         1,
@@ -2151,6 +2170,14 @@ fn test_nats_routing_stream_mismatch_marks_session_uncertain() {
         .expect_err("uncertain session must refuse writes");
     assert!(err2.to_string().contains("uncertain state"));
 
+    rt.block_on(async {
+        let client = async_nats::connect(server.url()).await.expect("connect");
+        let js = async_nats::jetstream::new(client);
+        let mut stream = js.get_stream(&rogue_stem).await.expect("get rogue stream");
+        let info = stream.info().await.expect("stream info");
+        assert_eq!(info.state.messages, 1);
+    });
+
     adapter.delete_streams().expect("cleanup");
     let _ = rt.block_on(async {
         let client = async_nats::connect(server.url()).await.ok()?;
@@ -2418,4 +2445,212 @@ fn test_nats_read_meta_records_missing_seq1_fails_closed() {
     );
 
     adapter.delete_streams().expect("cleanup");
+}
+
+#[test]
+fn test_nats_default_subjects_underscore_routing() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("underscore_routing");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
+
+    assert_eq!(adapter.meta_subject(), format!("{stem}_meta"));
+    assert_eq!(adapter.data_subject(), format!("{stem}_data"));
+}
+
+#[test]
+fn test_nats_data_stream_missing_seq1_fails_closed() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("data_missing_seq1");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
+    let claim = sample_claim(1);
+
+    let mut writer = adapter.create(&claim).expect("create stream");
+    writer.append_raw_frame(b"frame-1").expect("append frame");
+    drop(writer);
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        let client = async_nats::connect(server.url()).await.expect("connect");
+        let js = async_nats::jetstream::new(client);
+        let stream = js
+            .get_stream(adapter.data_stream_name())
+            .await
+            .expect("get data stream");
+        stream.delete_message(1).await.expect("delete seq 1");
+    });
+
+    let err_write = adapter
+        .open_write(1)
+        .expect_err("open_write must fail closed when data seq 1 is deleted");
+    assert_eq!(
+        *err_write.condition(),
+        FailureCondition::OwnershipRecordUnreadable
+    );
+
+    let mut reader = adapter
+        .open_read()
+        .expect("open_read succeeds and marks broken reader state");
+    let err_read = reader
+        .read_all_frames()
+        .expect_err("read_all_frames must fail closed when data seq 1 is deleted");
+    assert_eq!(
+        *err_read.condition(),
+        FailureCondition::OwnershipRecordUnreadable
+    );
+
+    adapter.delete_streams().expect("cleanup");
+}
+
+#[test]
+fn test_nats_existing_stream_legacy_underscore_routing_reopen_and_append_continuation() {
+    let server = LiveNatsServer::acquire();
+    let stem_a = unique_stem("legacy_reopen_a");
+    let stem_b = unique_stem("legacy_reopen_b");
+
+    let adapter_a = NatsStorageAdapter::new(server.url(), &stem_a).expect("connect a");
+    let adapter_b = NatsStorageAdapter::new(server.url(), &stem_b).expect("connect b");
+
+    assert_eq!(adapter_a.meta_subject(), format!("{stem_a}_meta"));
+    assert_eq!(adapter_a.data_subject(), format!("{stem_a}_data"));
+    assert_eq!(adapter_b.meta_subject(), format!("{stem_b}_meta"));
+    assert_eq!(adapter_b.data_subject(), format!("{stem_b}_data"));
+
+    let claim = sample_claim(1);
+
+    let fiber1 = [0x11; 16];
+    let fiber2 = [0x22; 16];
+    let fiber3 = [0x33; 16];
+
+    let mut events_n = Vec::new();
+    let mut event_num = 1u8;
+    for _round in 0..4 {
+        events_n.push((
+            fiber1,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
+        event_num += 1;
+        events_n.push((
+            fiber2,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
+        event_num += 1;
+        events_n.push((
+            fiber3,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
+        event_num += 1;
+    }
+
+    let mut events_m = Vec::new();
+    for _round in 0..3 {
+        events_m.push((
+            fiber1,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
+        event_num += 1;
+        events_m.push((
+            fiber2,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
+        event_num += 1;
+        events_m.push((
+            fiber3,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
+        event_num += 1;
+    }
+
+    let mut writer_a = adapter_a.create(&claim).expect("create writer a");
+    for (fiber_id, event_id, payload) in &events_n {
+        writer_a
+            .append_to_fiber(*fiber_id, *event_id, payload.clone())
+            .expect("append to writer a");
+    }
+    drop(writer_a);
+
+    let mut writer_a = adapter_a.open_write(1).expect("reopen writer a");
+    for (fiber_id, event_id, payload) in &events_m {
+        writer_a
+            .append_to_fiber(*fiber_id, *event_id, payload.clone())
+            .expect("append continuation to writer a");
+    }
+    drop(writer_a);
+
+    let mut writer_b = adapter_b.create(&claim).expect("create writer b");
+    for (fiber_id, event_id, payload) in &events_n {
+        writer_b
+            .append_to_fiber(*fiber_id, *event_id, payload.clone())
+            .expect("batch append n to writer b");
+    }
+    for (fiber_id, event_id, payload) in &events_m {
+        writer_b
+            .append_to_fiber(*fiber_id, *event_id, payload.clone())
+            .expect("batch append m to writer b");
+    }
+    drop(writer_b);
+
+    let final_writer_a = adapter_a.open_write(1).expect("final open write a");
+    let final_writer_b = adapter_b.open_write(1).expect("final open write b");
+
+    assert_eq!(
+        final_writer_a.rolling_commitment().current_commitment(),
+        final_writer_b.rolling_commitment().current_commitment()
+    );
+    assert_eq!(
+        final_writer_a.rolling_commitment().frame_count(),
+        final_writer_b.rolling_commitment().frame_count()
+    );
+    assert_eq!(final_writer_a.rolling_commitment().frame_count(), 21);
+    assert_eq!(
+        final_writer_a.last_sequence(),
+        final_writer_b.last_sequence()
+    );
+
+    for fiber_id in [fiber1, fiber2, fiber3] {
+        let handle_a = final_writer_a.fiber(fiber_id).expect("fiber handle a");
+        let handle_b = final_writer_b.fiber(fiber_id).expect("fiber handle b");
+        assert_eq!(handle_a.event_count(), handle_b.event_count());
+        assert_eq!(handle_a.precursor(), handle_b.precursor());
+        assert_eq!(handle_a.state(), handle_b.state());
+
+        let latest_a = final_writer_a
+            .get_latest(fiber_id)
+            .expect("latest a")
+            .unwrap();
+        let latest_b = final_writer_b
+            .get_latest(fiber_id)
+            .expect("latest b")
+            .unwrap();
+        assert_eq!(latest_a.header.event_id, latest_b.header.event_id);
+        assert_eq!(latest_a.header.precursor, latest_b.header.precursor);
+        assert_eq!(latest_a.header.fiber_id, latest_b.header.fiber_id);
+        assert_eq!(latest_a.payload, latest_b.payload);
+    }
+    drop(final_writer_a);
+    drop(final_writer_b);
+
+    let mut final_reader_a = adapter_a.open_read().expect("final open read a");
+    let mut final_reader_b = adapter_b.open_read().expect("final open read b");
+    let envs_a = final_reader_a.read_all_envelopes().expect("read all a");
+    let envs_b = final_reader_b.read_all_envelopes().expect("read all b");
+    assert_eq!(envs_a.len(), 21);
+    assert_eq!(envs_b.len(), 21);
+
+    for (ea, eb) in envs_a.iter().zip(envs_b.iter()) {
+        assert_eq!(ea.header.event_id, eb.header.event_id);
+        assert_eq!(ea.header.fiber_id, eb.header.fiber_id);
+        assert_eq!(ea.header.precursor, eb.header.precursor);
+        assert_eq!(ea.header.precursor_hash, eb.header.precursor_hash);
+        assert_eq!(ea.header.detached, eb.header.detached);
+        assert_eq!(ea.payload, eb.payload);
+    }
+
+    adapter_a.delete_streams().expect("cleanup a");
+    adapter_b.delete_streams().expect("cleanup b");
 }
