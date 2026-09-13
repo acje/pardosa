@@ -594,7 +594,9 @@ impl SchemaDescriptor {
     /// Derives the schema identity for this descriptor.
     #[must_use]
     pub fn identity(&self) -> SchemaIdentity {
-        SchemaIdentity::from_descriptor(self.version, &self.root)
+        let admitted = AdmittedDescriptor::try_from_descriptor(self.clone())
+            .expect("SchemaDescriptor must be valid to compute identity; use AdmittedDescriptor for panic-free identity");
+        SchemaIdentity::from_descriptor(&admitted)
     }
 
     /// Asserts that this schema descriptor is structurally complete per C8.2.
@@ -882,13 +884,11 @@ impl SchemaIdentity {
         Ok(Self(*hash.as_bytes()))
     }
 
-    /// Computes schema identity from schema version and descriptor AST root.
-    ///
-    /// # Panics
-    /// Panics if descriptor encoding fails.
+    /// Computes schema identity from an admitted schema descriptor.
     #[must_use]
-    pub fn from_descriptor(version: u32, root: &DescriptorNode) -> Self {
-        Self::try_from_descriptor(version, root).expect("valid schema descriptor")
+    pub fn from_descriptor(descriptor: &AdmittedDescriptor) -> Self {
+        Self::try_from_descriptor(descriptor.version(), descriptor.root())
+            .expect("AdmittedDescriptor is guaranteed valid by construction")
     }
 
     /// Returns reference to 32-byte hash digest.
@@ -929,7 +929,10 @@ pub trait PardosaSchema: Sized {
 
     /// Derives schema identity.
     fn schema_identity() -> SchemaIdentity {
-        SchemaIdentity::from_descriptor(Self::schema_version(), &Self::schema_descriptor())
+        let desc = SchemaDescriptor::new(Self::schema_version(), Self::schema_descriptor());
+        let admitted = AdmittedDescriptor::try_from_descriptor(desc)
+            .expect("PardosaSchema must produce a valid schema descriptor");
+        SchemaIdentity::from_descriptor(&admitted)
     }
 
     /// Encodes this payload into wire bytes.
@@ -1617,7 +1620,27 @@ mod tests {
 
         let valid_node = DescriptorNode::U64;
         let identity = SchemaIdentity::try_from_descriptor(1, &valid_node).unwrap();
-        assert_eq!(identity, SchemaIdentity::from_descriptor(1, &valid_node));
+        let admitted =
+            AdmittedDescriptor::try_from_descriptor(SchemaDescriptor::new(1, valid_node)).unwrap();
+        assert_eq!(identity, SchemaIdentity::from_descriptor(&admitted));
+    }
+
+    #[test]
+    fn test_schema_identity_eliminates_panics_on_depth_exceeded() {
+        let mut deep_node = DescriptorNode::U32;
+        for _ in 0..65 {
+            deep_node = DescriptorNode::Option {
+                inner: Box::new(deep_node),
+            };
+        }
+        let deep_desc = SchemaDescriptor::new(1, deep_node);
+        let err = AdmittedDescriptor::try_from_descriptor(deep_desc).unwrap_err();
+        assert_eq!(
+            *err.condition(),
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong
+            }
+        );
     }
 
     #[test]

@@ -174,8 +174,9 @@ fn test_m7_symmetric_schema_completeness() {
     let claim = sample_claim(1);
 
     let mut file_writer = file_adapter.create(&claim).expect("create file writer");
+    let admitted_schema = AdmittedDescriptor::try_from_descriptor(valid_schema.clone()).unwrap();
     file_writer
-        .set_schema_descriptor(&valid_schema)
+        .set_schema_descriptor(&admitted_schema)
         .expect("set schema file");
     drop(file_writer);
 
@@ -190,7 +191,7 @@ fn test_m7_symmetric_schema_completeness() {
 
     let mut nats_writer = nats_adapter.create(&claim).expect("create nats writer");
     nats_writer
-        .set_schema_descriptor(&valid_schema)
+        .set_schema_descriptor(&admitted_schema)
         .expect("set schema nats");
     drop(nats_writer);
 
@@ -402,12 +403,15 @@ fn test_m7_dimension_1_concurrent_create_and_incomplete_creation() {
 
     let file_incomplete_path = dir.path().join("incomplete_file");
     let file_incomplete_adapter = FileStorageAdapter::new(&file_incomplete_path);
-    assert_eq!(file_incomplete_adapter.presence(), ArtefactPresence::None);
+    assert_eq!(
+        file_incomplete_adapter.try_presence().unwrap(),
+        ArtefactPresence::None
+    );
     file_incomplete_adapter
         .create_incomplete_meta_only(&claim)
         .expect("create file meta-only");
     assert_eq!(
-        file_incomplete_adapter.presence(),
+        file_incomplete_adapter.try_presence().unwrap(),
         ArtefactPresence::OwnershipRecordOnly
     );
     let file_reader = file_incomplete_adapter
@@ -420,7 +424,10 @@ fn test_m7_dimension_1_concurrent_create_and_incomplete_creation() {
     let mut file_completed = file_incomplete_adapter
         .complete_creation(&claim)
         .expect("complete file creation");
-    assert_eq!(file_incomplete_adapter.presence(), ArtefactPresence::Both);
+    assert_eq!(
+        file_incomplete_adapter.try_presence().unwrap(),
+        ArtefactPresence::Both
+    );
     file_completed
         .append_raw_frame(b"completed-frame")
         .expect("append after completion");
@@ -434,7 +441,10 @@ fn test_m7_dimension_1_concurrent_create_and_incomplete_creation() {
         .expect("append orphan frame");
     drop(orphan_writer);
     fs::remove_file(orphan_adapter.meta_path()).expect("remove meta to make orphan");
-    assert_eq!(orphan_adapter.presence(), ArtefactPresence::EventDataOnly);
+    assert_eq!(
+        orphan_adapter.try_presence().unwrap(),
+        ArtefactPresence::EventDataOnly
+    );
     let file_orphan_err = orphan_adapter.open_write(1).unwrap_err();
     assert_eq!(
         file_orphan_err.condition(),
@@ -444,12 +454,15 @@ fn test_m7_dimension_1_concurrent_create_and_incomplete_creation() {
     let nats_incomplete_stem = unique_nats_stem("dim1_incomplete_nats");
     let nats_incomplete_adapter =
         NatsStorageAdapter::new(server.url(), &nats_incomplete_stem).expect("connect nats");
-    assert_eq!(nats_incomplete_adapter.presence(), ArtefactPresence::None);
+    assert_eq!(
+        nats_incomplete_adapter.try_presence().unwrap(),
+        ArtefactPresence::None
+    );
     nats_incomplete_adapter
         .create_incomplete_meta_only(&claim)
         .expect("create nats meta-only");
     assert_eq!(
-        nats_incomplete_adapter.presence(),
+        nats_incomplete_adapter.try_presence().unwrap(),
         ArtefactPresence::OwnershipRecordOnly
     );
     let nats_reader = nats_incomplete_adapter
@@ -467,7 +480,10 @@ fn test_m7_dimension_1_concurrent_create_and_incomplete_creation() {
     let mut nats_completed = nats_incomplete_adapter
         .complete_creation(&claim)
         .expect("complete nats creation");
-    assert_eq!(nats_incomplete_adapter.presence(), ArtefactPresence::Both);
+    assert_eq!(
+        nats_incomplete_adapter.try_presence().unwrap(),
+        ArtefactPresence::Both
+    );
     nats_completed
         .append_raw_frame(b"completed-frame")
         .expect("append after completion");
@@ -505,7 +521,7 @@ fn test_m7_dimension_2_overlapping_writers_and_epoch_fencing() {
         .expect("append 1");
     let claim2 = sample_claim(2);
     file_adapter
-        .record_ownership_claim(&claim2)
+        .record_ownership_claim_for_test(&claim2)
         .expect("supersede file claim");
     let file_stale_err = file_writer1.append_raw_frame(b"file-frame-2").unwrap_err();
     assert_eq!(file_stale_err.condition(), &FailureCondition::StaleEpoch);
@@ -527,7 +543,7 @@ fn test_m7_dimension_2_overlapping_writers_and_epoch_fencing() {
     );
 
     nats_adapter
-        .record_ownership_claim(&claim2)
+        .record_ownership_claim_for_test(&claim2)
         .expect("supersede nats claim");
     let nats_stale_err = nats_writer1.append_raw_frame(b"nats-frame-3").unwrap_err();
     assert_eq!(nats_stale_err.condition(), &FailureCondition::StaleEpoch);
@@ -621,7 +637,7 @@ fn test_m7_dimension_4_migration_cutover_and_permanent_source_retirement() {
         cutover_epoch: 1,
     };
     file_source
-        .record_outbound_pointer(&outbound)
+        .record_outbound_pointer_for_test(&outbound)
         .expect("retire file source");
 
     assert!(file_source.is_retired_source().expect("query retired"));
@@ -662,7 +678,7 @@ fn test_m7_dimension_4_migration_cutover_and_permanent_source_retirement() {
         cutover_epoch: 1,
     };
     nats_source
-        .record_outbound_pointer(&nats_outbound)
+        .record_outbound_pointer_for_test(&nats_outbound)
         .expect("retire nats source");
 
     assert!(nats_source.is_retired_source().expect("query retired"));
@@ -704,7 +720,7 @@ fn test_m7_dimension_4_migration_cutover_and_permanent_source_retirement() {
         FailureCondition::InvariantBreakingConfiguration
     );
     cross_fn_file_src
-        .record_outbound_pointer(&OutboundPointerRecord {
+        .record_outbound_pointer_for_test(&OutboundPointerRecord {
             next_generation_locator_id: cross_fn_nats_dst.locator_id(),
             cutover_epoch: 1,
         })
@@ -732,7 +748,7 @@ fn test_m7_dimension_4_migration_cutover_and_permanent_source_retirement() {
         FailureCondition::InvariantBreakingConfiguration
     );
     cross_nf_nats_src
-        .record_outbound_pointer(&OutboundPointerRecord {
+        .record_outbound_pointer_for_test(&OutboundPointerRecord {
             next_generation_locator_id: cross_nf_file_dst.locator_id(),
             cutover_epoch: 1,
         })
@@ -773,7 +789,7 @@ fn test_m7_dimension_5_partial_target_reads_and_superseded_generation() {
         FailureCondition::InvariantBreakingConfiguration
     );
     file_src
-        .record_outbound_pointer(&OutboundPointerRecord {
+        .record_outbound_pointer_for_test(&OutboundPointerRecord {
             next_generation_locator_id: file_target.locator_id(),
             cutover_epoch: 1,
         })
@@ -813,7 +829,7 @@ fn test_m7_dimension_5_partial_target_reads_and_superseded_generation() {
         FailureCondition::InvariantBreakingConfiguration
     );
     nats_src
-        .record_outbound_pointer(&OutboundPointerRecord {
+        .record_outbound_pointer_for_test(&OutboundPointerRecord {
             next_generation_locator_id: nats_target.locator_id(),
             cutover_epoch: 1,
         })
@@ -941,7 +957,9 @@ fn test_m7_dimension_7_chain_breaks_and_mismatch_refusal() {
         },
         payload: b"broken_event".to_vec(),
     };
-    file_writer.append_envelope(&env1).expect("append env1");
+    file_writer
+        .append_envelope_verdict(&env1)
+        .expect("append env1");
     let mut broken_buf = Vec::new();
     broken_env.encode(&mut broken_buf);
     file_writer
@@ -1121,8 +1139,12 @@ fn test_m7_strict_cross_adapter_error_condition_parity() {
 
     let initial_env = sample_genesis_envelope(1, 0x10, b"initial_event");
     let mut nats_writer2 = nats_adapter.open_write(1).expect("open write 2");
-    let _ = nats_writer.append_envelope(&initial_env).expect("append 1");
-    let nats_err_conflict = nats_writer2.append_envelope(&initial_env).unwrap_err();
+    let _ = nats_writer
+        .append_envelope_verdict(&initial_env)
+        .expect("append 1");
+    let nats_err_conflict = nats_writer2
+        .append_envelope_verdict(&initial_env)
+        .unwrap_err();
     assert_eq!(
         nats_err_conflict.condition(),
         &FailureCondition::ConcurrencyConflict
@@ -1137,17 +1159,21 @@ fn test_m7_strict_cross_adapter_error_condition_parity() {
     assert_eq!(cas_conflict.condition(), nats_err_conflict.condition());
 
     file_writer
-        .append_envelope(&initial_env)
+        .append_envelope_verdict(&initial_env)
         .expect("append initial file env");
     file_adapter
-        .record_ownership_claim(&claim2)
+        .record_ownership_claim_for_test(&claim2)
         .expect("supersede file claim");
     nats_adapter
-        .record_ownership_claim(&claim2)
+        .record_ownership_claim_for_test(&claim2)
         .expect("supersede nats claim");
 
-    let file_err_stale = file_writer.append_envelope(&initial_env).unwrap_err();
-    let nats_err_stale = nats_writer.append_envelope(&initial_env).unwrap_err();
+    let file_err_stale = file_writer
+        .append_envelope_verdict(&initial_env)
+        .unwrap_err();
+    let nats_err_stale = nats_writer
+        .append_envelope_verdict(&initial_env)
+        .unwrap_err();
     assert_eq!(file_err_stale.condition(), &FailureCondition::StaleEpoch);
     assert_eq!(nats_err_stale.condition(), &FailureCondition::StaleEpoch);
     assert_eq!(file_err_stale.condition(), nats_err_stale.condition());
@@ -1216,13 +1242,13 @@ fn test_m7_strict_cross_adapter_error_condition_parity() {
         .expect("create clean nats");
 
     file_adapter
-        .record_outbound_pointer(&OutboundPointerRecord {
+        .record_outbound_pointer_for_test(&OutboundPointerRecord {
             next_generation_locator_id: clean_target_file.locator_id(),
             cutover_epoch: 2,
         })
         .expect("retire file");
     nats_adapter
-        .record_outbound_pointer(&OutboundPointerRecord {
+        .record_outbound_pointer_for_test(&OutboundPointerRecord {
             next_generation_locator_id: clean_target_nats.locator_id(),
             cutover_epoch: 2,
         })
@@ -1342,14 +1368,18 @@ fn test_m7_clean_cancellation_and_shutdown_lock_release() {
 
     let file_adapter = FileStorageAdapter::new(dir.path().join("shutdown_file"));
     let mut file_writer_1 = file_adapter.create(&claim).expect("create file writer 1");
-    file_writer_1.append_frame(&buf1).expect("append frame 1");
+    file_writer_1
+        .append_frame_verdict(&buf1)
+        .expect("append frame 1");
     let file_comm_1 = file_writer_1.rolling_commitment().current_commitment();
     drop(file_writer_1);
 
     let mut file_writer_2 = file_adapter
         .open_write(1)
         .expect("open file writer 2 after writer 1 drop");
-    file_writer_2.append_frame(&buf2).expect("append frame 2");
+    file_writer_2
+        .append_frame_verdict(&buf2)
+        .expect("append frame 2");
     drop(file_writer_2);
 
     let mut file_reader = file_adapter.open_read().expect("open file reader");
@@ -1361,7 +1391,9 @@ fn test_m7_clean_cancellation_and_shutdown_lock_release() {
     let nats_stem = unique_nats_stem("shutdown_nats");
     let nats_adapter = NatsStorageAdapter::new(server.url(), &nats_stem).expect("connect nats");
     let mut nats_writer_1 = nats_adapter.create(&claim).expect("create nats writer 1");
-    nats_writer_1.append_frame(&buf1).expect("append frame 1");
+    nats_writer_1
+        .append_frame_verdict(&buf1)
+        .expect("append frame 1");
     let nats_comm_1 = nats_writer_1.rolling_commitment().current_commitment();
     assert_eq!(file_comm_1, nats_comm_1);
     drop(nats_writer_1);
@@ -1369,7 +1401,9 @@ fn test_m7_clean_cancellation_and_shutdown_lock_release() {
     let mut nats_writer_2 = nats_adapter
         .open_write(1)
         .expect("open nats writer 2 after writer 1 drop");
-    nats_writer_2.append_frame(&buf2).expect("append frame 2");
+    nats_writer_2
+        .append_frame_verdict(&buf2)
+        .expect("append frame 2");
     drop(nats_writer_2);
 
     let mut nats_reader = nats_adapter.open_read().expect("open nats reader");

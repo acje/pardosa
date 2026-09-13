@@ -4,7 +4,7 @@ use crate::encoding::{
     InboundPointerRecord, MigrationEndRecord, MigrationStartRecord, OutboundPointerRecord,
     OwnershipClaimRecord, OwnershipRecord, RescuePolicyChoiceRecord,
 };
-use crate::schema::SchemaDescriptor;
+use crate::schema::{AdmittedDescriptor, SchemaDescriptor};
 use crate::store::{OpenAdmission, OperationFailure, WriteLandingVerdict};
 
 /// Callback invoked for each recovered frame during incremental recovery.
@@ -158,7 +158,7 @@ pub trait StorageEngine {
     /// Returns [`OperationFailure`] if writing descriptor fails.
     fn set_schema_descriptor(
         &mut self,
-        descriptor: &SchemaDescriptor,
+        descriptor: &AdmittedDescriptor,
     ) -> Result<(), OperationFailure>;
 
     /// Records an ownership record into metadata.

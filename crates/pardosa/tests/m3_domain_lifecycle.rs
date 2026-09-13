@@ -1057,7 +1057,7 @@ fn test_compile_fail_and_positive_controls_external_boundary() {
 
     let file_reader_set_schema_code = r#"
         use pardosa::prelude::*;
-        pub fn run_invalid(mut reader: FileReaderSession, desc: &SchemaDescriptor) {
+        pub fn run_invalid(mut reader: FileReaderSession, desc: &AdmittedDescriptor) {
             let _ = reader.set_schema_descriptor(desc);
         }
     "#;
@@ -1093,14 +1093,116 @@ fn test_compile_fail_and_positive_controls_external_boundary() {
         "rejection must be missing DerefMut or missing method: {reader_meta_stderr}"
     );
 
+    let file_writer_append_envelope_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_invalid(mut writer: FileWriterSession, env: &EventEnvelope) {
+            let _ = writer.append_envelope(env);
+        }
+    "#;
+    let (writer_env_ok, writer_env_stderr) = run_rustc(file_writer_append_envelope_code);
+    assert!(
+        !writer_env_ok,
+        "FileWriterSession must not expose lossy append_envelope"
+    );
+    assert!(
+        writer_env_stderr.contains("no method named `append_envelope`")
+            || writer_env_stderr.contains("E0599"),
+        "rejection must be missing append_envelope: {writer_env_stderr}"
+    );
+
+    let file_writer_append_frame_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_invalid(mut writer: FileWriterSession) {
+            let _ = writer.append_frame(b"payload");
+        }
+    "#;
+    let (writer_frame_ok, writer_frame_stderr) = run_rustc(file_writer_append_frame_code);
+    assert!(
+        !writer_frame_ok,
+        "FileWriterSession must not expose lossy append_frame"
+    );
+    assert!(
+        writer_frame_stderr.contains("no method named `append_frame`")
+            || writer_frame_stderr.contains("E0599"),
+        "rejection must be missing append_frame: {writer_frame_stderr}"
+    );
+
+    let file_writer_append_frame_raw_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_invalid(mut writer: FileWriterSession) {
+            let _ = writer.append_frame_raw(b"payload");
+        }
+    "#;
+    let (writer_raw_ok, writer_raw_stderr) = run_rustc(file_writer_append_frame_raw_code);
+    assert!(
+        !writer_raw_ok,
+        "FileWriterSession must not expose lossy append_frame_raw"
+    );
+    assert!(
+        writer_raw_stderr.contains("no method named `append_frame_raw`")
+            || writer_raw_stderr.contains("E0599"),
+        "rejection must be missing append_frame_raw: {writer_raw_stderr}"
+    );
+
+    let file_writer_meta_record_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_invalid(mut writer: FileWriterSession, record: &OwnershipRecord) {
+            let _ = writer.record_meta_record(record);
+        }
+    "#;
+    let (writer_meta_ok, writer_meta_stderr) = run_rustc(file_writer_meta_record_code);
+    assert!(
+        !writer_meta_ok,
+        "FileWriterSession must not expose runtime record_meta_record in production"
+    );
+    assert!(
+        writer_meta_stderr.contains("no method named `record_meta_record`")
+            || writer_meta_stderr.contains("E0599"),
+        "rejection must be missing record_meta_record: {writer_meta_stderr}"
+    );
+
+    let file_adapter_meta_record_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_invalid(adapter: &FileStorageAdapter, record: &OwnershipRecord) {
+            let _ = adapter.record_meta_record(record);
+        }
+    "#;
+    let (adapter_meta_ok, adapter_meta_stderr) = run_rustc(file_adapter_meta_record_code);
+    assert!(
+        !adapter_meta_ok,
+        "FileStorageAdapter must not expose public record_meta_record in production"
+    );
+    assert!(
+        adapter_meta_stderr.contains("no method named `record_meta_record`")
+            || adapter_meta_stderr.contains("E0599"),
+        "rejection must be missing record_meta_record: {adapter_meta_stderr}"
+    );
+
+    let file_adapter_presence_lossy_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_invalid(adapter: &FileStorageAdapter) {
+            let _ = adapter.presence();
+        }
+    "#;
+    let (adapter_pres_ok, adapter_pres_stderr) = run_rustc(file_adapter_presence_lossy_code);
+    assert!(
+        !adapter_pres_ok,
+        "FileStorageAdapter must not expose lossy presence() method"
+    );
+    assert!(
+        adapter_pres_stderr.contains("no method named `presence`")
+            || adapter_pres_stderr.contains("E0599"),
+        "rejection must be missing presence: {adapter_pres_stderr}"
+    );
+
     let file_writer_mutation_positive_code = r#"
         use pardosa::prelude::*;
-        pub fn run_valid(mut writer: FileWriterSession, env: &EventEnvelope, desc: &SchemaDescriptor, record: &OwnershipRecord) {
-            let _ = writer.append_envelope(env);
+        pub fn run_valid(mut writer: FileWriterSession, env: &EventEnvelope, desc: &AdmittedDescriptor, adapter: &FileStorageAdapter) {
+            let _ = writer.append_envelope_verdict(env);
             let _ = writer.set_schema_descriptor(desc);
-            let _ = writer.record_meta_record(record);
             let _claim: &OwnershipClaimRecord = writer.claim();
             let _ = writer.release_exclusion();
+            let _ = adapter.try_presence();
         }
     "#;
     let (writer_mut_ok, writer_mut_stderr) = run_rustc(file_writer_mutation_positive_code);
@@ -1159,9 +1261,9 @@ fn test_compile_fail_and_positive_controls_external_boundary() {
 
     let file_writer_reuse_after_release_code = r#"
         use pardosa::prelude::*;
-        pub fn run_invalid(writer: FileWriterSession, env: &EventEnvelope) {
+        pub fn run_invalid(mut writer: FileWriterSession, env: &EventEnvelope) {
             let _ = writer.release_exclusion();
-            let _ = writer.append_envelope(env);
+            let _ = writer.append_envelope_verdict(env);
         }
     "#;
     let (fw_reuse_ok, fw_reuse_stderr) = run_rustc(file_writer_reuse_after_release_code);
@@ -1596,7 +1698,7 @@ impl StorageEngine for MockEngine {
 
     fn set_schema_descriptor(
         &mut self,
-        _descriptor: &SchemaDescriptor,
+        _descriptor: &AdmittedDescriptor,
     ) -> Result<(), OperationFailure> {
         Ok(())
     }
@@ -1655,13 +1757,14 @@ fn test_c5_12_and_c5_16_landing_verdicts() {
         ..Default::default()
     })
     .expect("store open");
-    let env_err = store_undet_env.append_envelope(&e1).unwrap_err();
-    assert_ne!(
-        *env_err.condition(),
-        FailureCondition::OwnershipRecordUnreadable
+    let v_undet_env = store_undet_env
+        .append_envelope_verdict(&e1)
+        .expect("verdict undet");
+    assert_eq!(
+        v_undet_env,
+        WriteLandingVerdict::Undetermined { carried_epoch: 42 }
     );
-    assert_eq!(*env_err.condition(), FailureCondition::TransportUnavailable);
-    assert!(env_err.to_string().contains("write landing undetermined"));
+    assert!(store_undet_env.uncertain_diagnostic().is_some());
 
     let mut store_fail = Store::open_writer(MockEngine {
         fail_at_block: Some(0),

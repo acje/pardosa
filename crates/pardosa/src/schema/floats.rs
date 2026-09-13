@@ -750,12 +750,28 @@ mod tests {
         let event_f64_desc = <EventF64 as PardosaType>::descriptor_node();
         assert_ne!(ordered_f64_desc, event_f64_desc);
 
-        let id_ord32 = crate::schema::SchemaIdentity::from_descriptor(1, &ordered_f32_desc);
-        let id_evt32 = crate::schema::SchemaIdentity::from_descriptor(1, &event_f32_desc);
+        let desc_ord32 = crate::schema::AdmittedDescriptor::try_from_descriptor(
+            crate::schema::SchemaDescriptor::new(1, ordered_f32_desc),
+        )
+        .unwrap();
+        let id_ord32 = crate::schema::SchemaIdentity::from_descriptor(&desc_ord32);
+        let desc_evt32 = crate::schema::AdmittedDescriptor::try_from_descriptor(
+            crate::schema::SchemaDescriptor::new(1, event_f32_desc),
+        )
+        .unwrap();
+        let id_evt32 = crate::schema::SchemaIdentity::from_descriptor(&desc_evt32);
         assert_ne!(id_ord32, id_evt32);
 
-        let id_ord64 = crate::schema::SchemaIdentity::from_descriptor(1, &ordered_f64_desc);
-        let id_evt64 = crate::schema::SchemaIdentity::from_descriptor(1, &event_f64_desc);
+        let desc_ord64 = crate::schema::AdmittedDescriptor::try_from_descriptor(
+            crate::schema::SchemaDescriptor::new(1, ordered_f64_desc),
+        )
+        .unwrap();
+        let id_ord64 = crate::schema::SchemaIdentity::from_descriptor(&desc_ord64);
+        let desc_evt64 = crate::schema::AdmittedDescriptor::try_from_descriptor(
+            crate::schema::SchemaDescriptor::new(1, event_f64_desc),
+        )
+        .unwrap();
+        let id_evt64 = crate::schema::SchemaIdentity::from_descriptor(&desc_evt64);
         assert_ne!(id_ord64, id_evt64);
 
         let mut nan32_wire = Vec::new();

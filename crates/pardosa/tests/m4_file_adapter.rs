@@ -78,11 +78,11 @@ fn test_m4_strict_create_and_refuse_existing() {
     assert_eq!(adapter.stem(), "demo_store");
     assert_eq!(adapter.meta_path(), store_path.with_extension("meta"));
     assert_eq!(adapter.pgno_path(), store_path.with_extension("pgno"));
-    assert_eq!(adapter.presence(), ArtefactPresence::None);
+    assert_eq!(adapter.try_presence().unwrap(), ArtefactPresence::None);
 
     let claim = sample_claim(1);
     let mut writer = adapter.create(&claim).expect("create should succeed");
-    assert_eq!(adapter.presence(), ArtefactPresence::Both);
+    assert_eq!(adapter.try_presence().unwrap(), ArtefactPresence::Both);
     assert_eq!(writer.carried_epoch(), 1);
     assert_eq!(writer.rolling_commitment().frame_count(), 0);
 
@@ -227,7 +227,10 @@ fn test_m4_incomplete_creation_and_orphan() {
     adapter
         .create_incomplete_meta_only(&claim)
         .expect("create incomplete meta only");
-    assert_eq!(adapter.presence(), ArtefactPresence::OwnershipRecordOnly);
+    assert_eq!(
+        adapter.try_presence().unwrap(),
+        ArtefactPresence::OwnershipRecordOnly
+    );
 
     let reader = adapter
         .open_read()
@@ -240,7 +243,7 @@ fn test_m4_incomplete_creation_and_orphan() {
     let mut writer = adapter
         .complete_creation(&claim)
         .expect("complete creation");
-    assert_eq!(adapter.presence(), ArtefactPresence::Both);
+    assert_eq!(adapter.try_presence().unwrap(), ArtefactPresence::Both);
     writer
         .append_raw_frame(b"after-completion")
         .expect("append after completion");
@@ -255,7 +258,10 @@ fn test_m4_incomplete_creation_and_orphan() {
     drop(orphan_writer);
 
     fs::remove_file(orphan_adapter.meta_path()).expect("remove meta to make orphan");
-    assert_eq!(orphan_adapter.presence(), ArtefactPresence::EventDataOnly);
+    assert_eq!(
+        orphan_adapter.try_presence().unwrap(),
+        ArtefactPresence::EventDataOnly
+    );
 
     let write_err = orphan_adapter.open_write(1).unwrap_err();
     assert_eq!(
@@ -286,7 +292,7 @@ fn test_m4_per_landing_epoch_verification() {
 
     let claim2 = sample_claim(2);
     adapter
-        .record_ownership_claim(&claim2)
+        .record_ownership_claim_for_test(&claim2)
         .expect("superseding claim in meta");
 
     let stale_err = writer
@@ -438,8 +444,9 @@ fn test_m4_c8_2_schema_structural_completeness() {
     let claim = sample_claim(1);
 
     let mut writer = adapter.create(&claim).expect("create writer");
+    let admitted = AdmittedDescriptor::try_from_descriptor(valid_schema.clone()).unwrap();
     writer
-        .set_schema_descriptor(&valid_schema)
+        .set_schema_descriptor(&admitted)
         .expect("set schema descriptor");
     drop(writer);
 
@@ -506,14 +513,16 @@ fn test_m4_adapter_retirement_and_generation_records() {
         },
         payload: b"sample payload".to_vec(),
     };
-    writer.append_envelope(&env).expect("append envelope");
+    writer
+        .append_envelope_verdict(&env)
+        .expect("append envelope");
 
     let outbound = OutboundPointerRecord {
         next_generation_locator_id: [42u8; 16],
         cutover_epoch: 1,
     };
     adapter
-        .record_outbound_pointer(&outbound)
+        .record_outbound_pointer_for_test(&outbound)
         .expect("record outbound pointer");
 
     let err_new_writer = adapter
@@ -525,7 +534,7 @@ fn test_m4_adapter_retirement_and_generation_records() {
     );
 
     let err_append = writer
-        .append_envelope(&env)
+        .append_envelope_verdict(&env)
         .expect_err("existing writer append must be rejected");
     assert_eq!(
         *err_append.condition(),

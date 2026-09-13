@@ -772,13 +772,6 @@ impl NatsStorageAdapter {
         })
     }
 
-    /// Returns the presence of artefact streams in JetStream per C5.10.
-    #[deprecated(note = "lossy presence folds errors into None per AGENTS.md; use try_presence")]
-    #[must_use]
-    pub fn presence(&self) -> ArtefactPresence {
-        self.try_presence().unwrap_or(ArtefactPresence::None)
-    }
-
     /// Creates the artefact streams exclusively with initial ownership claim per C5.10, C5.64, and C12.3.
     ///
     /// # Errors
@@ -1517,7 +1510,7 @@ impl NatsStorageAdapter {
     ///
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_ownership_record(
+    pub(crate) fn record_ownership_record_internal(
         &self,
         record: &OwnershipRecord,
     ) -> Result<(), OperationFailure> {
@@ -1570,67 +1563,83 @@ impl NatsStorageAdapter {
         })
     }
 
-    /// Appends an updated ownership claim record to the meta stream.
+    /// Records an arbitrary ownership record into metadata for test support.
     ///
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_ownership_claim(
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    pub fn record_meta_record_for_test(
+        &self,
+        record: &OwnershipRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_ownership_record_internal(record)
+    }
+
+    /// Records an arbitrary ownership record into metadata for test support.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    pub fn record_ownership_record(
+        &self,
+        record: &OwnershipRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_ownership_record_internal(record)
+    }
+
+    /// Appends an updated ownership claim record to the meta stream for test support.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    pub fn record_ownership_claim_for_test(
         &self,
         claim: &OwnershipClaimRecord,
     ) -> Result<(), OperationFailure> {
-        self.record_ownership_record(&OwnershipRecord::OwnershipClaim(claim.clone()))
+        self.record_ownership_record_internal(&OwnershipRecord::OwnershipClaim(claim.clone()))
     }
 
-    /// Appends an outbound generation pointer record to the meta stream per C6.17 and C5.63.
+    /// Appends an outbound generation pointer record to the meta stream for test support.
     ///
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_outbound_pointer(
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    pub fn record_outbound_pointer_for_test(
         &self,
         pointer: &OutboundPointerRecord,
     ) -> Result<(), OperationFailure> {
-        self.record_ownership_record(&OwnershipRecord::OutboundPointer(pointer.clone()))
+        self.record_ownership_record_internal(&OwnershipRecord::OutboundPointer(pointer.clone()))
     }
 
-    /// Appends an inbound generation pointer record to the meta stream per C6.16.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_inbound_pointer(
+    pub(crate) fn record_inbound_pointer(
         &self,
         pointer: &InboundPointerRecord,
     ) -> Result<(), OperationFailure> {
-        self.record_ownership_record(&OwnershipRecord::InboundPointer(pointer.clone()))
+        self.record_ownership_record_internal(&OwnershipRecord::InboundPointer(pointer.clone()))
     }
 
-    /// Appends a migration start record to the meta stream per C4.13.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_migration_start(
+    #[allow(dead_code)]
+    pub(crate) fn record_migration_start(
         &self,
         start: &MigrationStartRecord,
     ) -> Result<(), OperationFailure> {
-        self.record_ownership_record(&OwnershipRecord::MigrationStart(start.clone()))
+        self.record_ownership_record_internal(&OwnershipRecord::MigrationStart(start.clone()))
     }
 
-    /// Appends a migration end record to the meta stream per C4.13.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_migration_end(&self, end: &MigrationEndRecord) -> Result<(), OperationFailure> {
-        self.record_ownership_record(&OwnershipRecord::MigrationEnd(end.clone()))
+    #[allow(dead_code)]
+    pub(crate) fn record_migration_end(
+        &self,
+        end: &MigrationEndRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_ownership_record_internal(&OwnershipRecord::MigrationEnd(end.clone()))
     }
 
-    /// Appends a rescue policy choice record to the meta stream per C4.13.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_rescue_policy_choice(
+    #[allow(dead_code)]
+    pub(crate) fn record_rescue_policy_choice(
         &self,
         choice: &RescuePolicyChoiceRecord,
     ) -> Result<(), OperationFailure> {
-        self.record_ownership_record(&OwnershipRecord::RescuePolicyChoice(choice.clone()))
+        self.record_ownership_record_internal(&OwnershipRecord::RescuePolicyChoice(choice.clone()))
     }
 
     /// Queries the outbound generation pointer if present.
@@ -2123,11 +2132,11 @@ impl StorageEngine for NatsEngine {
 
     fn set_schema_descriptor(
         &mut self,
-        descriptor: &SchemaDescriptor,
+        descriptor: &AdmittedDescriptor,
     ) -> Result<(), OperationFailure> {
         self.check_authority()?;
         if let Some(existing) = self.meta_records.schema_descriptor.as_ref() {
-            if existing == descriptor {
+            if existing == descriptor.descriptor() {
                 return Ok(());
             }
             return Err(OperationFailure::new(
@@ -2143,7 +2152,7 @@ impl StorageEngine for NatsEngine {
         }
         let mut descriptor_bytes = Vec::new();
         descriptor
-            .root
+            .root()
             .encode(&mut descriptor_bytes)
             .map_err(|err| {
                 OperationFailure::new(
@@ -2154,7 +2163,7 @@ impl StorageEngine for NatsEngine {
                 )
             })?;
         let record = OwnershipRecord::SchemaDescriptor {
-            schema_version: descriptor.version,
+            schema_version: descriptor.version(),
             descriptor_bytes,
         };
         self.record_meta_record(&record)
@@ -2388,15 +2397,28 @@ impl NatsWriterSession {
         self
     }
 
-    /// Records an arbitrary ownership record into metadata.
+    /// Records an arbitrary ownership record into metadata for test support.
     ///
     /// # Errors
-    /// Returns [`OperationFailure`] if recording fails.
+    /// Returns [`OperationFailure`] if authority verification or recording fails.
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    pub fn record_meta_record_for_test(
+        &mut self,
+        record: &OwnershipRecord,
+    ) -> Result<(), OperationFailure> {
+        self.store.record_meta_record_for_test(record)
+    }
+
+    /// Records an arbitrary ownership record into metadata for test support.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if authority verification or recording fails.
+    #[cfg(any(test, feature = "unstable-test-support"))]
     pub fn record_ownership_record(
         &mut self,
         record: &OwnershipRecord,
     ) -> Result<(), OperationFailure> {
-        self.store.record_meta_record(record)
+        self.store.record_meta_record_for_test(record)
     }
 
     /// Reads a single raw block at the specified sequence or index from the data stream.
@@ -2522,11 +2544,11 @@ impl MigrationSource for NatsStorageAdapter {
         &self,
         pointer: &OutboundPointerRecord,
     ) -> Result<(), OperationFailure> {
-        self.record_outbound_pointer(pointer)
+        self.record_ownership_record_internal(&OwnershipRecord::OutboundPointer(pointer.clone()))
     }
 
     fn record_meta(&self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
-        self.record_ownership_record(record)
+        self.record_ownership_record_internal(record)
     }
 
     fn read_meta(&self) -> Result<MetaRecords, OperationFailure> {
@@ -2563,7 +2585,7 @@ impl MigrationTarget for NatsStorageAdapter {
     }
 
     fn record_meta(&self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
-        self.record_ownership_record(record)
+        self.record_ownership_record_internal(record)
     }
 
     fn set_schema_descriptor(
@@ -2572,7 +2594,8 @@ impl MigrationTarget for NatsStorageAdapter {
     ) -> Result<(), OperationFailure> {
         let epoch = self.current_epoch()?;
         let mut writer = self.open_write(epoch)?;
-        writer.set_schema_descriptor(descriptor)
+        let admitted = AdmittedDescriptor::try_from_descriptor(descriptor.clone())?;
+        writer.set_schema_descriptor(&admitted)
     }
 }
 

@@ -5,7 +5,7 @@ use crate::encoding::{
     MigrationStartRecord, OutboundPointerRecord, OwnershipClaimRecord, OwnershipRecord,
     RescuePolicyChoiceRecord, ValueConstraint,
 };
-use crate::schema::{DescriptorNode, SchemaDescriptor};
+use crate::schema::{AdmittedDescriptor, DescriptorNode, SchemaDescriptor};
 use crate::store::{
     admit_create, admit_open, ArtefactPresence, FailureCondition, OpenAdmission, OperationFailure,
     StorageEngine, Store, WriteLandingVerdict,
@@ -590,14 +590,34 @@ impl FileStorageAdapter {
     }
 
     /// Returns the presence of artefact components in storage per C5.10.
-    #[must_use]
-    pub fn presence(&self) -> ArtefactPresence {
-        match (self.meta_path.exists(), self.pgno_path.exists()) {
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if checking files fails.
+    pub fn try_presence(&self) -> Result<ArtefactPresence, OperationFailure> {
+        let meta_exists = self.meta_path.try_exists().map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                format!(
+                    "failed to check existence of meta file {}: {err}",
+                    self.meta_path.display()
+                ),
+            )
+        })?;
+        let pgno_exists = self.pgno_path.try_exists().map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                format!(
+                    "failed to check existence of pgno file {}: {err}",
+                    self.pgno_path.display()
+                ),
+            )
+        })?;
+        Ok(match (meta_exists, pgno_exists) {
             (false, false) => ArtefactPresence::None,
             (true, false) => ArtefactPresence::OwnershipRecordOnly,
             (false, true) => ArtefactPresence::EventDataOnly,
             (true, true) => ArtefactPresence::Both,
-        }
+        })
     }
 
     /// Creates the artefact files exclusively with initial ownership claim per C5.10, C5.64, and C12.3.
@@ -610,7 +630,7 @@ impl FileStorageAdapter {
         &self,
         initial_claim: &OwnershipClaimRecord,
     ) -> Result<FileWriterSession, OperationFailure> {
-        admit_create(self.presence())?;
+        admit_create(self.try_presence()?)?;
         let mut meta_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -774,7 +794,7 @@ impl FileStorageAdapter {
         &self,
         claim: &OwnershipClaimRecord,
     ) -> Result<FileWriterSession, OperationFailure> {
-        let presence = self.presence();
+        let presence = self.try_presence()?;
         if presence != ArtefactPresence::OwnershipRecordOnly {
             return Err(OperationFailure::new(
                 FailureCondition::StoreAlreadyExists,
@@ -856,7 +876,7 @@ impl FileStorageAdapter {
     /// Returns [`OperationFailure`] with [`FailureCondition::AnotherOwnerHoldsExclusion`] if lock is held.
     /// Returns [`OperationFailure`] with [`FailureCondition::ExclusionUnavailable`] if lock unsupported.
     pub fn open_write(&self, carried_epoch: u64) -> Result<FileWriterSession, OperationFailure> {
-        match self.presence() {
+        match self.try_presence()? {
             ArtefactPresence::None => {
                 return Err(OperationFailure::new(
                     FailureCondition::NoArtefactExists,
@@ -968,7 +988,7 @@ impl FileStorageAdapter {
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::NoArtefactExists`] if artefact is missing.
     pub fn open_read(&self) -> Result<FileReaderSession, OperationFailure> {
-        let presence = self.presence();
+        let presence = self.try_presence()?;
         if presence == ArtefactPresence::None {
             return Err(OperationFailure::new(
                 FailureCondition::NoArtefactExists,
@@ -1039,75 +1059,78 @@ impl FileStorageAdapter {
         read_meta_records(&self.meta_path)
     }
 
-    /// Appends an arbitrary ownership record to the .meta file.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_meta_record(&self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
+    pub(crate) fn record_meta_record_internal(
+        &self,
+        record: &OwnershipRecord,
+    ) -> Result<(), OperationFailure> {
         append_meta_record(&self.meta_path, record).map_err(MetaWriteError::into_failure)
     }
 
-    /// Appends an updated ownership claim record to the .meta file.
+    /// Appends an arbitrary ownership record to the .meta file for test support.
     ///
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_ownership_claim(
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    pub fn record_meta_record_for_test(
+        &self,
+        record: &OwnershipRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_meta_record_internal(record)
+    }
+
+    /// Appends an updated ownership claim record to the .meta file for test support.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    pub fn record_ownership_claim_for_test(
         &self,
         claim: &OwnershipClaimRecord,
     ) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::OwnershipClaim(claim.clone()))
+        self.record_meta_record_for_test(&OwnershipRecord::OwnershipClaim(claim.clone()))
     }
 
-    /// Appends an outbound generation pointer record to the .meta file per C6.17 and C5.63.
+    /// Appends an outbound generation pointer record to the .meta file for test support.
     ///
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_outbound_pointer(
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    pub fn record_outbound_pointer_for_test(
         &self,
         pointer: &OutboundPointerRecord,
     ) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::OutboundPointer(pointer.clone()))
+        self.record_meta_record_for_test(&OwnershipRecord::OutboundPointer(pointer.clone()))
     }
 
-    /// Appends an inbound generation pointer record to the .meta file per C6.16.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_inbound_pointer(
+    pub(crate) fn record_inbound_pointer(
         &self,
         pointer: &InboundPointerRecord,
     ) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::InboundPointer(pointer.clone()))
+        self.record_meta_record_internal(&OwnershipRecord::InboundPointer(pointer.clone()))
     }
 
-    /// Appends a migration start record to the .meta file per C4.13.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_migration_start(
+    #[allow(dead_code)]
+    pub(crate) fn record_migration_start(
         &self,
         start: &MigrationStartRecord,
     ) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::MigrationStart(start.clone()))
+        self.record_meta_record_internal(&OwnershipRecord::MigrationStart(start.clone()))
     }
 
-    /// Appends a migration end record to the .meta file per C4.13.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_migration_end(&self, end: &MigrationEndRecord) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::MigrationEnd(end.clone()))
+    #[allow(dead_code)]
+    pub(crate) fn record_migration_end(
+        &self,
+        end: &MigrationEndRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_meta_record_internal(&OwnershipRecord::MigrationEnd(end.clone()))
     }
 
-    /// Appends a rescue policy choice record to the .meta file per C4.13.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_rescue_policy_choice(
+    #[allow(dead_code)]
+    pub(crate) fn record_rescue_policy_choice(
         &self,
         choice: &RescuePolicyChoiceRecord,
     ) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::RescuePolicyChoice(choice.clone()))
+        self.record_meta_record_internal(&OwnershipRecord::RescuePolicyChoice(choice.clone()))
     }
 
     /// Queries the outbound generation pointer if present.
@@ -1455,11 +1478,11 @@ impl StorageEngine for FileEngine {
 
     fn set_schema_descriptor(
         &mut self,
-        descriptor: &SchemaDescriptor,
+        descriptor: &AdmittedDescriptor,
     ) -> Result<(), OperationFailure> {
         self.check_authority()?;
         if let Some(existing) = self.meta_records.schema_descriptor.as_ref() {
-            if existing == descriptor {
+            if existing == descriptor.descriptor() {
                 return Ok(());
             }
             return Err(OperationFailure::new(
@@ -1475,7 +1498,7 @@ impl StorageEngine for FileEngine {
         }
         let mut descriptor_bytes = Vec::new();
         descriptor
-            .root
+            .root()
             .encode(&mut descriptor_bytes)
             .map_err(|err| {
                 OperationFailure::new(
@@ -1486,7 +1509,7 @@ impl StorageEngine for FileEngine {
                 )
             })?;
         let record = OwnershipRecord::SchemaDescriptor {
-            schema_version: descriptor.version,
+            schema_version: descriptor.version(),
             descriptor_bytes,
         };
         self.record_meta_record(&record)
@@ -2006,11 +2029,13 @@ mod tests {
         let mut writer = adapter.create(&claim).expect("create writer");
         let fiber_id = [0x99; 16];
         let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"initial").unwrap();
-        writer.append_envelope(&genesis).expect("append genesis");
+        writer
+            .append_envelope_verdict(&genesis)
+            .expect("append genesis");
         let file_len_before = std::fs::metadata(writer.pgno_path()).unwrap().len();
 
         let dup_genesis = EventEnvelope::genesis([0x02; 16], fiber_id, b"dup").unwrap();
-        let err = writer.append_envelope(&dup_genesis).unwrap_err();
+        let err = writer.append_envelope_verdict(&dup_genesis).unwrap_err();
         assert_eq!(
             *err.condition(),
             FailureCondition::PrecursorChainBroken(None)
@@ -2121,7 +2146,7 @@ mod tests {
         assert!(bytes.len() >= 85);
         bytes[32] = 2;
         let err = writer
-            .append_frame(&bytes)
+            .append_frame_verdict(&bytes)
             .expect_err("malformed boolean discriminant in envelope payload must be rejected");
         assert_eq!(*err.condition(), FailureCondition::EnvelopeMismatch);
     }
@@ -2143,7 +2168,9 @@ mod tests {
         let mut writer = adapter.create(&claim).expect("create writer");
         let fiber_id = [0x77; 16];
         let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"initial").unwrap();
-        writer.append_envelope(&genesis).expect("append genesis");
+        writer
+            .append_envelope_verdict(&genesis)
+            .expect("append genesis");
 
         let mut reader = adapter.open_read().expect("open reader");
         let handle = reader.fiber(fiber_id).expect("reader initial point lookup");
@@ -2197,8 +2224,8 @@ mod tests {
         let mut writer = adapter.create(&claim).expect("create writer");
         let short_payload = [0u8; 84];
         let err = writer
-            .append_frame(&short_payload)
-            .expect_err("84-byte payload must be rejected by append_frame per H2");
+            .append_frame_verdict(&short_payload)
+            .expect_err("84-byte payload must be rejected by append_frame_verdict per H2");
         assert_eq!(*err.condition(), FailureCondition::EnvelopeMismatch);
         assert!(err
             .to_string()
@@ -2223,16 +2250,18 @@ mod tests {
         writer.store.engine.uncertain = true;
         writer.store.engine.uncertain_diagnostic =
             Some("writer session in uncertain state; reconciliation required".to_string());
-        let descriptor = crate::schema::SchemaDescriptor::new(
-            1,
-            crate::schema::DescriptorNode::Struct {
-                name: "OrderPayload".to_string(),
-                fields: vec![crate::schema::FieldDescriptor {
-                    name: "id".to_string(),
-                    node: crate::schema::DescriptorNode::Uuid,
-                }],
-            },
-        );
+        let descriptor =
+            AdmittedDescriptor::try_from_descriptor(crate::schema::SchemaDescriptor::new(
+                1,
+                crate::schema::DescriptorNode::Struct {
+                    name: "OrderPayload".to_string(),
+                    fields: vec![crate::schema::FieldDescriptor {
+                        name: "id".to_string(),
+                        node: crate::schema::DescriptorNode::Uuid,
+                    }],
+                },
+            ))
+            .unwrap();
         let err = writer
             .set_schema_descriptor(&descriptor)
             .expect_err("set_schema_descriptor must be rejected while uncertain per M3");
@@ -2355,7 +2384,7 @@ mod tests {
         );
 
         let env = EventEnvelope::genesis([0x02; 16], fiber_id, b"envelope").unwrap();
-        let err_append_env = writer.append_envelope(&env).unwrap_err();
+        let err_append_env = writer.append_envelope_verdict(&env).unwrap_err();
         assert_eq!(
             *err_append_env.condition(),
             FailureCondition::EnvelopeMismatch
@@ -2541,7 +2570,7 @@ mod tests {
 
         let dummy_record = OwnershipRecord::OwnershipClaim(claim.clone());
         let meta_err = meta_writer
-            .record_meta_record(&dummy_record)
+            .record_meta_record_for_test(&dummy_record)
             .expect_err("read-only meta should fail append");
         assert_eq!(
             *meta_err.condition(),
@@ -2566,7 +2595,7 @@ mod tests {
         }
 
         meta_writer
-            .record_meta_record(&dummy_record)
+            .record_meta_record_for_test(&dummy_record)
             .expect("recording succeeds after restoring permissions");
         assert!(meta_writer.uncertain_diagnostic().is_none());
     }
@@ -2599,10 +2628,14 @@ mod tests {
             policy_tag: 0,
             parameter_payload: vec![],
         };
-        let err_meta = writer.record_rescue_policy_choice(&choice).unwrap_err();
+        let err_meta = writer
+            .record_rescue_policy_choice_for_test(&choice)
+            .unwrap_err();
         assert_eq!(*err_meta.condition(), FailureCondition::StaleEpoch);
 
-        let descriptor = SchemaDescriptor::new(1, DescriptorNode::U64);
+        let descriptor =
+            AdmittedDescriptor::try_from_descriptor(SchemaDescriptor::new(1, DescriptorNode::U64))
+                .unwrap();
         let err_schema = writer.set_schema_descriptor(&descriptor).unwrap_err();
         assert_eq!(*err_schema.condition(), FailureCondition::StaleEpoch);
 
@@ -2795,7 +2828,9 @@ mod tests {
             prior_generation_epoch: 2,
         });
 
-        let err = writer.record_meta_record(&inbound_record).unwrap_err();
+        let err = writer
+            .record_meta_record_for_test(&inbound_record)
+            .unwrap_err();
         assert_eq!(
             *err.condition(),
             FailureCondition::OwnershipRecordUnreadable
@@ -2818,7 +2853,7 @@ mod tests {
         }
 
         writer
-            .record_meta_record(&inbound_record)
+            .record_meta_record_for_test(&inbound_record)
             .expect("recording meta record succeeds after permissions restored");
         assert!(writer.uncertain_diagnostic().is_none());
         assert!(writer.inbound_pointer().is_some());
@@ -2855,7 +2890,7 @@ mod tests {
         });
 
         let err = sync_err_writer
-            .record_meta_record(&inbound_record)
+            .record_meta_record_for_test(&inbound_record)
             .unwrap_err();
         assert_eq!(
             *err.condition(),
@@ -2868,7 +2903,7 @@ mod tests {
         assert!(diag.contains("failed to sync .meta: simulated sync_data failure"));
 
         let subsequent_err = sync_err_writer
-            .record_meta_record(&inbound_record)
+            .record_meta_record_for_test(&inbound_record)
             .unwrap_err();
         assert_eq!(
             *subsequent_err.condition(),
@@ -2897,7 +2932,7 @@ mod tests {
         let mut write_err_writer = writer_write.with_simulate_write_error(true);
 
         let err_write = write_err_writer
-            .record_meta_record(&inbound_record)
+            .record_meta_record_for_test(&inbound_record)
             .unwrap_err();
         assert_eq!(
             *err_write.condition(),
@@ -2912,7 +2947,7 @@ mod tests {
         assert!(diag_write.contains("failed to write record to .meta: simulated write_all failure"));
 
         let subsequent_write_err = write_err_writer
-            .record_meta_record(&inbound_record)
+            .record_meta_record_for_test(&inbound_record)
             .unwrap_err();
         assert!(subsequent_write_err
             .to_string()
@@ -2934,7 +2969,9 @@ mod tests {
             operator_label: "test-operator".to_string(),
         };
         let mut writer = adapter.create(&claim).expect("create writer");
-        let desc1 = SchemaDescriptor::new(1, DescriptorNode::U64);
+        let desc1 =
+            AdmittedDescriptor::try_from_descriptor(SchemaDescriptor::new(1, DescriptorNode::U64))
+                .unwrap();
         writer
             .set_schema_descriptor(&desc1)
             .expect("first set_schema_descriptor");
@@ -2942,6 +2979,7 @@ mod tests {
         let mut meta_file = File::open(&writer.store.engine.meta_path).unwrap();
         let (_, frames_first, _) = read_container_frames(&mut meta_file).unwrap();
         let first_count = frames_first.len();
+        let meta_len_first = meta_file.metadata().unwrap().len();
 
         writer
             .set_schema_descriptor(&desc1)
@@ -2949,18 +2987,27 @@ mod tests {
         let mut meta_file = File::open(&writer.store.engine.meta_path).unwrap();
         let (_, frames_second, _) = read_container_frames(&mut meta_file).unwrap();
         assert_eq!(first_count, frames_second.len());
+        assert_eq!(meta_len_first, meta_file.metadata().unwrap().len());
 
-        let desc_conflicting_version = SchemaDescriptor::new(2, DescriptorNode::U64);
+        let desc_conflicting_version =
+            AdmittedDescriptor::try_from_descriptor(SchemaDescriptor::new(2, DescriptorNode::U64))
+                .unwrap();
         let err_version = writer
             .set_schema_descriptor(&desc_conflicting_version)
             .unwrap_err();
         assert_eq!(*err_version.condition(), FailureCondition::SchemaMismatch);
+        let meta_file = File::open(&writer.store.engine.meta_path).unwrap();
+        assert_eq!(meta_len_first, meta_file.metadata().unwrap().len());
 
-        let desc_conflicting_root = SchemaDescriptor::new(1, DescriptorNode::U32);
+        let desc_conflicting_root =
+            AdmittedDescriptor::try_from_descriptor(SchemaDescriptor::new(1, DescriptorNode::U32))
+                .unwrap();
         let err_root = writer
             .set_schema_descriptor(&desc_conflicting_root)
             .unwrap_err();
         assert_eq!(*err_root.condition(), FailureCondition::SchemaMismatch);
+        let meta_file = File::open(&writer.store.engine.meta_path).unwrap();
+        assert_eq!(meta_len_first, meta_file.metadata().unwrap().len());
     }
 
     #[test]
@@ -2984,7 +3031,9 @@ mod tests {
             .append_to_fiber(fiber_id, event_id, b"first-event")
             .expect("append event");
 
-        let desc = SchemaDescriptor::new(1, DescriptorNode::U64);
+        let desc =
+            AdmittedDescriptor::try_from_descriptor(SchemaDescriptor::new(1, DescriptorNode::U64))
+                .unwrap();
         let err = writer.set_schema_descriptor(&desc).unwrap_err();
         assert_eq!(*err.condition(), FailureCondition::SchemaMismatch);
     }

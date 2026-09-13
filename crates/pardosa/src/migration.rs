@@ -6,7 +6,7 @@ pub use crate::encoding::{
     OutboundPointerRecord, RescuePolicy, RescuePolicyChoiceRecord,
 };
 use crate::file::{FileStorageAdapter, MetaRecords};
-use crate::schema::SchemaDescriptor;
+use crate::schema::{AdmittedDescriptor, SchemaDescriptor};
 use crate::store::{CausalChainError, FailureCondition, FiberMigrationPolicy, OperationFailure};
 use std::collections::HashMap;
 use std::fmt;
@@ -139,11 +139,11 @@ impl MigrationSource for FileStorageAdapter {
         &self,
         pointer: &OutboundPointerRecord,
     ) -> Result<(), OperationFailure> {
-        self.record_outbound_pointer(pointer)
+        self.record_meta_record_internal(&OwnershipRecord::OutboundPointer(pointer.clone()))
     }
 
     fn record_meta(&self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
-        self.record_meta_record(record)
+        self.record_meta_record_internal(record)
     }
 
     fn read_meta(&self) -> Result<MetaRecords, OperationFailure> {
@@ -179,7 +179,7 @@ impl MigrationTarget for FileStorageAdapter {
     }
 
     fn record_meta(&self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
-        self.record_meta_record(record)
+        self.record_meta_record_internal(record)
     }
 
     fn set_schema_descriptor(
@@ -188,7 +188,8 @@ impl MigrationTarget for FileStorageAdapter {
     ) -> Result<(), OperationFailure> {
         let epoch = self.current_epoch()?;
         let mut writer = self.open_write(epoch)?;
-        writer.set_schema_descriptor(descriptor)
+        let admitted = AdmittedDescriptor::try_from_descriptor(descriptor.clone())?;
+        writer.set_schema_descriptor(&admitted)
     }
 }
 

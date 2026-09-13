@@ -446,12 +446,13 @@ fn test_v21_schema_descriptor_golden_wire_bytes_and_conflicting_rejection() {
         operator_label: "test-operator".to_string(),
     };
     let mut writer = adapter.create(&claim).expect("create writer");
+    let admitted_v21 = AdmittedDescriptor::try_from_descriptor(v21_descriptor.clone()).unwrap();
     writer
-        .set_schema_descriptor(&v21_descriptor)
+        .set_schema_descriptor(&admitted_v21)
         .expect("initial v21 schema descriptor set");
 
     writer
-        .set_schema_descriptor(&v21_descriptor)
+        .set_schema_descriptor(&admitted_v21)
         .expect("idempotent re-submission of identical v21 descriptor");
 
     let conflicting_v21_descriptor = SchemaDescriptor::new(
@@ -466,14 +467,18 @@ fn test_v21_schema_descriptor_golden_wire_bytes_and_conflicting_rejection() {
             }],
         },
     );
+    let admitted_conflicting =
+        AdmittedDescriptor::try_from_descriptor(conflicting_v21_descriptor).unwrap();
     let err_conflict = writer
-        .set_schema_descriptor(&conflicting_v21_descriptor)
+        .set_schema_descriptor(&admitted_conflicting)
         .unwrap_err();
     assert_eq!(*err_conflict.condition(), FailureCondition::SchemaMismatch);
 
     let conflicting_version_descriptor = SchemaDescriptor::new(22, v21_descriptor.root.clone());
+    let admitted_conflicting_version =
+        AdmittedDescriptor::try_from_descriptor(conflicting_version_descriptor).unwrap();
     let err_version = writer
-        .set_schema_descriptor(&conflicting_version_descriptor)
+        .set_schema_descriptor(&admitted_conflicting_version)
         .unwrap_err();
     assert_eq!(*err_version.condition(), FailureCondition::SchemaMismatch);
 }

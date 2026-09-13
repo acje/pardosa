@@ -116,7 +116,7 @@ fn test_m6_migration_basic_lifecycle_and_cutover() {
         status: MigrationStatus::Complete,
     };
     target
-        .record_meta_record(&OwnershipRecord::MigrationEnd(end_record))
+        .record_meta_record_for_test(&OwnershipRecord::MigrationEnd(end_record))
         .expect("record migration end");
 
     let rescue_choice = RescuePolicyChoiceRecord {
@@ -124,7 +124,7 @@ fn test_m6_migration_basic_lifecycle_and_cutover() {
         parameter_payload: Vec::new(),
     };
     target
-        .record_meta_record(&OwnershipRecord::RescuePolicyChoice(rescue_choice))
+        .record_meta_record_for_test(&OwnershipRecord::RescuePolicyChoice(rescue_choice))
         .expect("record rescue choice");
 
     let outbound = OutboundPointerRecord {
@@ -132,7 +132,7 @@ fn test_m6_migration_basic_lifecycle_and_cutover() {
         cutover_epoch: source_epoch,
     };
     source
-        .record_outbound_pointer(&outbound)
+        .record_outbound_pointer_for_test(&outbound)
         .expect("record outbound");
 
     assert!(source.is_retired_source().expect("query retired"));

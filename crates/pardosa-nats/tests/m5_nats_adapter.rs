@@ -109,8 +109,9 @@ fn test_m5_c8_2_schema_completeness_on_nats_adapter() {
     let claim = sample_claim(1);
 
     let mut writer = adapter.create(&claim).expect("create writer");
+    let admitted = AdmittedDescriptor::try_from_descriptor(valid_schema.clone()).unwrap();
     writer
-        .set_schema_descriptor(&valid_schema)
+        .set_schema_descriptor(&admitted)
         .expect("set schema descriptor");
     drop(writer);
 
@@ -219,7 +220,7 @@ fn test_m5_nats_per_landing_epoch_verification() {
 
     let claim2 = sample_claim(2);
     adapter
-        .record_ownership_claim(&claim2)
+        .record_ownership_claim_for_test(&claim2)
         .expect("supersede with epoch 2");
 
     let stale = writer1.append_raw_frame(b"event-2").unwrap_err();
