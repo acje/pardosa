@@ -418,23 +418,12 @@ fn test_v21_schema_descriptor_golden_wire_bytes_and_conflicting_rejection() {
     v21_descriptor.encode(&mut wire_bytes).unwrap();
 
     let expected_golden_bytes: [u8; 131] = [
-        21, 0, 0, 0,
-        16,
-        13, 0, 0, 0, 69, 118, 105, 100, 101, 110, 99, 101, 69, 118, 101, 110, 116,
-        1,
-        2, 0, 0, 0,
-        0,
-        9, 0, 0, 0, 84, 111, 109, 98, 115, 116, 111, 110, 101,
-        0,
-        1,
-        8, 0, 0, 0, 79, 98, 115, 101, 114, 118, 101, 100,
-        15,
-        15, 0, 0, 0, 69, 118, 105, 100, 101, 110, 99, 101, 80, 97, 121, 108, 111, 97, 100,
-        4, 0, 0, 0,
-        9, 0, 0, 0, 101, 110, 116, 105, 116, 121, 95, 105, 100, 18,
-        9, 0, 0, 0, 116, 105, 109, 101, 115, 116, 97, 109, 112, 17,
-        5, 0, 0, 0, 108, 97, 98, 101, 108, 10, 64, 0, 0, 0,
-        5, 0, 0, 0, 99, 111, 117, 110, 116, 4,
+        21, 0, 0, 0, 16, 13, 0, 0, 0, 69, 118, 105, 100, 101, 110, 99, 101, 69, 118, 101, 110, 116,
+        1, 2, 0, 0, 0, 0, 9, 0, 0, 0, 84, 111, 109, 98, 115, 116, 111, 110, 101, 0, 1, 8, 0, 0, 0,
+        79, 98, 115, 101, 114, 118, 101, 100, 15, 15, 0, 0, 0, 69, 118, 105, 100, 101, 110, 99,
+        101, 80, 97, 121, 108, 111, 97, 100, 4, 0, 0, 0, 9, 0, 0, 0, 101, 110, 116, 105, 116, 121,
+        95, 105, 100, 18, 9, 0, 0, 0, 116, 105, 109, 101, 115, 116, 97, 109, 112, 17, 5, 0, 0, 0,
+        108, 97, 98, 101, 108, 10, 64, 0, 0, 0, 5, 0, 0, 0, 99, 111, 117, 110, 116, 4,
     ];
 
     assert_eq!(wire_bytes.as_slice(), &expected_golden_bytes);
@@ -482,10 +471,7 @@ fn test_v21_schema_descriptor_golden_wire_bytes_and_conflicting_rejection() {
         .unwrap_err();
     assert_eq!(*err_conflict.condition(), FailureCondition::SchemaMismatch);
 
-    let conflicting_version_descriptor = SchemaDescriptor::new(
-        22,
-        v21_descriptor.root.clone(),
-    );
+    let conflicting_version_descriptor = SchemaDescriptor::new(22, v21_descriptor.root.clone());
     let err_version = writer
         .set_schema_descriptor(&conflicting_version_descriptor)
         .unwrap_err();

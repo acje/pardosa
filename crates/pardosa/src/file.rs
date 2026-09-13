@@ -2935,23 +2935,31 @@ mod tests {
         };
         let mut writer = adapter.create(&claim).expect("create writer");
         let desc1 = SchemaDescriptor::new(1, DescriptorNode::U64);
-        writer.set_schema_descriptor(&desc1).expect("first set_schema_descriptor");
+        writer
+            .set_schema_descriptor(&desc1)
+            .expect("first set_schema_descriptor");
 
         let mut meta_file = File::open(&writer.store.engine.meta_path).unwrap();
         let (_, frames_first, _) = read_container_frames(&mut meta_file).unwrap();
         let first_count = frames_first.len();
 
-        writer.set_schema_descriptor(&desc1).expect("idempotent second set_schema_descriptor");
+        writer
+            .set_schema_descriptor(&desc1)
+            .expect("idempotent second set_schema_descriptor");
         let mut meta_file = File::open(&writer.store.engine.meta_path).unwrap();
         let (_, frames_second, _) = read_container_frames(&mut meta_file).unwrap();
         assert_eq!(first_count, frames_second.len());
 
         let desc_conflicting_version = SchemaDescriptor::new(2, DescriptorNode::U64);
-        let err_version = writer.set_schema_descriptor(&desc_conflicting_version).unwrap_err();
+        let err_version = writer
+            .set_schema_descriptor(&desc_conflicting_version)
+            .unwrap_err();
         assert_eq!(*err_version.condition(), FailureCondition::SchemaMismatch);
 
         let desc_conflicting_root = SchemaDescriptor::new(1, DescriptorNode::U32);
-        let err_root = writer.set_schema_descriptor(&desc_conflicting_root).unwrap_err();
+        let err_root = writer
+            .set_schema_descriptor(&desc_conflicting_root)
+            .unwrap_err();
         assert_eq!(*err_root.condition(), FailureCondition::SchemaMismatch);
     }
 
