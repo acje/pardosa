@@ -400,7 +400,17 @@ pub fn read_meta_records(meta_path: &Path) -> Result<MetaRecords, OperationFailu
                         ),
                     ));
                 }
-                records.schema_descriptor = Some(SchemaDescriptor::new(schema_version, root));
+                let new_desc = SchemaDescriptor::new(schema_version, root);
+                if let Some(existing) = &records.schema_descriptor {
+                    if existing != &new_desc {
+                        return Err(OperationFailure::new(
+                            FailureCondition::OwnershipRecordUnreadable,
+                            "conflicting schema descriptor in .meta metadata",
+                        ));
+                    }
+                } else {
+                    records.schema_descriptor = Some(new_desc);
+                }
             }
             OwnershipRecord::OutboundPointer(p) => {
                 records.outbound_pointer = Some(p);
@@ -1440,6 +1450,22 @@ impl StorageEngine for FileEngine {
         &mut self,
         descriptor: &SchemaDescriptor,
     ) -> Result<(), OperationFailure> {
+        self.check_authority()?;
+        if let Some(existing) = self.meta_records.schema_descriptor.as_ref() {
+            if existing == descriptor {
+                return Ok(());
+            }
+            return Err(OperationFailure::new(
+                FailureCondition::SchemaMismatch,
+                "conflicting schema descriptor already recorded in .meta",
+            ));
+        }
+        if self.frame_count > 0 {
+            return Err(OperationFailure::new(
+                FailureCondition::SchemaMismatch,
+                "cannot set schema descriptor after data events have already landed",
+            ));
+        }
         let mut descriptor_bytes = Vec::new();
         descriptor
             .root
@@ -1502,8 +1528,17 @@ impl StorageEngine for FileEngine {
                         format!("failed to decode schema descriptor in .meta: {err}"),
                     )
                 })?;
-                self.meta_records.schema_descriptor =
-                    Some(SchemaDescriptor::new(*schema_version, root));
+                let new_desc = SchemaDescriptor::new(*schema_version, root);
+                if let Some(existing) = &self.meta_records.schema_descriptor {
+                    if existing != &new_desc {
+                        return Err(OperationFailure::new(
+                            FailureCondition::SchemaMismatch,
+                            "conflicting schema descriptor in .meta metadata",
+                        ));
+                    }
+                } else {
+                    self.meta_records.schema_descriptor = Some(new_desc);
+                }
             }
             OwnershipRecord::OutboundPointer(pointer) => {
                 self.meta_records.outbound_pointer = Some(pointer.clone());
@@ -2874,5 +2909,120 @@ mod tests {
         assert!(subsequent_write_err
             .to_string()
             .contains("writer session in uncertain state"));
+    }
+
+    #[test]
+    fn test_set_schema_descriptor_idempotent_and_conflicting_rejection() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stem = temp_dir.path().join("schema_idempotency");
+        let adapter = FileStorageAdapter::new(&stem);
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1u8; 16],
+            boot_id: [2u8; 16],
+            process_id: 12345,
+            process_start_time_ns: 1_000_000,
+            claim_time_ns: 2_000_000,
+            operator_label: "test-operator".to_string(),
+        };
+        let mut writer = adapter.create(&claim).expect("create writer");
+        let desc1 = SchemaDescriptor::new(1, DescriptorNode::U64);
+        writer.set_schema_descriptor(&desc1).expect("first set_schema_descriptor");
+
+        let mut meta_file = File::open(&writer.store.engine.meta_path).unwrap();
+        let (_, frames_first, _) = read_container_frames(&mut meta_file).unwrap();
+        let first_count = frames_first.len();
+
+        writer.set_schema_descriptor(&desc1).expect("idempotent second set_schema_descriptor");
+        let mut meta_file = File::open(&writer.store.engine.meta_path).unwrap();
+        let (_, frames_second, _) = read_container_frames(&mut meta_file).unwrap();
+        assert_eq!(first_count, frames_second.len());
+
+        let desc_conflicting_version = SchemaDescriptor::new(2, DescriptorNode::U64);
+        let err_version = writer.set_schema_descriptor(&desc_conflicting_version).unwrap_err();
+        assert_eq!(*err_version.condition(), FailureCondition::SchemaMismatch);
+
+        let desc_conflicting_root = SchemaDescriptor::new(1, DescriptorNode::U32);
+        let err_root = writer.set_schema_descriptor(&desc_conflicting_root).unwrap_err();
+        assert_eq!(*err_root.condition(), FailureCondition::SchemaMismatch);
+    }
+
+    #[test]
+    fn test_set_schema_descriptor_rejects_after_data_events_landed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stem = temp_dir.path().join("schema_after_data");
+        let adapter = FileStorageAdapter::new(&stem);
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1u8; 16],
+            boot_id: [2u8; 16],
+            process_id: 12345,
+            process_start_time_ns: 1_000_000,
+            claim_time_ns: 2_000_000,
+            operator_label: "test-operator".to_string(),
+        };
+        let mut writer = adapter.create(&claim).expect("create writer");
+        let fiber_id = [0xAA; 16];
+        let event_id = [0x01; 16];
+        writer.append_to_fiber(fiber_id, event_id, b"first-event").expect("append event");
+
+        let desc = SchemaDescriptor::new(1, DescriptorNode::U64);
+        let err = writer.set_schema_descriptor(&desc).unwrap_err();
+        assert_eq!(*err.condition(), FailureCondition::SchemaMismatch);
+    }
+
+    #[test]
+    fn test_read_meta_records_conflicting_descriptors_fails_closed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stem = temp_dir.path().join("test_meta_conflicts");
+        let adapter = FileStorageAdapter::new(&stem);
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1u8; 16],
+            boot_id: [2u8; 16],
+            process_id: 12345,
+            process_start_time_ns: 1_000_000,
+            claim_time_ns: 2_000_000,
+            operator_label: "test-operator".to_string(),
+        };
+        adapter.create_incomplete_meta_only(&claim).unwrap();
+        let meta_path = adapter.meta_path();
+
+        let mut desc1_bytes = Vec::new();
+        DescriptorNode::U64.encode(&mut desc1_bytes).unwrap();
+        append_meta_record(
+            meta_path,
+            &OwnershipRecord::SchemaDescriptor {
+                schema_version: 1,
+                descriptor_bytes: desc1_bytes.clone(),
+            },
+        )
+        .unwrap();
+
+        append_meta_record(
+            meta_path,
+            &OwnershipRecord::SchemaDescriptor {
+                schema_version: 1,
+                descriptor_bytes: desc1_bytes,
+            },
+        )
+        .unwrap();
+
+        let records = read_meta_records(meta_path).expect("identical multiple descriptors are allowed");
+        assert_eq!(records.schema_descriptor.unwrap().version, 1);
+
+        let mut desc2_bytes = Vec::new();
+        DescriptorNode::U32.encode(&mut desc2_bytes).unwrap();
+        append_meta_record(
+            meta_path,
+            &OwnershipRecord::SchemaDescriptor {
+                schema_version: 1,
+                descriptor_bytes: desc2_bytes,
+            },
+        )
+        .unwrap();
+
+        let err = read_meta_records(meta_path).unwrap_err();
+        assert_eq!(*err.condition(), FailureCondition::OwnershipRecordUnreadable);
     }
 }

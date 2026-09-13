@@ -196,7 +196,19 @@ async fn read_meta_records_async(
                         ),
                     ));
                 }
-                records.schema_descriptor = Some(SchemaDescriptor::new(schema_version, root));
+                let new_desc = SchemaDescriptor::new(schema_version, root);
+                if let Some(existing) = &records.schema_descriptor {
+                    if existing != &new_desc {
+                        return Err(OperationFailure::new(
+                            FailureCondition::OwnershipRecordUnreadable,
+                            format!(
+                                "conflicting schema descriptor in meta stream at seq {seq}"
+                            ),
+                        ));
+                    }
+                } else {
+                    records.schema_descriptor = Some(new_desc);
+                }
             }
             OwnershipRecord::OutboundPointer(p) => {
                 records.outbound_pointer = Some(p);
@@ -915,6 +927,7 @@ impl NatsStorageAdapter {
                 meta_records,
                 admission: OpenAdmission::Ready,
                 last_data_seq: data_ack.sequence,
+                data_events_landed: false,
                 read_all_count: 0,
                 publish_timeout: Duration::from_secs(5),
                 simulate_indeterminate: false,
@@ -1158,6 +1171,7 @@ impl NatsStorageAdapter {
                 meta_records,
                 admission: OpenAdmission::Ready,
                 last_data_seq: data_ack.sequence,
+                data_events_landed: false,
                 read_all_count: 0,
                 publish_timeout: Duration::from_secs(5),
                 simulate_indeterminate: false,
@@ -1245,7 +1259,7 @@ impl NatsStorageAdapter {
 
         let js_data = self.js.clone();
         let data_name = self.data_stream_name.clone();
-        let last_data_seq = run_future(&handle, async move {
+        let (last_data_seq, data_events_landed) = run_future(&handle, async move {
             let mut stream = js_data
                 .get_stream(&data_name)
                 .await
@@ -1284,7 +1298,7 @@ impl NatsStorageAdapter {
                     "trailing unconsumed bytes in container header",
                 ));
             }
-            Ok(last_seq)
+            Ok((last_seq, messages > 1))
         })?;
 
         let engine = NatsEngine {
@@ -1301,6 +1315,7 @@ impl NatsStorageAdapter {
             meta_records: meta,
             admission: OpenAdmission::Ready,
             last_data_seq,
+            data_events_landed,
             read_all_count: 0,
             publish_timeout: Duration::from_secs(5),
             simulate_indeterminate: false,
@@ -1350,6 +1365,7 @@ impl NatsStorageAdapter {
             meta_records,
             admission,
             last_data_seq: 0,
+            data_events_landed: false,
             read_all_count: 0,
             publish_timeout: Duration::from_secs(5),
             simulate_indeterminate: false,
@@ -1541,6 +1557,7 @@ pub struct NatsEngine {
     pub(crate) meta_records: NatsMetaRecords,
     pub(crate) admission: OpenAdmission,
     pub(crate) last_data_seq: u64,
+    pub(crate) data_events_landed: bool,
     pub(crate) read_all_count: usize,
     pub(crate) publish_timeout: Duration,
     pub(crate) simulate_indeterminate: bool,
@@ -1754,6 +1771,7 @@ impl StorageEngine for NatsEngine {
                     return Ok(WriteLandingVerdict::Undetermined { carried_epoch });
                 }
                 self.last_data_seq = pub_ack.sequence;
+                self.data_events_landed = true;
                 Ok(WriteLandingVerdict::Landed(pub_ack.sequence))
             }
             WriteLandingVerdict::Undetermined { carried_epoch } => {
@@ -1962,6 +1980,22 @@ impl StorageEngine for NatsEngine {
         &mut self,
         descriptor: &SchemaDescriptor,
     ) -> Result<(), OperationFailure> {
+        self.check_authority()?;
+        if let Some(existing) = self.meta_records.schema_descriptor.as_ref() {
+            if existing == descriptor {
+                return Ok(());
+            }
+            return Err(OperationFailure::new(
+                FailureCondition::SchemaMismatch,
+                "conflicting schema descriptor already recorded in meta stream",
+            ));
+        }
+        if self.data_events_landed {
+            return Err(OperationFailure::new(
+                FailureCondition::SchemaMismatch,
+                "cannot set schema descriptor after data events have already landed",
+            ));
+        }
         let mut descriptor_bytes = Vec::new();
         descriptor
             .root
@@ -2058,8 +2092,17 @@ impl StorageEngine for NatsEngine {
                         format!("failed to decode schema descriptor in meta stream: {err}"),
                     )
                 })?;
-                self.meta_records.schema_descriptor =
-                    Some(SchemaDescriptor::new(*schema_version, root));
+                let new_desc = SchemaDescriptor::new(*schema_version, root);
+                if let Some(existing) = &self.meta_records.schema_descriptor {
+                    if existing != &new_desc {
+                        return Err(OperationFailure::new(
+                            FailureCondition::SchemaMismatch,
+                            "conflicting schema descriptor in meta stream",
+                        ));
+                    }
+                } else {
+                    self.meta_records.schema_descriptor = Some(new_desc);
+                }
             }
             OwnershipRecord::OutboundPointer(pointer) => {
                 self.meta_records.outbound_pointer = Some(pointer.clone());

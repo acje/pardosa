@@ -368,3 +368,126 @@ fn test_f32_derived_payload_schema_identity_and_admission_mismatch() {
     let err = admit_event(&admission_mismatch).unwrap_err();
     assert_eq!(err.condition(), &FailureCondition::SchemaMismatch);
 }
+
+#[test]
+fn test_v21_schema_descriptor_golden_wire_bytes_and_conflicting_rejection() {
+    let v21_descriptor = SchemaDescriptor::new(
+        21,
+        DescriptorNode::Enum {
+            name: "EvidenceEvent".to_string(),
+            discriminant_width: 1,
+            variants: vec![
+                VariantDescriptor {
+                    discriminant: 0,
+                    name: "Tombstone".to_string(),
+                    payload: None,
+                },
+                VariantDescriptor {
+                    discriminant: 1,
+                    name: "Observed".to_string(),
+                    payload: Some(DescriptorNode::Struct {
+                        name: "EvidencePayload".to_string(),
+                        fields: vec![
+                            FieldDescriptor {
+                                name: "entity_id".to_string(),
+                                node: DescriptorNode::Uuid,
+                            },
+                            FieldDescriptor {
+                                name: "timestamp".to_string(),
+                                node: DescriptorNode::Timestamp,
+                            },
+                            FieldDescriptor {
+                                name: "label".to_string(),
+                                node: DescriptorNode::EventString { max_bytes: 64 },
+                            },
+                            FieldDescriptor {
+                                name: "count".to_string(),
+                                node: DescriptorNode::U64,
+                            },
+                        ],
+                    }),
+                },
+            ],
+        },
+    );
+
+    let admitted = AdmittedDescriptor::try_from_descriptor(v21_descriptor.clone()).unwrap();
+    assert_eq!(admitted.version(), 21);
+
+    let mut wire_bytes = Vec::new();
+    v21_descriptor.encode(&mut wire_bytes).unwrap();
+
+    let expected_golden_bytes: [u8; 131] = [
+        21, 0, 0, 0,
+        16,
+        13, 0, 0, 0, 69, 118, 105, 100, 101, 110, 99, 101, 69, 118, 101, 110, 116,
+        1,
+        2, 0, 0, 0,
+        0,
+        9, 0, 0, 0, 84, 111, 109, 98, 115, 116, 111, 110, 101,
+        0,
+        1,
+        8, 0, 0, 0, 79, 98, 115, 101, 114, 118, 101, 100,
+        15,
+        15, 0, 0, 0, 69, 118, 105, 100, 101, 110, 99, 101, 80, 97, 121, 108, 111, 97, 100,
+        4, 0, 0, 0,
+        9, 0, 0, 0, 101, 110, 116, 105, 116, 121, 95, 105, 100, 18,
+        9, 0, 0, 0, 116, 105, 109, 101, 115, 116, 97, 109, 112, 17,
+        5, 0, 0, 0, 108, 97, 98, 101, 108, 10, 64, 0, 0, 0,
+        5, 0, 0, 0, 99, 111, 117, 110, 116, 4,
+    ];
+
+    assert_eq!(wire_bytes.as_slice(), &expected_golden_bytes);
+
+    let (decoded, consumed) = SchemaDescriptor::decode(&expected_golden_bytes).unwrap();
+    assert_eq!(consumed, expected_golden_bytes.len());
+    assert_eq!(decoded, v21_descriptor);
+    assert_eq!(decoded.identity(), v21_descriptor.identity());
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let stem = temp_dir.path().join("v21_golden");
+    let adapter = FileStorageAdapter::new(&stem);
+    let claim = OwnershipClaimRecord {
+        epoch: 1,
+        machine_id: [1u8; 16],
+        boot_id: [2u8; 16],
+        process_id: 12345,
+        process_start_time_ns: 1_000_000,
+        claim_time_ns: 2_000_000,
+        operator_label: "test-operator".to_string(),
+    };
+    let mut writer = adapter.create(&claim).expect("create writer");
+    writer
+        .set_schema_descriptor(&v21_descriptor)
+        .expect("initial v21 schema descriptor set");
+
+    writer
+        .set_schema_descriptor(&v21_descriptor)
+        .expect("idempotent re-submission of identical v21 descriptor");
+
+    let conflicting_v21_descriptor = SchemaDescriptor::new(
+        21,
+        DescriptorNode::Enum {
+            name: "EvidenceEvent".to_string(),
+            discriminant_width: 1,
+            variants: vec![VariantDescriptor {
+                discriminant: 0,
+                name: "Tombstone".to_string(),
+                payload: None,
+            }],
+        },
+    );
+    let err_conflict = writer
+        .set_schema_descriptor(&conflicting_v21_descriptor)
+        .unwrap_err();
+    assert_eq!(*err_conflict.condition(), FailureCondition::SchemaMismatch);
+
+    let conflicting_version_descriptor = SchemaDescriptor::new(
+        22,
+        v21_descriptor.root.clone(),
+    );
+    let err_version = writer
+        .set_schema_descriptor(&conflicting_version_descriptor)
+        .unwrap_err();
+    assert_eq!(*err_version.condition(), FailureCondition::SchemaMismatch);
+}

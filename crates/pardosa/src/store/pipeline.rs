@@ -207,6 +207,21 @@ impl<E: StorageEngine> Store<E> {
     ) -> Result<(), OperationFailure> {
         descriptor.validate_structural_completeness()?;
         self.engine.check_authority()?;
+        if let Some(existing) = self.schema_descriptor() {
+            if existing == descriptor {
+                return Ok(());
+            }
+            return Err(OperationFailure::new(
+                FailureCondition::SchemaMismatch,
+                "cannot mutate schema descriptor: conflicting descriptor submitted",
+            ));
+        }
+        if !self.fiber_index.is_empty() || self.fiber_index.has_raw_frames() {
+            return Err(OperationFailure::new(
+                FailureCondition::SchemaMismatch,
+                "cannot set schema descriptor after data events have already landed",
+            ));
+        }
         self.engine.set_schema_descriptor(descriptor)
     }
 
@@ -966,6 +981,21 @@ mod tests {
             &mut self,
             descriptor: &SchemaDescriptor,
         ) -> Result<(), OperationFailure> {
+            if let Some(existing) = self.meta_records.schema_descriptor.as_ref() {
+                if existing == descriptor {
+                    return Ok(());
+                }
+                return Err(OperationFailure::new(
+                    FailureCondition::SchemaMismatch,
+                    "conflicting schema descriptor already recorded in metadata",
+                ));
+            }
+            if !self.blocks.is_empty() {
+                return Err(OperationFailure::new(
+                    FailureCondition::SchemaMismatch,
+                    "cannot set schema descriptor after data events have already landed",
+                ));
+            }
             self.meta_records.schema_descriptor = Some(descriptor.clone());
             Ok(())
         }

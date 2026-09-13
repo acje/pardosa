@@ -621,6 +621,91 @@ impl SchemaDescriptor {
     pub fn validate_structure(&self) -> Result<(), OperationFailure> {
         self.validate_structural_completeness()
     }
+
+    /// Asserts structural completeness and converts this descriptor into an [`AdmittedDescriptor`].
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if validation fails.
+    pub fn into_admitted(self) -> Result<AdmittedDescriptor, OperationFailure> {
+        AdmittedDescriptor::try_from_descriptor(self)
+    }
+}
+
+/// A validated schema descriptor guaranteed to be structurally complete and admitted per C8.2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedDescriptor(SchemaDescriptor);
+
+impl AdmittedDescriptor {
+    /// Validates and admits a schema descriptor.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if the schema descriptor violates structural completeness,
+    /// has version 0, depth > 64, invalid or duplicate discriminants, or invalid widths.
+    pub fn try_from_descriptor(descriptor: SchemaDescriptor) -> Result<Self, OperationFailure> {
+        descriptor.validate_structural_completeness()?;
+        let mut buf = Vec::new();
+        descriptor.encode(&mut buf).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                },
+                format!("schema descriptor encoding failed: {err}"),
+            )
+        })?;
+        Ok(Self(descriptor))
+    }
+
+    /// Returns the declared schema version.
+    #[must_use]
+    pub fn version(&self) -> u32 {
+        self.0.version
+    }
+
+    /// Returns the root descriptor AST node.
+    #[must_use]
+    pub fn root(&self) -> &DescriptorNode {
+        &self.0.root
+    }
+
+    /// Returns the inner [`SchemaDescriptor`].
+    #[must_use]
+    pub fn into_inner(self) -> SchemaDescriptor {
+        self.0
+    }
+
+    /// Returns a reference to the inner [`SchemaDescriptor`].
+    #[must_use]
+    pub fn descriptor(&self) -> &SchemaDescriptor {
+        &self.0
+    }
+
+    /// Derives the schema identity.
+    #[must_use]
+    pub fn identity(&self) -> SchemaIdentity {
+        self.0.identity()
+    }
+}
+
+impl TryFrom<SchemaDescriptor> for AdmittedDescriptor {
+    type Error = OperationFailure;
+
+    fn try_from(descriptor: SchemaDescriptor) -> Result<Self, Self::Error> {
+        Self::try_from_descriptor(descriptor)
+    }
+}
+
+impl std::ops::Deref for AdmittedDescriptor {
+    type Target = SchemaDescriptor;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<SchemaDescriptor> for AdmittedDescriptor {
+    fn as_ref(&self) -> &SchemaDescriptor {
+        &self.0
+    }
 }
 
 impl DescriptorNode {
@@ -785,14 +870,25 @@ impl SchemaIdentity {
         Self(bytes)
     }
 
-    /// Computes schema identity from schema version and descriptor AST root.
-    #[must_use]
-    pub fn from_descriptor(version: u32, root: &DescriptorNode) -> Self {
+    /// Computes schema identity from schema version and descriptor AST root, propagating encoding errors.
+    ///
+    /// # Errors
+    /// Returns [`EncodeError`] if descriptor encoding fails (e.g. recursion depth exceeds 64 or invalid discriminant width).
+    pub fn try_from_descriptor(version: u32, root: &DescriptorNode) -> Result<Self, EncodeError> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&version.to_le_bytes());
-        let _ = root.encode(&mut buf);
+        root.encode(&mut buf)?;
         let hash = blake3::hash(&buf);
-        Self(*hash.as_bytes())
+        Ok(Self(*hash.as_bytes()))
+    }
+
+    /// Computes schema identity from schema version and descriptor AST root.
+    ///
+    /// # Panics
+    /// Panics if descriptor encoding fails.
+    #[must_use]
+    pub fn from_descriptor(version: u32, root: &DescriptorNode) -> Self {
+        Self::try_from_descriptor(version, root).expect("valid schema descriptor")
     }
 
     /// Returns reference to 32-byte hash digest.
@@ -1486,5 +1582,103 @@ mod tests {
 
         let expected_key = blake3::derive_key("pardosa.fiber_id.v1", key1.as_bytes());
         assert_eq!(fiber_id_1, expected_key[..16]);
+    }
+
+    #[test]
+    fn test_schema_identity_try_from_descriptor_depth_limit() {
+        let mut deep_node = DescriptorNode::U32;
+        for _ in 0..65 {
+            deep_node = DescriptorNode::Option {
+                inner: Box::new(deep_node),
+            };
+        }
+        let err = SchemaIdentity::try_from_descriptor(1, &deep_node).unwrap_err();
+        match err {
+            EncodeError::DepthExceeded { depth, max } => {
+                assert_eq!(depth, 65);
+                assert_eq!(max, 64);
+            }
+            other => panic!("expected DepthExceeded, got {other:?}"),
+        }
+
+        let valid_node = DescriptorNode::U64;
+        let identity = SchemaIdentity::try_from_descriptor(1, &valid_node).unwrap();
+        assert_eq!(identity, SchemaIdentity::from_descriptor(1, &valid_node));
+    }
+
+    #[test]
+    fn test_admitted_descriptor_validation() {
+        let valid_desc = SchemaDescriptor::new(1, DescriptorNode::U64);
+        let admitted = AdmittedDescriptor::try_from_descriptor(valid_desc.clone()).unwrap();
+        assert_eq!(admitted.version(), 1);
+        assert_eq!(admitted.root(), &DescriptorNode::U64);
+        assert_eq!(admitted.descriptor(), &valid_desc);
+        assert_eq!(admitted.identity(), valid_desc.identity());
+
+        let zero_version = SchemaDescriptor::new(0, DescriptorNode::U64);
+        let err_zero = AdmittedDescriptor::try_from_descriptor(zero_version).unwrap_err();
+        assert_eq!(*err_zero.condition(), FailureCondition::MissingSchemaDescriptor);
+
+        let mut deep_node = DescriptorNode::U32;
+        for _ in 0..65 {
+            deep_node = DescriptorNode::Option {
+                inner: Box::new(deep_node),
+            };
+        }
+        let deep_desc = SchemaDescriptor::new(1, deep_node);
+        let err_deep = AdmittedDescriptor::try_from_descriptor(deep_desc).unwrap_err();
+        assert!(matches!(
+            err_deep.condition(),
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong
+            }
+        ));
+
+        let dup_enum = SchemaDescriptor::new(
+            1,
+            DescriptorNode::Enum {
+                name: "Dup".to_string(),
+                discriminant_width: 1,
+                variants: vec![
+                    VariantDescriptor {
+                        discriminant: 1,
+                        name: "A".to_string(),
+                        payload: None,
+                    },
+                    VariantDescriptor {
+                        discriminant: 1,
+                        name: "B".to_string(),
+                        payload: None,
+                    },
+                ],
+            },
+        );
+        let err_dup = AdmittedDescriptor::try_from_descriptor(dup_enum).unwrap_err();
+        assert!(matches!(
+            err_dup.condition(),
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::NotReal
+            }
+        ));
+
+        let bad_width_enum = SchemaDescriptor::new(
+            1,
+            DescriptorNode::Enum {
+                name: "BadWidth".to_string(),
+                discriminant_width: 3,
+                variants: vec![VariantDescriptor {
+                    discriminant: 1,
+                    name: "A".to_string(),
+                    payload: None,
+                }],
+            },
+        );
+        let err_width = AdmittedDescriptor::try_from_descriptor(bad_width_enum).unwrap_err();
+        assert!(matches!(
+            err_width.condition(),
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::NotReal
+            }
+        ));
     }
 }
