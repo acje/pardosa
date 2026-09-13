@@ -10,7 +10,7 @@ mod floats;
 pub use floats::{EventF32, EventF64, OrderedF32, OrderedF64};
 
 /// Maximum recursion depth allowed during descriptor AST decoding to prevent cycles.
-pub const MAX_DESCRIPTOR_DEPTH: usize = 64;
+pub const MAX_DESCRIPTOR_DEPTH: usize = 16;
 
 /// A field within a struct descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -605,7 +605,7 @@ impl SchemaDescriptor {
     /// Returns [`OperationFailure`] with [`FailureCondition::MissingSchemaDescriptor`]
     /// if version is zero.
     /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`]
-    /// if any variant, field, or bound is invalid, or if recursion depth exceeds 64.
+    /// if any variant, field, or bound is invalid, or if recursion depth exceeds 16.
     pub fn validate_structural_completeness(&self) -> Result<(), OperationFailure> {
         if self.version == 0 {
             return Err(OperationFailure::new(
@@ -642,7 +642,7 @@ impl AdmittedDescriptor {
     ///
     /// # Errors
     /// Returns [`OperationFailure`] if the schema descriptor violates structural completeness,
-    /// has version 0, depth > 64, invalid or duplicate discriminants, or invalid widths.
+    /// has version 0, depth > 16, invalid or duplicate discriminants, or invalid widths.
     pub fn try_from_descriptor(descriptor: SchemaDescriptor) -> Result<Self, OperationFailure> {
         descriptor.validate_structural_completeness()?;
         let mut buf = Vec::new();
@@ -723,7 +723,7 @@ impl DescriptorNode {
     ///
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`]
-    /// if any variant, field, or bound is invalid, or if recursion depth exceeds 64.
+    /// if any variant, field, or bound is invalid, or if recursion depth exceeds 16.
     pub fn validate_structural_completeness(&self) -> Result<(), OperationFailure> {
         self.validate_structural_completeness_recursive(0)
     }
@@ -737,7 +737,7 @@ impl DescriptorNode {
                 FailureCondition::ValueConstraintViolated {
                     constraint: ValueConstraint::TooLong,
                 },
-                "descriptor nesting depth exceeds maximum depth of 64 per C8.2",
+                "descriptor nesting depth exceeds maximum depth of 16 per C8.2",
             ));
         }
         match self {
@@ -875,7 +875,7 @@ impl SchemaIdentity {
     /// Computes schema identity from schema version and descriptor AST root, propagating encoding errors.
     ///
     /// # Errors
-    /// Returns [`EncodeError`] if descriptor encoding fails (e.g. recursion depth exceeds 64 or invalid discriminant width).
+    /// Returns [`EncodeError`] if descriptor encoding fails (e.g. recursion depth exceeds 16 or invalid discriminant width).
     pub fn try_from_descriptor(version: u32, root: &DescriptorNode) -> Result<Self, EncodeError> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&version.to_le_bytes());
@@ -1313,16 +1313,19 @@ impl<T: PardosaType, const MAX: usize> PardosaType for EventVec<T, MAX> {
         if count > MAX {
             return Err(DecodeError::ItemCountExceeded { count, max: MAX });
         }
+        if count == 0 {
+            return Ok((Self::new(Vec::new())?, 4));
+        }
         let remaining_wire = buf.len() - 4;
         let initial_capacity = remaining_wire.min(count);
         let mut cursor = 4;
         let mut items = Vec::with_capacity(initial_capacity);
         for _ in 0..count {
             let (item, consumed) = T::decode_type(&buf[cursor..])?;
-            if consumed == 0 {
+            if cursor + consumed > buf.len() {
                 return Err(DecodeError::TruncatedPayload {
-                    expected: 1,
-                    available: 0,
+                    expected: cursor + consumed,
+                    available: buf.len(),
                 });
             }
             cursor += consumed;
@@ -1489,8 +1492,44 @@ mod tests {
     }
 
     #[test]
+    fn test_depth_limit_boundary_16_passes_17_fails() {
+        let mut node_16 = DescriptorNode::U32;
+        for _ in 0..16 {
+            node_16 = DescriptorNode::Option {
+                inner: Box::new(node_16),
+            };
+        }
+        assert!(node_16.validate_structure().is_ok());
+        let mut buf_16 = Vec::new();
+        assert!(node_16.encode(&mut buf_16).is_ok());
+
+        let mut node_17 = DescriptorNode::U32;
+        for _ in 0..17 {
+            node_17 = DescriptorNode::Option {
+                inner: Box::new(node_17),
+            };
+        }
+        let err_validate = node_17.validate_structure().unwrap_err();
+        assert_eq!(
+            *err_validate.condition(),
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            }
+        );
+        let mut buf_17 = Vec::new();
+        let err_encode = node_17.encode(&mut buf_17).unwrap_err();
+        match err_encode {
+            EncodeError::DepthExceeded { depth, max } => {
+                assert_eq!(depth, 17);
+                assert_eq!(max, 16);
+            }
+            other => panic!("expected DepthExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_recursion_depth_limit() {
-        let mut buf = vec![0x0E; 70];
+        let mut buf = vec![0x0E; 20];
         buf.push(0x01);
 
         let err = DescriptorNode::decode(&buf).unwrap_err();
@@ -1498,9 +1537,9 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_and_validate_structure_reject_depth_exceeding_64() {
+    fn test_encode_and_validate_structure_reject_depth_exceeding_16() {
         let mut deep_node = DescriptorNode::U32;
-        for _ in 0..65 {
+        for _ in 0..17 {
             deep_node = DescriptorNode::Option {
                 inner: Box::new(deep_node),
             };
@@ -1509,8 +1548,8 @@ mod tests {
         let err_encode = deep_node.encode(&mut buf).unwrap_err();
         match err_encode {
             EncodeError::DepthExceeded { depth, max } => {
-                assert_eq!(depth, 65);
-                assert_eq!(max, 64);
+                assert_eq!(depth, 17);
+                assert_eq!(max, 16);
             }
             other => panic!("expected DepthExceeded, got {other:?}"),
         }
@@ -1617,25 +1656,22 @@ mod tests {
             }
         }
 
-        let mut buf = vec![0xe8, 0x03, 0x00, 0x00];
-        let err = EventVec::<ZeroWire, 1000>::decode_type(&buf).unwrap_err();
-        assert!(matches!(
-            err,
-            DecodeError::TruncatedPayload {
-                expected: 1,
-                available: 0
-            }
-        ));
+        let empty_vec = EventVec::<ZeroWire, 10>::new(vec![]).unwrap();
+        let mut buf = Vec::new();
+        empty_vec.encode_type(&mut buf).unwrap();
+        assert_eq!(buf, vec![0x00, 0x00, 0x00, 0x00]);
+        let (decoded_empty, consumed_empty) = EventVec::<ZeroWire, 10>::decode_type(&buf).unwrap();
+        assert_eq!(consumed_empty, 4);
+        assert_eq!(decoded_empty, empty_vec);
 
-        buf.extend_from_slice(&[0x01, 0x02]);
-        let err2 = EventVec::<ZeroWire, 1000>::decode_type(&buf).unwrap_err();
-        assert!(matches!(
-            err2,
-            DecodeError::TruncatedPayload {
-                expected: 1,
-                available: 0
-            }
-        ));
+        let non_empty = EventVec::<ZeroWire, 10>::new(vec![ZeroWire, ZeroWire, ZeroWire]).unwrap();
+        buf.clear();
+        non_empty.encode_type(&mut buf).unwrap();
+        assert_eq!(buf, vec![0x03, 0x00, 0x00, 0x00]);
+        let (decoded_non_empty, consumed_non_empty) =
+            EventVec::<ZeroWire, 10>::decode_type(&buf).unwrap();
+        assert_eq!(consumed_non_empty, 4);
+        assert_eq!(decoded_non_empty, non_empty);
     }
 
     #[test]
@@ -1657,7 +1693,7 @@ mod tests {
     #[test]
     fn test_schema_identity_try_from_descriptor_depth_limit() {
         let mut deep_node = DescriptorNode::U32;
-        for _ in 0..65 {
+        for _ in 0..17 {
             deep_node = DescriptorNode::Option {
                 inner: Box::new(deep_node),
             };
@@ -1665,8 +1701,8 @@ mod tests {
         let err = SchemaIdentity::try_from_descriptor(1, &deep_node).unwrap_err();
         match err {
             EncodeError::DepthExceeded { depth, max } => {
-                assert_eq!(depth, 65);
-                assert_eq!(max, 64);
+                assert_eq!(depth, 17);
+                assert_eq!(max, 16);
             }
             other => panic!("expected DepthExceeded, got {other:?}"),
         }
@@ -1681,7 +1717,7 @@ mod tests {
     #[test]
     fn test_schema_identity_eliminates_panics_on_depth_exceeded() {
         let mut deep_node = DescriptorNode::U32;
-        for _ in 0..65 {
+        for _ in 0..17 {
             deep_node = DescriptorNode::Option {
                 inner: Box::new(deep_node),
             };

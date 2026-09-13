@@ -3,6 +3,8 @@
 use std::fmt;
 use std::ops::Deref;
 
+use crate::schema::PardosaType;
+
 /// Closed vocabulary of value constraints for value-decoding failures per C6.7 / C5.53.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueConstraint {
@@ -485,9 +487,9 @@ impl<const MAX: usize> Deref for EventBytes<MAX> {
 
 /// Bounded collection of items of admitted type `T`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct EventVec<T, const MAX: usize>(Vec<T>);
+pub struct EventVec<T: PardosaType, const MAX: usize>(Vec<T>);
 
-impl<T, const MAX: usize> EventVec<T, MAX> {
+impl<T: PardosaType, const MAX: usize> EventVec<T, MAX> {
     /// Creates a new `EventVec`, verifying `len <= MAX`.
     ///
     /// # Errors
@@ -520,7 +522,7 @@ impl<T, const MAX: usize> EventVec<T, MAX> {
     }
 }
 
-impl<T, const MAX: usize> Deref for EventVec<T, MAX> {
+impl<T: PardosaType, const MAX: usize> Deref for EventVec<T, MAX> {
     type Target = [T];
     fn deref(&self) -> &Self::Target {
         &self.0

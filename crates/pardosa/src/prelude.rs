@@ -36,4 +36,4 @@ pub use crate::store::{
     TakeoverProof, TakeoverVerdict, WriteLandingVerdict, MAX_ACTIVE_FIBERS, MAX_STREAM_BYTES,
     MAX_STREAM_ITEMS,
 };
-pub use pardosa_derive::PardosaSchema;
+pub use pardosa_derive::{PardosaSchema, PardosaType};

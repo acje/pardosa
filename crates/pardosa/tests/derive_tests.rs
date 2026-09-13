@@ -482,3 +482,279 @@ fn test_v21_schema_descriptor_golden_wire_bytes_and_conflicting_rejection() {
         .unwrap_err();
     assert_eq!(*err_version.condition(), FailureCondition::SchemaMismatch);
 }
+
+fn run_rustc(code: &str) -> (bool, String) {
+    use std::io::Write;
+    use std::process::Command;
+
+    let deps_dir = std::env::current_exe()
+        .expect("current test executable")
+        .parent()
+        .expect("parent deps directory")
+        .to_path_buf();
+
+    let entries = std::fs::read_dir(&deps_dir)
+        .unwrap_or_else(|e| panic!("failed to read deps dir {}: {e}", deps_dir.display()));
+    let mut rlibs = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.unwrap_or_else(|e| panic!("failed to read entry in {}: {e}", deps_dir.display()));
+        let p = entry.path();
+        if let Some(s) = p.file_name().and_then(|n| n.to_str()) {
+            if s.starts_with("libpardosa-") && s.ends_with(".rlib") {
+                rlibs.push(p.clone());
+            }
+        }
+    }
+    let rlib = match rlibs.len() {
+        0 => panic!(
+            "could not locate libpardosa rlib in deps directory: {}",
+            deps_dir.display()
+        ),
+        1 => rlibs.remove(0),
+        _ => {
+            rlibs.sort_by_key(|p| {
+                std::fs::metadata(p)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+            });
+            rlibs.pop().unwrap()
+        }
+    };
+
+    let rustc_cmd = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let mut cmd = Command::new(&rustc_cmd);
+    cmd.arg("--edition")
+        .arg("2021")
+        .arg("-L")
+        .arg(&deps_dir)
+        .arg("--extern")
+        .arg(format!("pardosa={}", rlib.display()));
+    let mut child = cmd
+        .arg("--crate-type")
+        .arg("lib")
+        .arg("--emit")
+        .arg("mir=-")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rustc");
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(code.as_bytes())
+            .expect("write code to rustc stdin");
+    }
+    let output = child.wait_with_output().expect("wait rustc");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    (output.status.success(), stderr)
+}
+
+#[test]
+fn test_event_vec_negative_compile_on_non_pardosa() {
+    let code = r#"
+        use pardosa::prelude::*;
+        struct NonPardosa;
+        pub fn test_invalid() {
+            let _ = EventVec::<NonPardosa, 10>::new(vec![]);
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(
+        !ok,
+        "EventVec<NonPardosa, 10> must fail compilation without PardosaType bound"
+    );
+    assert!(
+        stderr.contains("PardosaType")
+            || stderr.contains("the trait `PardosaType` is not implemented"),
+        "stderr should cite PardosaType trait requirement: {stderr}"
+    );
+}
+
+#[test]
+fn test_event_vec_positive_controls_roundtrip() {
+    let empty = EventVec::<u32, 10>::new(vec![]).unwrap();
+    let mut buf = Vec::new();
+    empty.encode_type(&mut buf).unwrap();
+    assert_eq!(buf, vec![0, 0, 0, 0]);
+    let (decoded_empty, consumed) = EventVec::<u32, 10>::decode_type(&buf).unwrap();
+    assert_eq!(consumed, 4);
+    assert_eq!(decoded_empty, empty);
+
+    let populated = EventVec::<u32, 10>::new(vec![10, 20, 30]).unwrap();
+    buf.clear();
+    populated.encode_type(&mut buf).unwrap();
+    assert_eq!(buf.len(), 4 + 3 * 4);
+    let (decoded_pop, consumed) = EventVec::<u32, 10>::decode_type(&buf).unwrap();
+    assert_eq!(consumed, buf.len());
+    assert_eq!(decoded_pop, populated);
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, PardosaType)]
+struct Address {
+    street: EventString<32>,
+    zip_code: u32,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, PardosaType)]
+struct Marker;
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy, PardosaType)]
+#[repr(u8)]
+enum AccountState {
+    Active = 0,
+    Suspended = 1,
+    Closed = 2,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, PardosaType)]
+#[repr(u8)]
+enum TransactionPayload {
+    None = 0,
+    Transfer(u64) = 1,
+    Adjustment { reason: EventString<16>, delta: i64 } = 2,
+}
+
+#[test]
+fn test_derived_pardosa_type_named_struct_roundtrip() {
+    let addr = Address {
+        street: EventString::new("Main St").unwrap(),
+        zip_code: 12345,
+    };
+
+    match Address::descriptor_node() {
+        DescriptorNode::Struct { name, fields } => {
+            assert_eq!(name, "Address");
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].name, "street");
+            assert_eq!(
+                fields[0].node,
+                DescriptorNode::EventString { max_bytes: 32 }
+            );
+            assert_eq!(fields[1].name, "zip_code");
+            assert_eq!(fields[1].node, DescriptorNode::U32);
+        }
+        other => panic!("expected Struct descriptor node, found {:?}", other),
+    }
+
+    let mut buf = Vec::new();
+    addr.encode_type(&mut buf).unwrap();
+
+    let (decoded, consumed) = Address::decode_type(&buf).unwrap();
+    assert_eq!(consumed, buf.len());
+    assert_eq!(decoded, addr);
+
+    buf.push(0xFF);
+    let (decoded_prefix, consumed_prefix) = Address::decode_type(&buf).unwrap();
+    assert_eq!(consumed_prefix, buf.len() - 1);
+    assert_eq!(decoded_prefix, addr);
+}
+
+#[test]
+fn test_derived_pardosa_type_unit_struct_roundtrip() {
+    let marker = Marker;
+
+    match Marker::descriptor_node() {
+        DescriptorNode::Struct { name, fields } => {
+            assert_eq!(name, "Marker");
+            assert_eq!(fields.len(), 0);
+        }
+        other => panic!("expected Struct descriptor node, found {:?}", other),
+    }
+
+    let mut buf = Vec::new();
+    marker.encode_type(&mut buf).unwrap();
+    assert!(buf.is_empty());
+
+    let (decoded, consumed) = Marker::decode_type(&buf).unwrap();
+    assert_eq!(consumed, 0);
+    assert_eq!(decoded, marker);
+}
+
+#[test]
+fn test_derived_pardosa_type_scalar_enum_roundtrip() {
+    match AccountState::descriptor_node() {
+        DescriptorNode::Enum {
+            name,
+            discriminant_width,
+            variants,
+        } => {
+            assert_eq!(name, "AccountState");
+            assert_eq!(discriminant_width, 1);
+            assert_eq!(variants.len(), 3);
+            assert_eq!(variants[0].name, "Active");
+            assert_eq!(variants[0].discriminant, 0);
+            assert_eq!(variants[0].payload, None);
+            assert_eq!(variants[1].name, "Suspended");
+            assert_eq!(variants[1].discriminant, 1);
+            assert_eq!(variants[2].name, "Closed");
+            assert_eq!(variants[2].discriminant, 2);
+        }
+        other => panic!("expected Enum descriptor node, found {:?}", other),
+    }
+
+    for state in [
+        AccountState::Active,
+        AccountState::Suspended,
+        AccountState::Closed,
+    ] {
+        let mut buf = Vec::new();
+        state.encode_type(&mut buf).unwrap();
+        assert_eq!(buf.len(), 1);
+
+        let (decoded, consumed) = AccountState::decode_type(&buf).unwrap();
+        assert_eq!(consumed, 1);
+        assert_eq!(decoded, state);
+    }
+
+    let err = AccountState::decode_type(&[99]).unwrap_err();
+    assert!(matches!(
+        err,
+        DecodeError::UnknownVariantDiscriminant { discriminant: 99 }
+    ));
+}
+
+#[test]
+fn test_derived_pardosa_type_composite_enum_roundtrip() {
+    match TransactionPayload::descriptor_node() {
+        DescriptorNode::Enum {
+            name,
+            discriminant_width,
+            variants,
+        } => {
+            assert_eq!(name, "TransactionPayload");
+            assert_eq!(discriminant_width, 1);
+            assert_eq!(variants.len(), 3);
+            assert_eq!(variants[0].name, "None");
+            assert_eq!(variants[0].payload, None);
+            assert_eq!(variants[1].name, "Transfer");
+            assert_eq!(variants[1].payload, Some(DescriptorNode::U64));
+            assert_eq!(variants[2].name, "Adjustment");
+            assert!(matches!(
+                variants[2].payload,
+                Some(DescriptorNode::Struct { .. })
+            ));
+        }
+        other => panic!("expected Enum descriptor node, found {:?}", other),
+    }
+
+    let cases = vec![
+        TransactionPayload::None,
+        TransactionPayload::Transfer(1_000_000),
+        TransactionPayload::Adjustment {
+            reason: EventString::new("Refund").unwrap(),
+            delta: -500,
+        },
+    ];
+
+    for case in cases {
+        let mut buf = Vec::new();
+        case.encode_type(&mut buf).unwrap();
+
+        let (decoded, consumed) = TransactionPayload::decode_type(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(decoded, case);
+    }
+}

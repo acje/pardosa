@@ -105,8 +105,8 @@
 //!   backpressure to upstream event producers, enforcing global process memory quotas, and establishing collection
 //!   deadlines.
 //! - **EventVec Decode Work Bounds**: [`encoding::EventVec`] decoding bounds initial heap allocation by
-//!   `remaining_wire.min(count)` and enforces that every decoded element consumes at least one wire byte,
-//!   ensuring zero-wire or tiny wire inputs cannot drive unbounded loop iterations or unbudgeted heap growth.
+//!   `remaining_wire.min(count)` and bounds decoding work by `MAX`, ensuring collection decoding
+//!   cannot exceed admitted schema limits.
 //! - **Transport Isolation**: Transport operations execute synchronously with sequential durability. `NatsEngine`
 //!   drains each publish future sequentially before initiating subsequent requests.
 //!
@@ -119,4 +119,4 @@ pub mod prelude;
 pub mod schema;
 pub mod store;
 
-pub use pardosa_derive::PardosaSchema;
+pub use pardosa_derive::{PardosaSchema, PardosaType};
