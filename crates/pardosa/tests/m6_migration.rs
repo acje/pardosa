@@ -707,3 +707,24 @@ fn test_compile_fail_migration_source_schema_version_max() {
         "stderr must cite u32::MAX constraint:\n{stderr}"
     );
 }
+
+#[test]
+fn test_compile_fail_missing_mandatory_schema_version_const() {
+    let code = r#"
+        use pardosa::schema::{DescriptorNode, PardosaSchema};
+
+        pub struct MissingConstEvent;
+        impl PardosaSchema for MissingConstEvent {
+            fn schema_descriptor() -> DescriptorNode { DescriptorNode::U8 }
+            fn encode_payload(&self, _: &mut Vec<u8>) -> Result<(), pardosa::encoding::EncodeError> { Ok(()) }
+            fn decode_payload(_: &[u8]) -> Result<Self, pardosa::encoding::DecodeError> { Ok(Self) }
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(!ok, "omitting const SCHEMA_VERSION must fail compilation");
+    assert!(
+        stderr.contains("SCHEMA_VERSION")
+            || stderr.contains("not all trait items implemented, missing: `SCHEMA_VERSION`"),
+        "stderr must cite missing SCHEMA_VERSION item:\n{stderr}"
+    );
+}

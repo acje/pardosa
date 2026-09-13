@@ -758,3 +758,29 @@ fn test_derived_pardosa_type_composite_enum_roundtrip() {
         assert_eq!(decoded, case);
     }
 }
+
+#[test]
+fn test_compile_fail_missing_schema_version_attribute() {
+    let code = r#"
+        use pardosa::prelude::*;
+
+        #[derive(Debug, PartialEq, Eq, PardosaSchema)]
+        #[repr(u8)]
+        enum MissingVersionEvent {
+            #[pardosa(tombstone)]
+            Tombstone = 0,
+            Action = 1,
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(
+        !ok,
+        "omitting #[pardosa(version = N)] must fail compilation"
+    );
+    assert!(
+        stderr.contains(
+            "missing mandatory `#[pardosa(version = N)]` attribute on PardosaSchema root"
+        ),
+        "stderr must cite missing mandatory version attribute:\n{stderr}"
+    );
+}

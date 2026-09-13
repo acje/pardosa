@@ -596,7 +596,7 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
         }
     };
 
-    let schema_version = parse_schema_version(&input.attrs)?;
+    let schema_version = parse_schema_version(input)?;
 
     let mut has_tombstone = false;
     let mut variant_data = Vec::with_capacity(data_enum.variants.len());
@@ -955,8 +955,8 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
     })
 }
 
-fn parse_schema_version(attrs: &[Attribute]) -> syn::Result<u32> {
-    for attr in attrs {
+fn parse_schema_version(input: &DeriveInput) -> syn::Result<u32> {
+    for attr in &input.attrs {
         if attr.path().is_ident("pardosa") {
             let mut version = None;
             attr.parse_nested_meta(|meta| {
@@ -974,7 +974,10 @@ fn parse_schema_version(attrs: &[Attribute]) -> syn::Result<u32> {
             }
         }
     }
-    Ok(1)
+    Err(syn::Error::new_spanned(
+        input,
+        "missing mandatory `#[pardosa(version = N)]` attribute on PardosaSchema root",
+    ))
 }
 
 fn check_tombstone_attr(attrs: &[Attribute]) -> syn::Result<bool> {
@@ -1090,8 +1093,10 @@ mod tests {
 
     #[test]
     fn test_reject_missing_explicit_discriminant() {
-        let input: DeriveInput =
-            parse_str("enum MyEvent { #[pardosa(tombstone)] Tombstone, Other = 1 }").unwrap();
+        let input: DeriveInput = parse_str(
+            "#[pardosa(version = 1)] enum MyEvent { #[pardosa(tombstone)] Tombstone, Other = 1 }",
+        )
+        .unwrap();
         let err = expand_pardosa_schema(&input).unwrap_err();
         assert!(err
             .to_string()
@@ -1100,7 +1105,9 @@ mod tests {
 
     #[test]
     fn test_reject_missing_tombstone() {
-        let input: DeriveInput = parse_str("enum MyEvent { Active = 1, Suspended = 2 }").unwrap();
+        let input: DeriveInput =
+            parse_str("#[pardosa(version = 1)] enum MyEvent { Active = 1, Suspended = 2 }")
+                .unwrap();
         let err = expand_pardosa_schema(&input).unwrap_err();
         assert!(err
             .to_string()
@@ -1110,7 +1117,7 @@ mod tests {
     #[test]
     fn test_reject_floating_point() {
         let input: DeriveInput =
-            parse_str("enum MyEvent { #[pardosa(tombstone)] Tombstone = 0, FloatData(f64) = 1 }")
+            parse_str("#[pardosa(version = 1)] enum MyEvent { #[pardosa(tombstone)] Tombstone = 0, FloatData(f64) = 1 }")
                 .unwrap();
         let err = expand_pardosa_schema(&input).unwrap_err();
         assert!(err
@@ -1121,7 +1128,7 @@ mod tests {
     #[test]
     fn test_reject_unbounded_string() {
         let input: DeriveInput =
-            parse_str("enum MyEvent { #[pardosa(tombstone)] Tombstone = 0, StrData(String) = 1 }")
+            parse_str("#[pardosa(version = 1)] enum MyEvent { #[pardosa(tombstone)] Tombstone = 0, StrData(String) = 1 }")
                 .unwrap();
         let err = expand_pardosa_schema(&input).unwrap_err();
         assert!(err.to_string().contains("unsupported type `String`"));
@@ -1130,7 +1137,7 @@ mod tests {
     #[test]
     fn test_reject_unbounded_vec() {
         let input: DeriveInput =
-            parse_str("enum MyEvent { #[pardosa(tombstone)] Tombstone = 0, VecData(Vec<u8>) = 1 }")
+            parse_str("#[pardosa(version = 1)] enum MyEvent { #[pardosa(tombstone)] Tombstone = 0, VecData(Vec<u8>) = 1 }")
                 .unwrap();
         let err = expand_pardosa_schema(&input).unwrap_err();
         assert!(err.to_string().contains("unsupported type `Vec`"));
@@ -1139,7 +1146,7 @@ mod tests {
     #[test]
     fn test_detect_cycle_direct() {
         let input: DeriveInput =
-            parse_str("enum MyNode { #[pardosa(tombstone)] Tombstone = 0, Next(Box<MyNode>) = 1 }")
+            parse_str("#[pardosa(version = 1)] enum MyNode { #[pardosa(tombstone)] Tombstone = 0, Next(Box<MyNode>) = 1 }")
                 .unwrap();
         let err = expand_pardosa_schema(&input).unwrap_err();
         assert!(err.to_string().contains("cycle detected"));
@@ -1155,9 +1162,20 @@ mod tests {
     }
 
     #[test]
+    fn test_reject_missing_version_attr() {
+        let input: DeriveInput =
+            parse_str("enum MyEvent { #[pardosa(tombstone)] Tombstone = 0, Created(u32) = 1 }")
+                .unwrap();
+        let err = expand_pardosa_schema(&input).unwrap_err();
+        assert!(err.to_string().contains(
+            "missing mandatory `#[pardosa(version = N)]` attribute on PardosaSchema root"
+        ));
+    }
+
+    #[test]
     fn test_reject_discriminant_overflow() {
         let input: DeriveInput =
-            parse_str("enum MyEvent { #[pardosa(tombstone)] Tombstone = 0, Big = 65536 }").unwrap();
+            parse_str("#[pardosa(version = 1)] enum MyEvent { #[pardosa(tombstone)] Tombstone = 0, Big = 65536 }").unwrap();
         let err = expand_pardosa_schema(&input).unwrap_err();
         assert!(err
             .to_string()
@@ -1167,7 +1185,7 @@ mod tests {
     #[test]
     fn test_reject_duplicate_discriminant() {
         let input: DeriveInput = parse_str(
-            "enum MyEvent { #[pardosa(tombstone)] Tombstone = 0, First = 1, Second = 1 }",
+            "#[pardosa(version = 1)] enum MyEvent { #[pardosa(tombstone)] Tombstone = 0, First = 1, Second = 1 }",
         )
         .unwrap();
         let err = expand_pardosa_schema(&input).unwrap_err();

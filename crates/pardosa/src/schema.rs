@@ -591,12 +591,25 @@ impl SchemaDescriptor {
         Ok((Self { version, root }, 4 + consumed))
     }
 
+    /// Derives the schema identity for this descriptor fallibly.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if the descriptor violates structural completeness,
+    /// has version 0, depth > 16, invalid or duplicate discriminants, or invalid widths.
+    pub fn try_identity(&self) -> Result<SchemaIdentity, OperationFailure> {
+        let admitted = AdmittedDescriptor::try_from_descriptor(self.clone())?;
+        Ok(SchemaIdentity::from_descriptor(&admitted))
+    }
+
     /// Derives the schema identity for this descriptor.
+    ///
+    /// # Panics
+    /// Panics if the schema descriptor violates admission validation. Use [`try_identity`](Self::try_identity)
+    /// for fallible derivation.
     #[must_use]
     pub fn identity(&self) -> SchemaIdentity {
-        let admitted = AdmittedDescriptor::try_from_descriptor(self.clone())
-            .expect("SchemaDescriptor must be valid to compute identity; use AdmittedDescriptor for panic-free identity");
-        SchemaIdentity::from_descriptor(&admitted)
+        self.try_identity()
+            .expect("SchemaDescriptor must be valid to compute identity; use try_identity for fallible derivation")
     }
 
     /// Asserts that this schema descriptor is structurally complete per C8.2.
@@ -684,7 +697,7 @@ impl AdmittedDescriptor {
     /// Derives the schema identity.
     #[must_use]
     pub fn identity(&self) -> SchemaIdentity {
-        self.0.identity()
+        SchemaIdentity::from_descriptor(self)
     }
 }
 
@@ -922,7 +935,7 @@ pub fn derive_fiber_id(domain_key: &str) -> [u8; 16] {
 /// Trait implemented by payload types declaring schema descriptor and codecs.
 pub trait PardosaSchema: Sized {
     /// Declared schema version constant.
-    const SCHEMA_VERSION: u32 = 1;
+    const SCHEMA_VERSION: u32;
 
     /// Returns declared schema version.
     fn schema_version() -> u32 {
@@ -1322,12 +1335,13 @@ impl<T: PardosaType, const MAX: usize> PardosaType for EventVec<T, MAX> {
         let mut items = Vec::with_capacity(initial_capacity);
         for _ in 0..count {
             let (item, consumed) = T::decode_type(&buf[cursor..])?;
-            let next_cursor = cursor
-                .checked_add(consumed)
-                .ok_or_else(|| DecodeError::TruncatedPayload {
-                    expected: usize::MAX,
-                    available: buf.len(),
-                })?;
+            let next_cursor =
+                cursor
+                    .checked_add(consumed)
+                    .ok_or(DecodeError::TruncatedPayload {
+                        expected: usize::MAX,
+                        available: buf.len(),
+                    })?;
             if next_cursor > buf.len() {
                 return Err(DecodeError::TruncatedPayload {
                     expected: next_cursor,
@@ -1813,6 +1827,35 @@ mod tests {
             err_width.condition(),
             FailureCondition::ValueConstraintViolated {
                 constraint: ValueConstraint::NotReal
+            }
+        ));
+    }
+
+    #[test]
+    fn test_schema_descriptor_try_identity() {
+        let valid = SchemaDescriptor::new(1, DescriptorNode::U64);
+        let identity = valid.try_identity().unwrap();
+        assert_eq!(identity, valid.identity());
+
+        let invalid_zero = SchemaDescriptor::new(0, DescriptorNode::U64);
+        let err_zero = invalid_zero.try_identity().unwrap_err();
+        assert_eq!(
+            *err_zero.condition(),
+            FailureCondition::MissingSchemaDescriptor
+        );
+
+        let mut deep = DescriptorNode::U32;
+        for _ in 0..17 {
+            deep = DescriptorNode::Option {
+                inner: Box::new(deep),
+            };
+        }
+        let invalid_deep = SchemaDescriptor::new(1, deep);
+        let err_deep = invalid_deep.try_identity().unwrap_err();
+        assert!(matches!(
+            err_deep.condition(),
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong
             }
         ));
     }
