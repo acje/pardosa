@@ -676,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_from_frames_broken_envelope_event_id_tracked_for_uniqueness() {
+    fn test_session_index_build_from_frames_broken_envelope_event_id_tracked_for_uniqueness() {
         let f1 = [0x71; 16];
         let f2 = [0x72; 16];
         let shared_event_id = [0x88; 16];
@@ -890,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_fiber_broken_reason_truncation_and_capacity_refusal() {
+    fn test_session_index_mark_fiber_broken_reason_truncation_and_capacity_refusal() {
         let mut index = SessionIndex::new();
         let fiber_id = [0x77; 16];
         let mut huge_capacity_string = String::with_capacity(1024 * 1024);
@@ -930,7 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_fiber_broken_unicode_scalar_bound() {
+    fn test_session_index_mark_fiber_broken_unicode_scalar_bound() {
         let mut index = SessionIndex::new();
         let fiber_id = [0x99; 16];
         let emoji_reason = "🦀".repeat(300);
@@ -990,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_fiber_broken_transitions_fiber_to_broken() {
+    fn test_session_index_mark_fiber_broken_transitions_fiber_to_broken() {
         let mut index = SessionIndex::new();
         let fiber_id = [0x99; 16];
         let env1 = EventEnvelope::genesis([0x01; 16], fiber_id, vec![0xaa; 100]).unwrap();
@@ -1004,7 +1004,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_fiber_broken_active_replacement_capacity_refusal() {
+    fn test_session_index_mark_fiber_broken_active_replacement_capacity_refusal() {
         let mut index = SessionIndex::new();
         for i in 0..MAX_ACTIVE_FIBERS as u32 {
             let mut fid = [0u8; 16];
@@ -1022,7 +1022,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_fiber_broken_broken_replacement_capacity_refusal() {
+    fn test_session_index_mark_fiber_broken_broken_replacement_capacity_refusal() {
         let mut index = SessionIndex::new();
         for i in 0..MAX_ACTIVE_FIBERS as u32 {
             let mut fid = [0u8; 16];
@@ -1047,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_has_raw_frames_revokes_validate_append() {
+    fn test_session_index_mark_has_raw_frames_revokes_validate_append() {
         let mut index = SessionIndex::new();
         let fiber_id = [0x88; 16];
         let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"payload").unwrap();
@@ -1066,7 +1066,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_from_frames_broken_event_id_capacity_accounting_and_refusal() {
+    fn test_session_index_build_from_frames_broken_event_id_capacity_accounting_and_refusal() {
         let f1 = [0x71; 16];
         let broken_env1 = EventEnvelope {
             header: crate::encoding::EnvelopeHeader {
@@ -1104,7 +1104,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_broken_event_id_capacity_exhaustion_refusal() {
+    fn test_session_index_record_broken_event_id_capacity_exhaustion_refusal() {
         let mut index = SessionIndex::new();
         let fiber_id = [0x88; 16];
         index
@@ -1124,7 +1124,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_from_frames_broken_fiber_event_count_limit_exhaustion() {
+    fn test_session_index_build_from_frames_broken_fiber_event_count_limit_exhaustion() {
         assert_eq!(MAX_EVENTS_PER_FIBER, 100_000);
         let fiber_id = [0x42; 16];
         let count = (MAX_EVENTS_PER_FIBER + 1) as usize;

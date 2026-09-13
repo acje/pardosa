@@ -1806,6 +1806,7 @@ impl FileReaderSession {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::encoding::EventEnvelope;
@@ -2971,7 +2972,9 @@ mod tests {
         let mut writer = adapter.create(&claim).expect("create writer");
         let fiber_id = [0xAA; 16];
         let event_id = [0x01; 16];
-        writer.append_to_fiber(fiber_id, event_id, b"first-event").expect("append event");
+        writer
+            .append_to_fiber(fiber_id, event_id, b"first-event")
+            .expect("append event");
 
         let desc = SchemaDescriptor::new(1, DescriptorNode::U64);
         let err = writer.set_schema_descriptor(&desc).unwrap_err();
@@ -3015,7 +3018,8 @@ mod tests {
         )
         .unwrap();
 
-        let records = read_meta_records(meta_path).expect("identical multiple descriptors are allowed");
+        let records =
+            read_meta_records(meta_path).expect("identical multiple descriptors are allowed");
         assert_eq!(records.schema_descriptor.unwrap().version, 1);
 
         let mut desc2_bytes = Vec::new();
@@ -3030,6 +3034,9 @@ mod tests {
         .unwrap();
 
         let err = read_meta_records(meta_path).unwrap_err();
-        assert_eq!(*err.condition(), FailureCondition::OwnershipRecordUnreadable);
+        assert_eq!(
+            *err.condition(),
+            FailureCondition::OwnershipRecordUnreadable
+        );
     }
 }

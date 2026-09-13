@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use pardosa::prelude::*;
 use pardosa_nats::test_support::LiveNatsServer;
 use pardosa_nats::NatsStorageAdapter;
@@ -2209,22 +2211,46 @@ fn test_nats_reopen_same_stream_append_continuation_matches_batch() {
     let mut events_n = Vec::new();
     let mut event_num = 1u8;
     for _round in 0..4 {
-        events_n.push((fiber1, [event_num; 16], format!("payload-{event_num}").into_bytes()));
+        events_n.push((
+            fiber1,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
         event_num += 1;
-        events_n.push((fiber2, [event_num; 16], format!("payload-{event_num}").into_bytes()));
+        events_n.push((
+            fiber2,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
         event_num += 1;
-        events_n.push((fiber3, [event_num; 16], format!("payload-{event_num}").into_bytes()));
+        events_n.push((
+            fiber3,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
         event_num += 1;
     }
     assert_eq!(events_n.len(), 12);
 
     let mut events_m = Vec::new();
     for _round in 0..3 {
-        events_m.push((fiber1, [event_num; 16], format!("payload-{event_num}").into_bytes()));
+        events_m.push((
+            fiber1,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
         event_num += 1;
-        events_m.push((fiber2, [event_num; 16], format!("payload-{event_num}").into_bytes()));
+        events_m.push((
+            fiber2,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
         event_num += 1;
-        events_m.push((fiber3, [event_num; 16], format!("payload-{event_num}").into_bytes()));
+        events_m.push((
+            fiber3,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
         event_num += 1;
     }
     assert_eq!(events_m.len(), 9);
@@ -2275,7 +2301,10 @@ fn test_nats_reopen_same_stream_append_continuation_matches_batch() {
         final_writer_b.rolling_commitment().frame_count()
     );
     assert_eq!(final_writer_a.rolling_commitment().frame_count(), 21);
-    assert_eq!(final_writer_a.last_sequence(), final_writer_b.last_sequence());
+    assert_eq!(
+        final_writer_a.last_sequence(),
+        final_writer_b.last_sequence()
+    );
 
     for fiber_id in [fiber1, fiber2, fiber3] {
         let handle_a = final_writer_a.fiber(fiber_id).expect("fiber handle a");
@@ -2284,8 +2313,14 @@ fn test_nats_reopen_same_stream_append_continuation_matches_batch() {
         assert_eq!(handle_a.precursor(), handle_b.precursor());
         assert_eq!(handle_a.state(), handle_b.state());
 
-        let latest_a = final_writer_a.get_latest(fiber_id).expect("latest a").unwrap();
-        let latest_b = final_writer_b.get_latest(fiber_id).expect("latest b").unwrap();
+        let latest_a = final_writer_a
+            .get_latest(fiber_id)
+            .expect("latest a")
+            .unwrap();
+        let latest_b = final_writer_b
+            .get_latest(fiber_id)
+            .expect("latest b")
+            .unwrap();
         assert_eq!(latest_a.header.event_id, latest_b.header.event_id);
         assert_eq!(latest_a.header.precursor, latest_b.header.precursor);
         assert_eq!(latest_a.header.fiber_id, latest_b.header.fiber_id);
@@ -2321,18 +2356,28 @@ fn test_nats_read_meta_records_missing_seq1_fails_closed() {
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
     let claim = sample_claim(1);
 
-    adapter.create_incomplete_meta_only(&claim).expect("create meta");
+    adapter
+        .create_incomplete_meta_only(&claim)
+        .expect("create meta");
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
         let client = async_nats::connect(server.url()).await.expect("connect");
         let js = async_nats::jetstream::new(client);
-        let stream = js.get_stream(adapter.meta_stream_name()).await.expect("get stream");
+        let stream = js
+            .get_stream(adapter.meta_stream_name())
+            .await
+            .expect("get stream");
         stream.delete_message(1).await.expect("delete seq 1");
     });
 
-    let err = adapter.read_meta_records().expect_err("must fail closed when seq 1 is deleted");
-    assert_eq!(*err.condition(), FailureCondition::OwnershipRecordUnreadable);
+    let err = adapter
+        .read_meta_records()
+        .expect_err("must fail closed when seq 1 is deleted");
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::OwnershipRecordUnreadable
+    );
 
     adapter.delete_streams().expect("cleanup");
 }

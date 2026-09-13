@@ -19,6 +19,8 @@ pub struct Store<E: StorageEngine> {
     pub(crate) rolling_commitment: RollingCommitment,
     pub(crate) fiber_index: SessionIndex,
     pub(crate) broken_reader_cause: Option<FailureCondition>,
+    pub(crate) uncertain: bool,
+    pub(crate) uncertain_diagnostic: Option<String>,
 }
 
 impl<E: StorageEngine + fmt::Debug> fmt::Debug for Store<E> {
@@ -28,6 +30,8 @@ impl<E: StorageEngine + fmt::Debug> fmt::Debug for Store<E> {
             .field("rolling_commitment", &self.rolling_commitment)
             .field("fiber_index", &self.fiber_index)
             .field("broken_reader_cause", &self.broken_reader_cause)
+            .field("uncertain", &self.uncertain)
+            .field("uncertain_diagnostic", &self.uncertain_diagnostic)
             .finish()
     }
 }
@@ -51,6 +55,8 @@ impl<E: StorageEngine> Store<E> {
             rolling_commitment,
             fiber_index,
             broken_reader_cause: None,
+            uncertain: false,
+            uncertain_diagnostic: None,
         })
     }
 
@@ -81,6 +87,8 @@ impl<E: StorageEngine> Store<E> {
                 rolling_commitment: rolling,
                 fiber_index: SessionIndex::new(),
                 broken_reader_cause: Some(cause),
+                uncertain: false,
+                uncertain_diagnostic: None,
             };
         }
 
@@ -90,6 +98,8 @@ impl<E: StorageEngine> Store<E> {
                 rolling_commitment: rolling,
                 fiber_index: SessionIndex::new(),
                 broken_reader_cause: Some(FailureCondition::PrecursorChainBroken(None)),
+                uncertain: false,
+                uncertain_diagnostic: None,
             };
         }
 
@@ -99,12 +109,16 @@ impl<E: StorageEngine> Store<E> {
                 rolling_commitment: rolling,
                 fiber_index,
                 broken_reader_cause: None,
+                uncertain: false,
+                uncertain_diagnostic: None,
             },
             Err(err) => Self {
                 engine,
                 rolling_commitment: RollingCommitment::new(),
                 fiber_index: SessionIndex::new(),
                 broken_reader_cause: Some(err.condition().clone()),
+                uncertain: false,
+                uncertain_diagnostic: None,
             },
         }
     }
@@ -134,7 +148,24 @@ impl<E: StorageEngine> Store<E> {
     /// Returns the diagnostic detail string if the engine entered an uncertain write state.
     #[must_use]
     pub fn uncertain_diagnostic(&self) -> Option<&str> {
-        self.engine.uncertain_diagnostic()
+        self.uncertain_diagnostic
+            .as_deref()
+            .or_else(|| self.engine.uncertain_diagnostic())
+    }
+
+    fn check_session_authority(&self) -> Result<(), OperationFailure> {
+        if self.uncertain || self.engine.uncertain_diagnostic().is_some() {
+            let detail = if let Some(diag) = self.uncertain_diagnostic() {
+                format!("writer session in uncertain state; reconciliation required: {diag}")
+            } else {
+                "writer session in uncertain state; reconciliation required".to_string()
+            };
+            return Err(OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                detail,
+            ));
+        }
+        self.engine.check_authority()
     }
 
     /// Returns the active ownership claim record, if established.
@@ -206,7 +237,7 @@ impl<E: StorageEngine> Store<E> {
         descriptor: &SchemaDescriptor,
     ) -> Result<(), OperationFailure> {
         descriptor.validate_structural_completeness()?;
-        self.engine.check_authority()?;
+        self.check_session_authority()?;
         if let Some(existing) = self.schema_descriptor() {
             if existing == descriptor {
                 return Ok(());
@@ -260,7 +291,7 @@ impl<E: StorageEngine> Store<E> {
     /// # Errors
     /// Returns [`OperationFailure`] if authority verification or recording fails.
     pub fn record_meta_record(&mut self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
-        self.engine.check_authority()?;
+        self.check_session_authority()?;
         self.engine.record_meta_record(record)
     }
 
@@ -272,6 +303,7 @@ impl<E: StorageEngine> Store<E> {
         &mut self,
         pointer: &OutboundPointerRecord,
     ) -> Result<(), OperationFailure> {
+        self.check_session_authority()?;
         self.engine.record_outbound_pointer(pointer)
     }
 
@@ -283,6 +315,7 @@ impl<E: StorageEngine> Store<E> {
         &mut self,
         pointer: &InboundPointerRecord,
     ) -> Result<(), OperationFailure> {
+        self.check_session_authority()?;
         self.engine.record_inbound_pointer(pointer)
     }
 
@@ -294,6 +327,7 @@ impl<E: StorageEngine> Store<E> {
         &mut self,
         start: &MigrationStartRecord,
     ) -> Result<(), OperationFailure> {
+        self.check_session_authority()?;
         self.engine.record_migration_start(start)
     }
 
@@ -305,6 +339,7 @@ impl<E: StorageEngine> Store<E> {
         &mut self,
         end: &MigrationEndRecord,
     ) -> Result<(), OperationFailure> {
+        self.check_session_authority()?;
         self.engine.record_migration_end(end)
     }
 
@@ -316,6 +351,7 @@ impl<E: StorageEngine> Store<E> {
         &mut self,
         choice: &RescuePolicyChoiceRecord,
     ) -> Result<(), OperationFailure> {
+        self.check_session_authority()?;
         self.engine.record_rescue_policy_choice(choice)
     }
 
@@ -332,10 +368,15 @@ impl<E: StorageEngine> Store<E> {
     /// # Errors
     /// Returns [`OperationFailure`] if reader has failed or fiber is broken.
     pub fn fiber(&self, fiber_id: [u8; 16]) -> Result<FiberHandle, OperationFailure> {
-        if self.engine.uncertain_diagnostic().is_some() {
+        if self.uncertain || self.engine.uncertain_diagnostic().is_some() {
+            let detail = if let Some(diag) = self.uncertain_diagnostic() {
+                format!("writer session in uncertain state; reconciliation required: {diag}")
+            } else {
+                "writer session in uncertain state; reconciliation required".to_string()
+            };
             return Err(OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
-                "writer session in uncertain state; reconciliation required",
+                detail,
             ));
         }
         if let Some(ref cause) = self.broken_reader_cause {
@@ -363,10 +404,15 @@ impl<E: StorageEngine> Store<E> {
         &self,
         fiber_id: [u8; 16],
     ) -> Result<Option<&EventEnvelope>, OperationFailure> {
-        if self.engine.uncertain_diagnostic().is_some() {
+        if self.uncertain || self.engine.uncertain_diagnostic().is_some() {
+            let detail = if let Some(diag) = self.uncertain_diagnostic() {
+                format!("writer session in uncertain state; reconciliation required: {diag}")
+            } else {
+                "writer session in uncertain state; reconciliation required".to_string()
+            };
             return Err(OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
-                "writer session in uncertain state; reconciliation required",
+                detail,
             ));
         }
         if let Some(ref cause) = self.broken_reader_cause {
@@ -389,7 +435,7 @@ impl<E: StorageEngine> Store<E> {
         self.get_latest(derive_fiber_id(domain_key))
     }
 
-    fn append_frame_raw(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
+    fn append_frame_raw_internal(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
         let mut frame_buf = Vec::new();
         ContainerFrame::encode_payload(payload, &mut frame_buf);
         let verdict = self.engine.append_block(&frame_buf)?;
@@ -398,15 +444,16 @@ impl<E: StorageEngine> Store<E> {
                 self.rolling_commitment.update_frame(&frame_buf);
                 Ok(self.rolling_commitment.frame_count())
             }
-            WriteLandingVerdict::Undetermined { .. } => {
+            WriteLandingVerdict::Undetermined { carried_epoch } => {
+                self.uncertain = true;
                 let diag = self
                     .engine
                     .uncertain_diagnostic()
                     .map(ToString::to_string)
                     .unwrap_or_else(|| {
-                        "write landing undetermined: operation may or may not have landed; transport/sync confirmation failed"
-                            .to_string()
+                        format!("writer session in uncertain state; reconciliation required: write landing undetermined for carried epoch {carried_epoch} per C5.16")
                     });
+                self.uncertain_diagnostic = Some(diag.clone());
                 Err(OperationFailure::new(
                     FailureCondition::TransportUnavailable,
                     diag,
@@ -419,19 +466,46 @@ impl<E: StorageEngine> Store<E> {
     ///
     /// # Errors
     /// Returns [`OperationFailure`] if write or sync fails.
-    pub fn append_raw_frame(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
-        self.engine.check_authority()?;
+    #[deprecated(
+        note = "lossy append folds landing uncertainty; use append_frame_verdict per C5.16"
+    )]
+    pub fn append_frame_raw(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
+        self.check_session_authority()?;
         if payload.len() >= 85 {
             if let Ok((env, consumed)) = EventEnvelope::decode(payload) {
                 if consumed == payload.len() {
                     self.fiber_index.validate_append(&env)?;
-                    let count = self.append_frame_raw(payload)?;
+                    let count = self.append_frame_raw_internal(payload)?;
                     self.fiber_index.commit_envelope_unchecked(env);
                     return Ok(count);
                 }
             }
         }
-        let count = self.append_frame_raw(payload)?;
+        let count = self.append_frame_raw_internal(payload)?;
+        self.fiber_index.mark_has_raw_frames();
+        Ok(count)
+    }
+
+    /// Appends a raw frame payload without session index pre-admission validation.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if write or sync fails.
+    #[deprecated(
+        note = "lossy append folds landing uncertainty; use append_frame_verdict per C5.16"
+    )]
+    pub fn append_raw_frame(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
+        self.check_session_authority()?;
+        if payload.len() >= 85 {
+            if let Ok((env, consumed)) = EventEnvelope::decode(payload) {
+                if consumed == payload.len() {
+                    self.fiber_index.validate_append(&env)?;
+                    let count = self.append_frame_raw_internal(payload)?;
+                    self.fiber_index.commit_envelope_unchecked(env);
+                    return Ok(count);
+                }
+            }
+        }
+        let count = self.append_frame_raw_internal(payload)?;
         self.fiber_index.mark_has_raw_frames();
         Ok(count)
     }
@@ -442,8 +516,8 @@ impl<E: StorageEngine> Store<E> {
     /// Returns [`OperationFailure`] if authority verification or storage write fails.
     #[doc(hidden)]
     pub fn append_unvalidated_frame(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
-        self.engine.check_authority()?;
-        let count = self.append_frame_raw(payload)?;
+        self.check_session_authority()?;
+        let count = self.append_frame_raw_internal(payload)?;
         self.fiber_index.mark_has_raw_frames();
         Ok(count)
     }
@@ -456,7 +530,7 @@ impl<E: StorageEngine> Store<E> {
         &mut self,
         payload: &[u8],
     ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-        self.engine.check_authority()?;
+        self.check_session_authority()?;
         if payload.len() < 85 {
             return Err(OperationFailure::new(
                 FailureCondition::EnvelopeMismatch,
@@ -497,6 +571,15 @@ impl<E: StorageEngine> Store<E> {
                 ))
             }
             WriteLandingVerdict::Undetermined { carried_epoch } => {
+                self.uncertain = true;
+                let diag = self
+                    .engine
+                    .uncertain_diagnostic()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| {
+                        format!("writer session in uncertain state; reconciliation required: write landing undetermined for carried epoch {carried_epoch} per C5.16")
+                    });
+                self.uncertain_diagnostic = Some(diag);
                 Ok(WriteLandingVerdict::Undetermined { carried_epoch })
             }
         }
@@ -506,16 +589,18 @@ impl<E: StorageEngine> Store<E> {
     ///
     /// # Errors
     /// Returns [`OperationFailure`] if validation, storage write, or landing fails.
+    #[deprecated(
+        note = "lossy append folds landing uncertainty; use append_frame_verdict per C5.16"
+    )]
     pub fn append_frame(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
         match self.append_frame_verdict(payload)? {
             WriteLandingVerdict::Landed(count) => Ok(count),
             WriteLandingVerdict::Undetermined { .. } => {
                 let diag = self
-                    .engine
                     .uncertain_diagnostic()
                     .map(ToString::to_string)
                     .unwrap_or_else(|| {
-                        "write landing undetermined: operation may or may not have landed; use append_envelope_verdict to preserve landing certainty per C5.16"
+                        "write landing undetermined: operation may or may not have landed; use append_frame_verdict to preserve landing certainty per C5.16"
                             .to_string()
                     });
                 Err(OperationFailure::new(
@@ -543,12 +628,14 @@ impl<E: StorageEngine> Store<E> {
     ///
     /// # Errors
     /// Returns [`OperationFailure`] if validation, storage write, or landing fails.
+    #[deprecated(
+        note = "lossy append folds landing uncertainty; use append_envelope_verdict per C5.16"
+    )]
     pub fn append_envelope(&mut self, envelope: &EventEnvelope) -> Result<u64, OperationFailure> {
         match self.append_envelope_verdict(envelope)? {
             WriteLandingVerdict::Landed(count) => Ok(count),
             WriteLandingVerdict::Undetermined { .. } => {
                 let diag = self
-                    .engine
                     .uncertain_diagnostic()
                     .map(ToString::to_string)
                     .unwrap_or_else(|| {
@@ -573,6 +660,7 @@ impl<E: StorageEngine> Store<E> {
         event_id: [u8; 16],
         payload: impl Into<Vec<u8>>,
     ) -> Result<WriteLandingVerdict<EventEnvelope>, OperationFailure> {
+        self.check_session_authority()?;
         let mut handle = self.fiber(fiber_id)?;
         let envelope = handle.append(event_id, payload)?;
         let mut env_buf = Vec::new();
@@ -596,6 +684,7 @@ impl<E: StorageEngine> Store<E> {
         event_id: [u8; 16],
         payload: impl Into<Vec<u8>>,
     ) -> Result<WriteLandingVerdict<EventEnvelope>, OperationFailure> {
+        self.check_session_authority()?;
         let mut handle = self.fiber(fiber_id)?;
         let envelope = handle.detach(event_id, payload)?;
         let mut env_buf = Vec::new();
@@ -619,6 +708,7 @@ impl<E: StorageEngine> Store<E> {
         event_id: [u8; 16],
         payload: impl Into<Vec<u8>>,
     ) -> Result<WriteLandingVerdict<EventEnvelope>, OperationFailure> {
+        self.check_session_authority()?;
         let mut handle = self.fiber(fiber_id)?;
         let envelope = handle.rescue(event_id, payload)?;
         let mut env_buf = Vec::new();
@@ -859,6 +949,7 @@ impl<E: StorageEngine> Store<E> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::store::FiberState;
@@ -1118,6 +1209,46 @@ mod tests {
         assert!(err
             .to_string()
             .contains("writer session in uncertain state; reconciliation required"));
+    }
+
+    #[test]
+    fn test_store_session_marks_permanently_uncertain_on_undetermined_outcome() {
+        let engine = InMemoryEngine {
+            epoch: 1,
+            undetermined_after_n_blocks: Some(0),
+            ..Default::default()
+        };
+        let mut store = Store::open_writer(engine).expect("open writer");
+        let fiber_id = [0x11; 16];
+        let event_id1 = [0x01; 16];
+        let verdict = store
+            .append_to_fiber(fiber_id, event_id1, b"first-event")
+            .expect("call succeeds returning verdict");
+        assert!(matches!(verdict, WriteLandingVerdict::Undetermined { .. }));
+
+        let event_id2 = [0x02; 16];
+        let err = store
+            .append_to_fiber(fiber_id, event_id2, b"second-event")
+            .unwrap_err();
+        assert_eq!(
+            *err.condition(),
+            FailureCondition::OwnershipRecordUnreadable
+        );
+        assert!(err
+            .to_string()
+            .contains("writer session in uncertain state; reconciliation required"));
+
+        let err_fiber = store.fiber(fiber_id).unwrap_err();
+        assert_eq!(
+            *err_fiber.condition(),
+            FailureCondition::OwnershipRecordUnreadable
+        );
+
+        let err_latest = store.get_latest(fiber_id).unwrap_err();
+        assert_eq!(
+            *err_latest.condition(),
+            FailureCondition::OwnershipRecordUnreadable
+        );
     }
 
     #[test]

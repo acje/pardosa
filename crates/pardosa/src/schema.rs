@@ -1305,8 +1305,9 @@ impl<T: PardosaType, const MAX: usize> PardosaType for EventVec<T, MAX> {
         if count > MAX {
             return Err(DecodeError::ItemCountExceeded { count, max: MAX });
         }
+        let initial_capacity = (buf.len() - 4).min(count);
         let mut cursor = 4;
-        let mut items = Vec::with_capacity(count);
+        let mut items = Vec::with_capacity(initial_capacity);
         for _ in 0..count {
             let (item, consumed) = T::decode_type(&buf[cursor..])?;
             cursor += consumed;
@@ -1569,6 +1570,19 @@ mod tests {
     }
 
     #[test]
+    fn test_event_vec_decode_allocation_bomb_rejection() {
+        let buf = [255, 255, 255, 255];
+        let err = EventVec::<u64, 4294967295>::decode_type(&buf).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::TruncatedPayload {
+                expected: 8,
+                available: 0
+            }
+        ));
+    }
+
+    #[test]
     fn test_derive_fiber_id() {
         let key1 = "account.us-east.98765";
         let fiber_id_1 = derive_fiber_id(key1);
@@ -1617,7 +1631,10 @@ mod tests {
 
         let zero_version = SchemaDescriptor::new(0, DescriptorNode::U64);
         let err_zero = AdmittedDescriptor::try_from_descriptor(zero_version).unwrap_err();
-        assert_eq!(*err_zero.condition(), FailureCondition::MissingSchemaDescriptor);
+        assert_eq!(
+            *err_zero.condition(),
+            FailureCondition::MissingSchemaDescriptor
+        );
 
         let mut deep_node = DescriptorNode::U32;
         for _ in 0..65 {

@@ -1,14 +1,15 @@
 //! Migration lifecycle, recovery, cutover, and dense re-chaining per C5.63, C6.16-20, and C12.2.
 
-use crate::encoding::{
-    EnvelopeHeader, EventEnvelope, InboundPointerRecord, MigrationEndRecord, MigrationStartRecord,
-    MigrationStatus, OutboundPointerRecord, OwnershipRecord, RescuePolicy,
-    RescuePolicyChoiceRecord,
+use crate::encoding::{EnvelopeHeader, EventEnvelope, OwnershipRecord};
+pub use crate::encoding::{
+    InboundPointerRecord, MigrationEndRecord, MigrationStartRecord, MigrationStatus,
+    OutboundPointerRecord, RescuePolicy, RescuePolicyChoiceRecord,
 };
 use crate::file::{FileStorageAdapter, MetaRecords};
 use crate::schema::SchemaDescriptor;
 use crate::store::{CausalChainError, FailureCondition, FiberMigrationPolicy, OperationFailure};
 use std::collections::HashMap;
+use std::fmt;
 
 /// Caller election on broken precursor chain handling per C5.28 and T3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +192,7 @@ impl MigrationTarget for FileStorageAdapter {
     }
 }
 
+#[allow(dead_code)]
 fn mint_fresh_identity(generation: u32, original_id: &[u8; 16], counter: u64) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"PARDOSA_GENERATION_BOUNDARY_MINT_V1");
@@ -212,6 +214,7 @@ pub struct MigrationManager<S, T, F> {
     rescue_policy: RescuePolicy,
     rescue_policy_parameters: Vec<u8>,
     broken_chain_election: BrokenChainElection,
+    #[allow(dead_code)]
     transformer: F,
     source_generation: u32,
     target_generation: u32,
@@ -223,6 +226,17 @@ pub struct MigrationManager<S, T, F> {
     known_source_commitments: HashMap<[u8; 16], ([u8; 16], [u8; 32])>,
 }
 
+impl<S: fmt::Debug, T: fmt::Debug, F> fmt::Debug for MigrationManager<S, T, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MigrationManager")
+            .field("source", &self.source)
+            .field("target", &self.target)
+            .field("phase", &self.phase)
+            .finish()
+    }
+}
+
+#[allow(dead_code)]
 fn identity_transformer(payload: &[u8]) -> Result<Vec<u8>, OperationFailure> {
     Ok(payload.to_vec())
 }
@@ -231,8 +245,21 @@ impl<S: MigrationSource, T: MigrationTarget>
     MigrationManager<S, T, fn(&[u8]) -> Result<Vec<u8>, OperationFailure>>
 {
     /// Creates a new migration manager with default identity payload transformation.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::InvariantBreakingConfiguration`]
+    /// because live migration is disabled per C5.18.
+    pub fn new(source: S, target: T) -> Result<Self, OperationFailure> {
+        let _ = (source, target);
+        Err(OperationFailure::new(
+            FailureCondition::InvariantBreakingConfiguration,
+            "live migration is disabled in this release per C5.18; use offline administrative migration",
+        ))
+    }
+
+    #[doc(hidden)]
     #[must_use]
-    pub fn new(source: S, target: T) -> Self {
+    pub fn new_for_test(source: S, target: T) -> Self {
         Self {
             source,
             target,
@@ -326,6 +353,7 @@ where
         self.phase
     }
 
+    #[allow(dead_code)]
     fn record_start_if_needed(&self) -> Result<(), OperationFailure> {
         let start_record = MigrationStartRecord {
             source_generation: self.source_generation,
@@ -339,6 +367,7 @@ where
             .record_meta(&OwnershipRecord::MigrationStart(start_record))
     }
 
+    #[allow(dead_code)]
     fn drain_batch(&mut self) -> Result<usize, OperationFailure> {
         let all_source_envelopes = self.source.read_envelopes()?;
         if all_source_envelopes.len() <= self.processed_source_count {
@@ -497,104 +526,50 @@ where
     /// Performs the chase phase: ingests events currently available in source while source appends.
     ///
     /// # Errors
-    /// Returns [`OperationFailure`] if reading, transforming, or appending fails.
+    /// Returns [`OperationFailure`] with [`FailureCondition::InvariantBreakingConfiguration`]
+    /// because live migration is disabled per C5.18.
     pub fn chase(&mut self) -> Result<usize, OperationFailure> {
-        if self.phase == MigrationPhase::Initial {
-            self.record_start_if_needed()?;
-        }
-        self.phase = MigrationPhase::Chase;
-        self.drain_batch()
+        Err(OperationFailure::new(
+            FailureCondition::InvariantBreakingConfiguration,
+            "live migration is disabled in this release per C5.18; use offline administrative migration",
+        ))
     }
 
     /// Performs the freeze phase: drains remainder of events from source while source takes no appends.
     ///
     /// # Errors
-    /// Returns [`OperationFailure`] if reading, transforming, or appending fails.
+    /// Returns [`OperationFailure`] with [`FailureCondition::InvariantBreakingConfiguration`]
+    /// because live migration is disabled per C5.18.
     pub fn freeze(&mut self) -> Result<usize, OperationFailure> {
-        if self.phase == MigrationPhase::Initial {
-            self.record_start_if_needed()?;
-        }
-        let source_meta = self.source.read_meta()?;
-        if source_meta.migration_start.is_none() && self.phase != MigrationPhase::Freeze {
-            return Err(OperationFailure::new(
-                FailureCondition::MigrationExclusionAbsent,
-                "offline freeze precondition not established: source missing MigrationStart record",
-            ));
-        }
-        self.phase = MigrationPhase::Freeze;
-        self.drain_batch()
+        Err(OperationFailure::new(
+            FailureCondition::InvariantBreakingConfiguration,
+            "live migration is disabled in this release per C5.18; use offline administrative migration",
+        ))
     }
 
     /// Performs cutover: final synchronization, generation records, and permanent source retirement per C5.63.
     ///
     /// # Errors
-    /// Returns [`OperationFailure`] if target completion, pointer recording, or retirement fails.
+    /// Returns [`OperationFailure`] with [`FailureCondition::InvariantBreakingConfiguration`]
+    /// because live migration is disabled per C5.18.
     pub fn cutover(mut self) -> Result<CutoverSummary, OperationFailure> {
-        if self.phase == MigrationPhase::Initial {
-            self.record_start_if_needed()?;
-        }
-        let source_meta = self.source.read_meta()?;
-        if source_meta.migration_start.is_none() && self.phase != MigrationPhase::Freeze {
-            return Err(OperationFailure::new(
-                FailureCondition::MigrationExclusionAbsent,
-                "offline freeze precondition not established: source missing MigrationStart record",
-            ));
-        }
-        self.phase = MigrationPhase::Freeze;
-        let _ = self.drain_batch()?;
-
-        let source_locator = self.source.locator_id();
-        let target_locator = self.target.locator_id();
-        let source_epoch = self.source.current_epoch()?;
-        let target_epoch = self.target.current_epoch()?;
-
-        let inbound = InboundPointerRecord {
-            prior_generation_locator_id: source_locator,
-            prior_generation_epoch: source_epoch,
-        };
-        self.target.record_inbound_pointer(&inbound)?;
-
-        let end_record = MigrationEndRecord {
-            source_generation: self.source_generation,
-            target_generation: self.target_generation,
-            end_time_ns: 2_000_000_000,
-            status: MigrationStatus::Complete,
-        };
-        self.target
-            .record_meta(&OwnershipRecord::MigrationEnd(end_record))?;
-
-        let rescue_choice = RescuePolicyChoiceRecord {
-            policy_tag: self.rescue_policy.to_u8(),
-            parameter_payload: self.rescue_policy_parameters.clone(),
-        };
-        self.target
-            .record_meta(&OwnershipRecord::RescuePolicyChoice(rescue_choice))?;
-
-        let outbound = OutboundPointerRecord {
-            next_generation_locator_id: target_locator,
-            cutover_epoch: source_epoch,
-        };
-        self.source.record_outbound_pointer(&outbound)?;
-
-        self.phase = MigrationPhase::Completed;
-
-        Ok(CutoverSummary {
-            total_migrated_events: self.target_event_counter as usize,
-            surviving_fibers: self.fiber_identity_map.len(),
-            source_locator_id: source_locator,
-            target_locator_id: target_locator,
-            prior_generation_epoch: source_epoch,
-            cutover_epoch: target_epoch,
-        })
+        let _ = &mut self;
+        Err(OperationFailure::new(
+            FailureCondition::InvariantBreakingConfiguration,
+            "live migration is disabled in this release per C5.18; use offline administrative migration",
+        ))
     }
 
     /// Executes chase, freeze, and cutover end-to-end.
     ///
     /// # Errors
-    /// Returns [`OperationFailure`] if any phase fails.
+    /// Returns [`OperationFailure`] with [`FailureCondition::InvariantBreakingConfiguration`]
+    /// because live migration is disabled per C5.18.
     pub fn run_all(mut self) -> Result<CutoverSummary, OperationFailure> {
-        self.chase()?;
-        self.freeze()?;
-        self.cutover()
+        let _ = &mut self;
+        Err(OperationFailure::new(
+            FailureCondition::InvariantBreakingConfiguration,
+            "live migration is disabled in this release per C5.18; use offline administrative migration",
+        ))
     }
 }

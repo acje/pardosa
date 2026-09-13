@@ -71,24 +71,31 @@
 //! Per C4.21, an artefact is read only by the major line that wrote it. Cross-major data export is the operator's
 //! responsibility via the migration subsystem.
 //!
-//! # Resource Allocation and Accounting Disclosure (R12 / M6 / M9)
+//! # Resource Allocation and Accounting Disclosure (R12 / M6 / M9 / L4)
 //!
 //! Pardosa operates as an in-process library without autonomous memory sandboxing or background workers:
 //! - **Single-Event Ingestion**: Writes execute synchronously one event at a time via [`store::Store::append_to_fiber`],
 //!   [`store::Store::append_envelope_verdict`], or [`store::Store::append_frame_verdict`].
-//! - **Buffer Allocations**: Frame encoding allocates a local buffer proportional to payload length, verified and
-//!   durably committed prior to subsequent writes. Point lookups and event decoding allocate single envelope
-//!   structures on the caller heap. Bulk reads (`read_all`, `build_from_frames`) allocate contiguous frame vectors
-//!   sized to the requested chunk or container history.
+//! - **Buffer Allocations and File Bulk Read Materialization**: Frame encoding allocates a local buffer proportional
+//!   to payload length, verified and durably committed prior to subsequent writes. Point lookups and event decoding
+//!   allocate single envelope structures on the caller heap. Bulk reads (`read_all`, `build_from_frames`, and file
+//!   container recovery) materialize all raw container frames into memory at once as contiguous byte vectors (`Vec<Vec<u8>>`);
+//!   callers opening reader sessions or running recovery over large container files must budget heap memory proportional
+//!   to total container size plus vector descriptor overhead.
 //! - **Session State and Event ID Accounting**: In-memory fiber indexing in [`store::SessionIndex`] tracks active
 //!   fiber state in heap-allocated maps. Session limits are bounded by `MAX_ACTIVE_FIBERS` (100,000) active fiber
 //!   handles and `MAX_EVENTS_PER_FIBER` (100,000) events per fiber. In addition, `seen_event_ids` retains every
-//!   observed event identifier across the entire session in a heap-allocated hash set for generation-wide duplicate
-//!   rejection (C5.23 / H2); its memory overhead grows monotonically with unique event arrivals up to session bounds.
+//!   observed event identifier across the entire session in a heap-allocated hash set (`HashSet<[u8; 16]>`) for
+//!   generation-wide duplicate rejection (C5.23 / H2); its memory overhead grows monotonically by ~32-48 bytes per
+//!   unique event ID and is never pruned during the session lifetime.
 //! - **Broken Slot Accounting**: When a fiber is marked broken or invalid history is discovered during recovery,
 //!   `SessionIndex` retains a `FiberSlot::Broken` entry rather than removing the fiber. This preserves error diagnostics
 //!   and event counts while refusing further appends or point lookups. Broken slots count against active fiber capacity
 //!   when new fibers are added.
+//! - **Fiber Tip Payloads**: Active fibers in `SessionIndex` retain their latest committed event envelope and payload
+//!   in memory to support predecessor commitment verification and $O(1)$ tip lookups via [`store::Store::get_latest`].
+//! - **NATS Buffer Copies**: Network operations in `NatsStorageAdapter` and `NatsEngine` perform buffer copies
+//!   between Pardosa frames, `async_nats::Message` payloads, and Tokio runtime buffers during publishing and recovery.
 //! - **Caller Backpressure Responsibilities**: Pardosa provides no asynchronous queues, worker pools, or automatic
 //!   rate-limiting. The calling host application is strictly responsible for managing thread concurrency, applying
 //!   backpressure to upstream event producers, enforcing global process memory quotas, and establishing collection

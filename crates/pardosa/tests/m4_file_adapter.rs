@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use pardosa::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -728,22 +730,46 @@ fn test_file_reopen_same_stream_append_continuation_matches_batch() {
     let mut events_n = Vec::new();
     let mut event_num = 1u8;
     for _round in 0..4 {
-        events_n.push((fiber1, [event_num; 16], format!("payload-{event_num}").into_bytes()));
+        events_n.push((
+            fiber1,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
         event_num += 1;
-        events_n.push((fiber2, [event_num; 16], format!("payload-{event_num}").into_bytes()));
+        events_n.push((
+            fiber2,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
         event_num += 1;
-        events_n.push((fiber3, [event_num; 16], format!("payload-{event_num}").into_bytes()));
+        events_n.push((
+            fiber3,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
         event_num += 1;
     }
     assert_eq!(events_n.len(), 12);
 
     let mut events_m = Vec::new();
     for _round in 0..3 {
-        events_m.push((fiber1, [event_num; 16], format!("payload-{event_num}").into_bytes()));
+        events_m.push((
+            fiber1,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
         event_num += 1;
-        events_m.push((fiber2, [event_num; 16], format!("payload-{event_num}").into_bytes()));
+        events_m.push((
+            fiber2,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
         event_num += 1;
-        events_m.push((fiber3, [event_num; 16], format!("payload-{event_num}").into_bytes()));
+        events_m.push((
+            fiber3,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
         event_num += 1;
     }
     assert_eq!(events_m.len(), 9);
@@ -802,8 +828,14 @@ fn test_file_reopen_same_stream_append_continuation_matches_batch() {
         assert_eq!(handle_a.precursor(), handle_b.precursor());
         assert_eq!(handle_a.state(), handle_b.state());
 
-        let latest_a = final_writer_a.get_latest(fiber_id).expect("latest a").unwrap();
-        let latest_b = final_writer_b.get_latest(fiber_id).expect("latest b").unwrap();
+        let latest_a = final_writer_a
+            .get_latest(fiber_id)
+            .expect("latest a")
+            .unwrap();
+        let latest_b = final_writer_b
+            .get_latest(fiber_id)
+            .expect("latest b")
+            .unwrap();
         assert_eq!(latest_a.header.event_id, latest_b.header.event_id);
         assert_eq!(latest_a.header.precursor, latest_b.header.precursor);
         assert_eq!(latest_a.header.fiber_id, latest_b.header.fiber_id);
@@ -836,12 +868,19 @@ fn test_file_read_meta_records_missing_seq1_fails_closed() {
     fs::write(&meta_path, b"not_a_header").expect("write invalid header");
 
     let err = pardosa::file::read_meta_records(&meta_path).expect_err("must fail closed");
-    assert_eq!(*err.condition(), FailureCondition::OwnershipRecordUnreadable);
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::OwnershipRecordUnreadable
+    );
 
     let empty_meta_path = dir.path().join("empty.meta");
     fs::write(&empty_meta_path, b"").expect("write empty meta");
-    let err_empty = pardosa::file::read_meta_records(&empty_meta_path).expect_err("must fail closed on empty");
-    assert_eq!(*err_empty.condition(), FailureCondition::OwnershipRecordUnreadable);
+    let err_empty =
+        pardosa::file::read_meta_records(&empty_meta_path).expect_err("must fail closed on empty");
+    assert_eq!(
+        *err_empty.condition(),
+        FailureCondition::OwnershipRecordUnreadable
+    );
 }
 
 #[test]
@@ -854,12 +893,21 @@ fn test_file_open_write_concurrent_writer_rejected_while_holding_lock() {
     let writer = adapter.create(&claim).expect("create");
     drop(writer);
 
-    let writer1 = adapter.open_write(1).expect("first open write holds exclusion");
-    let err = adapter.open_write(1).expect_err("concurrent open write must be rejected");
-    assert_eq!(*err.condition(), FailureCondition::AnotherOwnerHoldsExclusion);
+    let writer1 = adapter
+        .open_write(1)
+        .expect("first open write holds exclusion");
+    let err = adapter
+        .open_write(1)
+        .expect_err("concurrent open write must be rejected");
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::AnotherOwnerHoldsExclusion
+    );
 
     drop(writer1);
 
-    let writer2 = adapter.open_write(1).expect("open write succeeds after lock released");
+    let writer2 = adapter
+        .open_write(1)
+        .expect("open write succeeds after lock released");
     drop(writer2);
 }

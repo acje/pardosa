@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use pardosa::prelude::*;
 use pardosa_nats::test_support::LiveNatsServer;
 use pardosa_nats::NatsStorageAdapter;

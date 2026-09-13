@@ -217,9 +217,7 @@ async fn read_meta_records_async(
                     if existing != &new_desc {
                         return Err(OperationFailure::new(
                             FailureCondition::OwnershipRecordUnreadable,
-                            format!(
-                                "conflicting schema descriptor in meta stream at seq {seq}"
-                            ),
+                            format!("conflicting schema descriptor in meta stream at seq {seq}"),
                         ));
                     }
                 } else {
@@ -673,6 +671,19 @@ impl NatsStorageAdapter {
         }
     }
 
+    /// Overrides the subjects used for publishing and stream routing.
+    #[deprecated(note = "subjects are derived deterministically ({stem}.meta, {stem}.data)")]
+    #[must_use]
+    pub fn with_subjects(
+        mut self,
+        meta_subject: impl Into<String>,
+        data_subject: impl Into<String>,
+    ) -> Self {
+        self.meta_subject = meta_subject.into();
+        self.data_subject = data_subject.into();
+        self
+    }
+
     #[cfg(any(test, feature = "unstable-test-support"))]
     #[doc(hidden)]
     #[must_use]
@@ -762,6 +773,7 @@ impl NatsStorageAdapter {
     }
 
     /// Returns the presence of artefact streams in JetStream per C5.10.
+    #[deprecated(note = "lossy presence folds errors into None per AGENTS.md; use try_presence")]
     #[must_use]
     pub fn presence(&self) -> ArtefactPresence {
         self.try_presence().unwrap_or(ArtefactPresence::None)
@@ -814,43 +826,47 @@ impl NatsStorageAdapter {
                 async_nats::header::NATS_EXPECTED_STREAM,
                 async_nats::HeaderValue::from(meta_name.as_str()),
             );
-            let header_ack = js.publish_with_headers(
-                meta_subject.clone(),
-                init_meta_headers,
-                header_bytes.to_vec().into(),
-            )
-            .await
-            .map_err(|err| {
-                if is_wrong_last_sequence(&err) {
-                    OperationFailure::new(
-                        FailureCondition::StoreAlreadyExists,
-                        "artefact already created by concurrent writer per C12.3",
-                    )
-                } else {
-                    OperationFailure::new(
-                        FailureCondition::OwnershipRecordUnreadable,
-                        format!("failed to publish container header to meta stream: {err}"),
-                    )
-                }
-            })?
-            .await
-            .map_err(|err| {
-                if is_wrong_last_sequence(&err) {
-                    OperationFailure::new(
-                        FailureCondition::StoreAlreadyExists,
-                        "artefact already created by concurrent writer per C12.3",
-                    )
-                } else {
-                    OperationFailure::new(
-                        FailureCondition::OwnershipRecordUnreadable,
-                        format!("failed to ack container header on meta stream: {err}"),
-                    )
-                }
-            })?;
+            let header_ack = js
+                .publish_with_headers(
+                    meta_subject.clone(),
+                    init_meta_headers,
+                    header_bytes.to_vec().into(),
+                )
+                .await
+                .map_err(|err| {
+                    if is_wrong_last_sequence(&err) {
+                        OperationFailure::new(
+                            FailureCondition::StoreAlreadyExists,
+                            "artefact already created by concurrent writer per C12.3",
+                        )
+                    } else {
+                        OperationFailure::new(
+                            FailureCondition::OwnershipRecordUnreadable,
+                            format!("failed to publish container header to meta stream: {err}"),
+                        )
+                    }
+                })?
+                .await
+                .map_err(|err| {
+                    if is_wrong_last_sequence(&err) {
+                        OperationFailure::new(
+                            FailureCondition::StoreAlreadyExists,
+                            "artefact already created by concurrent writer per C12.3",
+                        )
+                    } else {
+                        OperationFailure::new(
+                            FailureCondition::OwnershipRecordUnreadable,
+                            format!("failed to ack container header on meta stream: {err}"),
+                        )
+                    }
+                })?;
             if header_ack.stream != meta_name {
                 return Err(OperationFailure::new(
                     FailureCondition::OwnershipRecordUnreadable,
-                    format!("publish ack stream mismatch: expected {meta_name}, got {}", header_ack.stream),
+                    format!(
+                        "publish ack stream mismatch: expected {meta_name}, got {}",
+                        header_ack.stream
+                    ),
                 ));
             }
 
@@ -868,7 +884,8 @@ impl NatsStorageAdapter {
                 async_nats::header::NATS_EXPECTED_STREAM,
                 async_nats::HeaderValue::from(meta_name.as_str()),
             );
-            let claim_ack = js.publish_with_headers(meta_subject.clone(), claim_meta_headers, claim_frame.into())
+            let claim_ack = js
+                .publish_with_headers(meta_subject.clone(), claim_meta_headers, claim_frame.into())
                 .await
                 .map_err(|err| {
                     if is_wrong_last_sequence(&err) {
@@ -900,7 +917,10 @@ impl NatsStorageAdapter {
             if claim_ack.stream != meta_name {
                 return Err(OperationFailure::new(
                     FailureCondition::OwnershipRecordUnreadable,
-                    format!("publish ack stream mismatch: expected {meta_name}, got {}", claim_ack.stream),
+                    format!(
+                        "publish ack stream mismatch: expected {meta_name}, got {}",
+                        claim_ack.stream
+                    ),
                 ));
             }
 
@@ -964,7 +984,10 @@ impl NatsStorageAdapter {
             if data_ack.stream != data_name {
                 return Err(OperationFailure::new(
                     FailureCondition::PrecursorChainBroken(None),
-                    format!("publish ack stream mismatch: expected {data_name}, got {}", data_ack.stream),
+                    format!(
+                        "publish ack stream mismatch: expected {data_name}, got {}",
+                        data_ack.stream
+                    ),
                 ));
             }
 
@@ -1045,43 +1068,47 @@ impl NatsStorageAdapter {
                 async_nats::header::NATS_EXPECTED_STREAM,
                 async_nats::HeaderValue::from(meta_name.as_str()),
             );
-            let header_ack = js.publish_with_headers(
-                meta_subject.clone(),
-                init_meta_headers,
-                header_bytes.to_vec().into(),
-            )
-            .await
-            .map_err(|err| {
-                if is_wrong_last_sequence(&err) {
-                    OperationFailure::new(
-                        FailureCondition::StoreAlreadyExists,
-                        "artefact already created by concurrent writer per C12.3",
-                    )
-                } else {
-                    OperationFailure::new(
-                        FailureCondition::OwnershipRecordUnreadable,
-                        format!("failed to publish container header: {err}"),
-                    )
-                }
-            })?
-            .await
-            .map_err(|err| {
-                if is_wrong_last_sequence(&err) {
-                    OperationFailure::new(
-                        FailureCondition::StoreAlreadyExists,
-                        "artefact already created by concurrent writer per C12.3",
-                    )
-                } else {
-                    OperationFailure::new(
-                        FailureCondition::OwnershipRecordUnreadable,
-                        format!("failed to ack container header: {err}"),
-                    )
-                }
-            })?;
+            let header_ack = js
+                .publish_with_headers(
+                    meta_subject.clone(),
+                    init_meta_headers,
+                    header_bytes.to_vec().into(),
+                )
+                .await
+                .map_err(|err| {
+                    if is_wrong_last_sequence(&err) {
+                        OperationFailure::new(
+                            FailureCondition::StoreAlreadyExists,
+                            "artefact already created by concurrent writer per C12.3",
+                        )
+                    } else {
+                        OperationFailure::new(
+                            FailureCondition::OwnershipRecordUnreadable,
+                            format!("failed to publish container header: {err}"),
+                        )
+                    }
+                })?
+                .await
+                .map_err(|err| {
+                    if is_wrong_last_sequence(&err) {
+                        OperationFailure::new(
+                            FailureCondition::StoreAlreadyExists,
+                            "artefact already created by concurrent writer per C12.3",
+                        )
+                    } else {
+                        OperationFailure::new(
+                            FailureCondition::OwnershipRecordUnreadable,
+                            format!("failed to ack container header: {err}"),
+                        )
+                    }
+                })?;
             if header_ack.stream != meta_name {
                 return Err(OperationFailure::new(
                     FailureCondition::OwnershipRecordUnreadable,
-                    format!("publish ack stream mismatch: expected {meta_name}, got {}", header_ack.stream),
+                    format!(
+                        "publish ack stream mismatch: expected {meta_name}, got {}",
+                        header_ack.stream
+                    ),
                 ));
             }
 
@@ -1099,7 +1126,8 @@ impl NatsStorageAdapter {
                 async_nats::header::NATS_EXPECTED_STREAM,
                 async_nats::HeaderValue::from(meta_name.as_str()),
             );
-            let claim_ack = js.publish_with_headers(meta_subject, claim_meta_headers, claim_frame.into())
+            let claim_ack = js
+                .publish_with_headers(meta_subject, claim_meta_headers, claim_frame.into())
                 .await
                 .map_err(|err| {
                     if is_wrong_last_sequence(&err) {
@@ -1131,7 +1159,10 @@ impl NatsStorageAdapter {
             if claim_ack.stream != meta_name {
                 return Err(OperationFailure::new(
                     FailureCondition::OwnershipRecordUnreadable,
-                    format!("publish ack stream mismatch: expected {meta_name}, got {}", claim_ack.stream),
+                    format!(
+                        "publish ack stream mismatch: expected {meta_name}, got {}",
+                        claim_ack.stream
+                    ),
                 ));
             }
 
@@ -1242,7 +1273,10 @@ impl NatsStorageAdapter {
             if data_ack.stream != data_name {
                 return Err(OperationFailure::new(
                     FailureCondition::PrecursorChainBroken(None),
-                    format!("publish ack stream mismatch: expected {data_name}, got {}", data_ack.stream),
+                    format!(
+                        "publish ack stream mismatch: expected {data_name}, got {}",
+                        data_ack.stream
+                    ),
                 ));
             }
 
@@ -1505,7 +1539,8 @@ impl NatsStorageAdapter {
                 async_nats::HeaderValue::from(meta_name.as_str()),
             );
 
-            let pub_ack = js.publish_with_headers(meta_subject, headers, record_frame.into())
+            let pub_ack = js
+                .publish_with_headers(meta_subject, headers, record_frame.into())
                 .await
                 .map_err(|err| {
                     OperationFailure::new(
@@ -1524,7 +1559,10 @@ impl NatsStorageAdapter {
             if pub_ack.stream != meta_name {
                 return Err(OperationFailure::new(
                     FailureCondition::OwnershipRecordUnreadable,
-                    format!("publish ack stream mismatch: expected {meta_name}, got {}", pub_ack.stream),
+                    format!(
+                        "publish ack stream mismatch: expected {meta_name}, got {}",
+                        pub_ack.stream
+                    ),
                 ));
             }
 

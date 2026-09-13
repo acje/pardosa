@@ -48,6 +48,28 @@ fn sample_chained_envelope(
 }
 
 #[test]
+fn test_m6_live_migration_manager_and_freeze_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = FileStorageAdapter::new(dir.path().join("source"));
+    let target = FileStorageAdapter::new(dir.path().join("target"));
+
+    let err_new = MigrationManager::new(source.clone(), target.clone()).unwrap_err();
+    assert_eq!(
+        *err_new.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
+    assert!(err_new.to_string().contains("live migration is disabled in this release per C5.18; use offline administrative migration"));
+
+    let mut manager = MigrationManager::new_for_test(source, target);
+    let err_freeze = manager.freeze().unwrap_err();
+    assert_eq!(
+        *err_freeze.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
+    assert!(err_freeze.to_string().contains("live migration is disabled in this release per C5.18; use offline administrative migration"));
+}
+
+#[test]
 fn test_m6_migration_basic_lifecycle_and_cutover() {
     let dir = tempfile::tempdir().expect("tempdir");
     let source_path = dir.path().join("source");
@@ -65,21 +87,55 @@ fn test_m6_migration_basic_lifecycle_and_cutover() {
     let env1 = sample_genesis_envelope(1, 0xaa, b"payload1");
     let comm1 = env1.commitment();
     let env2 = sample_chained_envelope(2, 0xaa, 1, comm1, b"payload2");
-    writer.append_envelope(&env1).expect("append 1");
-    writer.append_envelope(&env2).expect("append 2");
+    writer.append_envelope_verdict(&env1).expect("append 1");
+    writer.append_envelope_verdict(&env2).expect("append 2");
 
-    let mut manager = MigrationManager::new(source.clone(), target.clone());
-    let chased = manager.chase().expect("chase");
-    assert_eq!(chased, 2);
-    assert_eq!(manager.phase(), MigrationPhase::Chase);
+    let err_mgr = MigrationManager::new(source.clone(), target.clone()).unwrap_err();
+    assert_eq!(
+        *err_mgr.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
+    assert!(err_mgr.to_string().contains("live migration is disabled in this release per C5.18; use offline administrative migration"));
 
-    let frozen = manager.freeze().expect("freeze");
-    assert_eq!(frozen, 0);
-    assert_eq!(manager.phase(), MigrationPhase::Freeze);
+    let source_locator = source.locator_id();
+    let target_locator = target.locator_id();
+    let source_epoch = source.current_epoch().expect("source epoch");
 
-    let summary = manager.cutover().expect("cutover");
-    assert_eq!(summary.total_migrated_events, 2);
-    assert_eq!(summary.surviving_fibers, 1);
+    let inbound = InboundPointerRecord {
+        prior_generation_locator_id: source_locator,
+        prior_generation_epoch: source_epoch,
+    };
+    target
+        .record_inbound_pointer(&inbound)
+        .expect("record inbound");
+
+    let end_record = MigrationEndRecord {
+        source_generation: 1,
+        target_generation: 2,
+        end_time_ns: 2_000_000_000,
+        status: MigrationStatus::Complete,
+    };
+    target
+        .record_meta_record(&OwnershipRecord::MigrationEnd(end_record))
+        .expect("record migration end");
+
+    let rescue_choice = RescuePolicyChoiceRecord {
+        policy_tag: RescuePolicy::Strict.to_u8(),
+        parameter_payload: Vec::new(),
+    };
+    target
+        .record_meta_record(&OwnershipRecord::RescuePolicyChoice(rescue_choice))
+        .expect("record rescue choice");
+
+    let outbound = OutboundPointerRecord {
+        next_generation_locator_id: target_locator,
+        cutover_epoch: source_epoch,
+    };
+    source
+        .record_outbound_pointer(&outbound)
+        .expect("record outbound");
+
+    assert!(source.is_retired_source().expect("query retired"));
 
     let err_new = source.open_write(1).expect_err("source must be retired");
     assert_eq!(
@@ -88,14 +144,14 @@ fn test_m6_migration_basic_lifecycle_and_cutover() {
     );
 
     let err_append = writer
-        .append_envelope(&env1)
+        .append_envelope_verdict(&env1)
         .expect_err("source writer retired");
     assert_eq!(
         *err_append.condition(),
         FailureCondition::RetiredMigrationSource
     );
 
-    let mut target_reader = target.open_read().expect("open target reader");
+    let target_reader = target.open_read().expect("open target reader");
     assert_eq!(
         target_reader
             .inbound_pointer()
@@ -103,16 +159,11 @@ fn test_m6_migration_basic_lifecycle_and_cutover() {
             .prior_generation_locator_id,
         source.locator_id()
     );
-    let migrated = target_reader.read_all_envelopes().expect("read migrated");
-    assert_eq!(migrated.len(), 2);
-    assert_ne!(migrated[0].header.event_id, env1.header.event_id);
-    assert_ne!(migrated[0].header.fiber_id, env1.header.fiber_id);
-    assert_eq!(migrated[0].header.precursor, [0u8; 16]);
-    assert_eq!(migrated[0].header.precursor_hash, [0u8; 32]);
-    assert_eq!(migrated[1].header.precursor, migrated[0].header.event_id);
-    assert_eq!(migrated[1].header.precursor_hash, migrated[0].commitment());
-    assert_eq!(migrated[0].payload, b"payload1");
-    assert_eq!(migrated[1].payload, b"payload2");
+
+    let meta = target.read_meta_records().expect("read meta records");
+    assert!(meta.inbound_pointer.is_some());
+    assert!(meta.migration_end.is_some());
+    assert!(meta.rescue_policy_choice.is_some());
 }
 
 #[test]
@@ -127,54 +178,23 @@ fn test_m6_caller_transformation_closure_and_refusal() {
 
     let mut writer = source.open_write(1).expect("open write source");
     let env1 = sample_genesis_envelope(1, 0xaa, b"input_data");
-    writer.append_envelope(&env1).expect("append 1");
+    writer.append_envelope_verdict(&env1).expect("append 1");
 
-    let manager_success = MigrationManager::new(source.clone(), target.clone()).with_transformer(
-        |payload: &[u8]| {
-            let mut transformed = payload.to_vec();
-            transformed.extend_from_slice(b"_v2");
-            Ok(transformed)
-        },
+    let err = MigrationManager::new(source.clone(), target.clone()).unwrap_err();
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::InvariantBreakingConfiguration
     );
-
-    let summary = manager_success.run_all().expect("run all migration");
-    assert_eq!(summary.total_migrated_events, 1);
-
-    let mut reader = target.open_read().expect("open target reader");
-    let migrated = reader.read_all_envelopes().expect("read envelopes");
-    assert_eq!(migrated[0].payload, b"input_data_v2");
-
-    let source_fail = FileStorageAdapter::new(dir.path().join("source_tx_fail"));
-    let target_fail = FileStorageAdapter::new(dir.path().join("target_tx_fail"));
-    source_fail.create(&claim).expect("create source");
-    target_fail.create(&claim).expect("create target");
-
-    let mut writer_fail = source_fail.open_write(1).expect("open write source");
-    writer_fail.append_envelope(&env1).expect("append");
-
-    let manager_fail = MigrationManager::new(source_fail.clone(), target_fail.clone())
-        .with_transformer(|_payload: &[u8]| {
-            Err(OperationFailure::new(
-                FailureCondition::TransformationRefused,
-                "schema upcast rejected payload",
-            ))
-        });
-
-    let err = manager_fail
-        .run_all()
-        .expect_err("transformation refusal must abort migration");
-    assert_eq!(*err.condition(), FailureCondition::TransformationRefused);
-
-    assert!(!source_fail.is_retired_source().expect("query retired"));
+    assert!(!source.is_retired_source().expect("query retired"));
     let env2 = sample_chained_envelope(2, 0xaa, 1, env1.commitment(), b"more_data");
-    writer_fail
-        .append_envelope(&env2)
+    writer
+        .append_envelope_verdict(&env2)
         .expect("existing writer still accepts appends");
-    drop(writer_fail);
-    let mut writer_new = source_fail.open_write(1).expect("new writer can be opened");
+    drop(writer);
+    let mut writer_new = source.open_write(1).expect("new writer can be opened");
     let env3 = sample_chained_envelope(3, 0xaa, 2, env2.commitment(), b"even_more_data");
     writer_new
-        .append_envelope(&env3)
+        .append_envelope_verdict(&env3)
         .expect("new writer accepts appends");
 }
 
@@ -188,10 +208,6 @@ fn test_m6_per_fiber_policies_keep_purge_lock_and_prune() {
     source.create(&claim).expect("create source");
     target.create(&claim).expect("create target");
 
-    let fiber_keep = [0x11u8; 16];
-    let fiber_purge = [0x22u8; 16];
-    let fiber_lock = [0x33u8; 16];
-
     let mut writer = source.open_write(1).expect("open write source");
 
     let a1 = sample_genesis_envelope(1, 0x11, b"a1");
@@ -200,52 +216,16 @@ fn test_m6_per_fiber_policies_keep_purge_lock_and_prune() {
     let comm_a2 = a2.commitment();
     let a3 = sample_chained_envelope(3, 0x11, 2, comm_a2, b"a3");
 
-    let b1 = sample_genesis_envelope(10, 0x22, b"b1");
-    let comm_b1 = b1.commitment();
-    let b2 = sample_chained_envelope(11, 0x22, 10, comm_b1, b"b2");
+    writer.append_envelope_verdict(&a1).expect("append a1");
+    writer.append_envelope_verdict(&a2).expect("append a2");
+    writer.append_envelope_verdict(&a3).expect("append a3");
 
-    let c1 = sample_genesis_envelope(20, 0x33, b"c1");
-    let comm_c1 = c1.commitment();
-    let c2 = sample_chained_envelope(21, 0x33, 20, comm_c1, b"c2");
-    let comm_c2 = c2.commitment();
-    let c3 = sample_chained_envelope(22, 0x33, 21, comm_c2, b"c3");
-
-    writer.append_envelope(&a1).expect("append a1");
-    writer.append_envelope(&b1).expect("append b1");
-    writer.append_envelope(&c1).expect("append c1");
-    writer.append_envelope(&a2).expect("append a2");
-    writer.append_envelope(&c2).expect("append c2");
-    writer.append_envelope(&b2).expect("append b2");
-    writer.append_envelope(&a3).expect("append a3");
-    writer.append_envelope(&c3).expect("append c3");
-
-    let manager = MigrationManager::new(source.clone(), target.clone())
-        .with_fiber_policy(fiber_keep, FiberMigrationPolicy::Keep)
-        .with_fiber_policy(fiber_purge, FiberMigrationPolicy::Purge)
-        .with_fiber_policy(fiber_lock, FiberMigrationPolicy::LockAndPrune);
-
-    let summary = manager.run_all().expect("run all migration");
-    assert_eq!(summary.total_migrated_events, 4);
-    assert_eq!(summary.surviving_fibers, 2);
-
-    let mut reader = target.open_read().expect("open target reader");
-    let migrated = reader.read_all_envelopes().expect("read envelopes");
-    assert_eq!(migrated.len(), 4);
-
-    assert_eq!(migrated[0].payload, b"a1");
-    assert_eq!(migrated[1].payload, b"a2");
-    assert_eq!(migrated[2].payload, b"a3");
-    assert_eq!(migrated[3].payload, b"c3");
-
-    assert!(migrated[3].header.detached);
-    assert_eq!(migrated[3].header.precursor, [0u8; 16]);
-    assert_eq!(migrated[3].header.precursor_hash, [0u8; 32]);
-
-    for env in &migrated {
-        assert_ne!(env.header.fiber_id, fiber_purge);
-        assert_ne!(env.payload, b"b1");
-        assert_ne!(env.payload, b"b2");
-    }
+    let err = MigrationManager::new(source.clone(), target.clone()).unwrap_err();
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
+    assert!(!source.is_retired_source().expect("query retired"));
 }
 
 #[test]
@@ -269,48 +249,18 @@ fn test_m6_dense_rechaining_and_pairwise_order() {
     let b2 = sample_chained_envelope(4, 0x0b, 2, comm_b1, b"B2");
     let a3 = sample_chained_envelope(5, 0x0a, 3, comm_a2, b"A3");
 
-    writer.append_envelope(&a1).expect("append");
-    writer.append_envelope(&b1).expect("append");
-    writer.append_envelope(&a2).expect("append");
-    writer.append_envelope(&b2).expect("append");
-    writer.append_envelope(&a3).expect("append");
+    writer.append_envelope_verdict(&a1).expect("append");
+    writer.append_envelope_verdict(&b1).expect("append");
+    writer.append_envelope_verdict(&a2).expect("append");
+    writer.append_envelope_verdict(&b2).expect("append");
+    writer.append_envelope_verdict(&a3).expect("append");
 
-    let manager = MigrationManager::new(source.clone(), target.clone());
-    let summary = manager.run_all().expect("run all migration");
-    assert_eq!(summary.total_migrated_events, 5);
-
-    let mut reader = target.open_read().expect("open target reader");
-    let migrated = reader.read_all_envelopes().expect("read envelopes");
-
-    let payloads: Vec<&[u8]> = migrated.iter().map(|e| e.payload.as_slice()).collect();
-    assert_eq!(payloads, vec![b"A1", b"B1", b"A2", b"B2", b"A3"]);
-
-    let target_a_fiber = migrated[0].header.fiber_id;
-    let target_b_fiber = migrated[1].header.fiber_id;
-    assert_ne!(target_a_fiber, target_b_fiber);
-
-    let a_events: Vec<&EventEnvelope> = migrated
-        .iter()
-        .filter(|e| e.header.fiber_id == target_a_fiber)
-        .collect();
-    assert_eq!(a_events.len(), 3);
-    assert_eq!(a_events[0].header.precursor, [0u8; 16]);
-    assert_eq!(a_events[0].header.precursor_hash, [0u8; 32]);
-    assert_eq!(a_events[1].header.precursor, a_events[0].header.event_id);
-    assert_eq!(a_events[1].header.precursor_hash, a_events[0].commitment());
-    assert_eq!(a_events[2].header.precursor, a_events[1].header.event_id);
-    assert_eq!(a_events[2].header.precursor_hash, a_events[1].commitment());
-
-    let mut env_map = HashMap::new();
-    for env in &migrated {
-        env_map.insert(env.header.event_id, env);
-    }
-
-    for env in &migrated {
-        let link = PrecursorLink::classify(env).expect("classify target link");
-        admit_precursor_link(&env.header.fiber_id, &link, |id| env_map.get(id).copied())
-            .expect("target precursor link validation");
-    }
+    let err = MigrationManager::new(source.clone(), target.clone()).unwrap_err();
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
+    assert!(!source.is_retired_source().expect("query retired"));
 }
 
 #[test]
@@ -335,23 +285,19 @@ fn test_m6_broken_chain_election_refuse_vs_permit() {
         },
         payload: b"broken_event".to_vec(),
     };
-    writer.append_envelope(&env1).expect("append env1");
+    writer.append_envelope_verdict(&env1).expect("append env1");
     let mut broken_buf = Vec::new();
     broken_env.encode(&mut broken_buf);
     writer
         .append_unvalidated_frame(&broken_buf)
         .expect("append broken raw frame");
 
-    let manager_refuse = MigrationManager::new(source_refuse.clone(), target_refuse.clone())
-        .with_broken_chain_election(BrokenChainElection::RefuseOnBreak);
-
-    let err = manager_refuse
-        .run_all()
-        .expect_err("must refuse on broken chain");
-    assert!(matches!(
-        err.condition(),
-        FailureCondition::PrecursorChainBroken(_)
-    ));
+    let err_refuse =
+        MigrationManager::new(source_refuse.clone(), target_refuse.clone()).unwrap_err();
+    assert_eq!(
+        *err_refuse.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
     assert!(!source_refuse.is_retired_source().expect("query retired"));
 
     let source_permit = FileStorageAdapter::new(dir.path().join("source_permit"));
@@ -362,7 +308,9 @@ fn test_m6_broken_chain_election_refuse_vs_permit() {
     let mut writer_permit = source_permit
         .open_write(1)
         .expect("open write source permit");
-    writer_permit.append_envelope(&env1).expect("append env1");
+    writer_permit
+        .append_envelope_verdict(&env1)
+        .expect("append env1");
     writer_permit
         .append_unvalidated_frame(&broken_buf)
         .expect("append broken raw frame");
@@ -393,44 +341,12 @@ fn test_m6_broken_chain_election_refuse_vs_permit() {
         FailureCondition::PrecursorChainBroken(_)
     ));
 
-    let manager_permit = MigrationManager::new(source_permit.clone(), target_permit.clone())
-        .with_broken_chain_election(BrokenChainElection::PermitBrokenHistory);
-
-    let summary = manager_permit
-        .run_all()
-        .expect("permit broken history migration");
-    assert_eq!(summary.total_migrated_events, 2);
-
-    let mut target_reader = target_permit.open_read().expect("open target reader");
-    let ordinary_target_err = target_reader
-        .read_all_envelopes()
-        .expect_err("ordinary reader on target with broken history must refuse");
-    assert!(matches!(
-        ordinary_target_err.condition(),
-        FailureCondition::PrecursorChainBroken(_)
-    ));
-    let migrated = target_reader
-        .read_all_envelopes_for_migration()
-        .expect("migration reader on target reads broken history");
-    assert_eq!(migrated.len(), 2);
-
-    assert_eq!(migrated[0].header.precursor, [0u8; 16]);
-    assert_eq!(migrated[0].header.precursor_hash, [0u8; 32]);
-    assert_eq!(migrated[1].header.precursor, [0u8; 16]);
-    assert_eq!(migrated[1].header.precursor_hash, [0u8; 32]);
-
-    let mut target_map = HashMap::new();
-    for env in &migrated {
-        target_map.insert(env.header.event_id, env);
-    }
-
-    for env in &migrated {
-        let link = PrecursorLink::classify(env).expect("classify link");
-        admit_precursor_link(&env.header.fiber_id, &link, |id| {
-            target_map.get(id).copied()
-        })
-        .expect("target reader validates successfully");
-    }
+    let err_permit =
+        MigrationManager::new(source_permit.clone(), target_permit.clone()).unwrap_err();
+    assert_eq!(
+        *err_permit.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
 }
 
 #[test]
@@ -439,116 +355,24 @@ fn test_m6_chase_phase_concurrent_source_appends() {
     let source = FileStorageAdapter::new(dir.path().join("source_chase"));
     let target = FileStorageAdapter::new(dir.path().join("target_chase"));
 
-    let claim = sample_claim(1);
-    source.create(&claim).expect("create source");
-    target.create(&claim).expect("create target");
-
-    let mut writer = source.open_write(1).expect("open write source");
-    let env1 = sample_genesis_envelope(1, 0x11, b"chase1");
-    let comm1 = env1.commitment();
-    let env2 = sample_chained_envelope(2, 0x11, 1, comm1, b"chase2");
-    let comm2 = env2.commitment();
-    writer.append_envelope(&env1).expect("append env1");
-    writer.append_envelope(&env2).expect("append env2");
-
-    let mut manager = MigrationManager::new(source.clone(), target.clone());
-    let chased = manager.chase().expect("chase initial batch");
-    assert_eq!(chased, 2);
-    assert_eq!(manager.phase(), MigrationPhase::Chase);
-
-    let env3 = sample_chained_envelope(3, 0x11, 2, comm2, b"chase3");
-    let comm3 = env3.commitment();
-    let env4 = sample_chained_envelope(4, 0x11, 3, comm3, b"chase4");
-    writer
-        .append_envelope(&env3)
-        .expect("append env3 during chase");
-    writer
-        .append_envelope(&env4)
-        .expect("append env4 during chase");
-
-    let frozen = manager.freeze().expect("freeze and drain remainder");
-    assert_eq!(frozen, 2);
-    assert_eq!(manager.phase(), MigrationPhase::Freeze);
-
-    let summary = manager.cutover().expect("cutover");
-    assert_eq!(summary.total_migrated_events, 4);
-    assert_eq!(summary.surviving_fibers, 1);
-
-    let err = writer
-        .append_envelope(&env1)
-        .expect_err("source writer permanently retired");
-    assert_eq!(*err.condition(), FailureCondition::RetiredMigrationSource);
-
-    let mut target_reader = target.open_read().expect("open target reader");
-    let migrated = target_reader
-        .read_all_envelopes()
-        .expect("read target envelopes");
-    assert_eq!(migrated.len(), 4);
-    assert_eq!(migrated[0].payload, b"chase1");
-    assert_eq!(migrated[1].payload, b"chase2");
-    assert_eq!(migrated[2].payload, b"chase3");
-    assert_eq!(migrated[3].payload, b"chase4");
+    let err = MigrationManager::new(source.clone(), target.clone()).unwrap_err();
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
+    assert!(err.to_string().contains("live migration is disabled in this release per C5.18; use offline administrative migration"));
 }
 
 #[test]
 fn test_m6_transform_failure_retry_does_not_leak_staged_state() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-
     let dir = tempfile::tempdir().expect("tempdir");
     let source = FileStorageAdapter::new(dir.path().join("source_retry"));
     let target = FileStorageAdapter::new(dir.path().join("target_retry"));
 
-    let claim = sample_claim(1);
-    source.create(&claim).expect("create source");
-    target.create(&claim).expect("create target");
-
-    let mut writer = source.open_write(1).expect("open write source");
-    let env1 = sample_genesis_envelope(1, 0x22, b"event1");
-    let comm1 = env1.commitment();
-    let env2 = sample_chained_envelope(2, 0x22, 1, comm1, b"event2");
-    writer.append_envelope(&env1).expect("append env1");
-    writer.append_envelope(&env2).expect("append env2");
-
-    let should_fail = Arc::new(AtomicBool::new(true));
-    let should_fail_clone = should_fail.clone();
-
-    let mut manager = MigrationManager::new(source.clone(), target.clone())
-        .with_default_fiber_policy(FiberMigrationPolicy::Keep)
-        .with_generations(1, 2)
-        .with_transformer(move |payload: &[u8]| {
-            if payload == b"event2" && should_fail_clone.swap(false, Ordering::SeqCst) {
-                Err(OperationFailure::new(
-                    FailureCondition::TransformationRefused,
-                    "simulated transform failure on event2",
-                ))
-            } else {
-                Ok(payload.to_vec())
-            }
-        });
-
-    let first_attempt = manager.chase();
-    assert!(first_attempt.is_err());
-    let err = first_attempt.unwrap_err();
-    assert_eq!(*err.condition(), FailureCondition::TransformationRefused);
-
-    let second_attempt = manager.chase().expect("retry chase must succeed");
-    assert_eq!(second_attempt, 2);
-
-    let frozen = manager.freeze().expect("freeze");
-    assert_eq!(frozen, 0);
-
-    let summary = manager.cutover().expect("cutover");
-    assert_eq!(summary.total_migrated_events, 2);
-    assert_eq!(summary.surviving_fibers, 1);
-
-    let mut target_reader = target.open_read().expect("open target reader");
-    let migrated = target_reader
-        .read_all_envelopes()
-        .expect("read target envelopes");
-    assert_eq!(migrated.len(), 2);
-    assert_eq!(migrated[0].payload, b"event1");
-    assert_eq!(migrated[1].payload, b"event2");
-    assert_eq!(migrated[1].header.precursor, migrated[0].header.event_id);
-    assert_eq!(migrated[1].header.precursor_hash, migrated[0].commitment());
+    let err = MigrationManager::new(source.clone(), target.clone()).unwrap_err();
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
+    assert!(err.to_string().contains("live migration is disabled in this release per C5.18; use offline administrative migration"));
 }

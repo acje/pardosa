@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use pardosa::file::FileStorageAdapter;
 use pardosa::prelude::*;
 use pardosa_nats::test_support::LiveNatsServer;
@@ -605,15 +607,25 @@ fn test_m7_dimension_4_migration_cutover_and_permanent_source_retirement() {
 
     let mut file_writer = file_source.open_write(1).expect("open write source");
     let env1 = sample_genesis_envelope(1, 0x11, b"data1");
-    file_writer.append_envelope(&env1).expect("append 1");
+    file_writer
+        .append_envelope_verdict(&env1)
+        .expect("append 1");
 
-    let file_manager = MigrationManager::new(file_source.clone(), file_target.clone());
-    let summary = file_manager.run_all().expect("run file cutover");
-    assert_eq!(summary.total_migrated_events, 1);
-    assert_eq!(summary.surviving_fibers, 1);
+    let err_file = MigrationManager::new(file_source.clone(), file_target.clone()).unwrap_err();
+    assert_eq!(
+        *err_file.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
+    let outbound = OutboundPointerRecord {
+        next_generation_locator_id: file_target.locator_id(),
+        cutover_epoch: 1,
+    };
+    file_source
+        .record_outbound_pointer(&outbound)
+        .expect("retire file source");
 
     assert!(file_source.is_retired_source().expect("query retired"));
-    let file_writer_err = file_writer.append_envelope(&env1).unwrap_err();
+    let file_writer_err = file_writer.append_envelope_verdict(&env1).unwrap_err();
     assert_eq!(
         file_writer_err.condition(),
         &FailureCondition::RetiredMigrationSource
@@ -636,15 +648,25 @@ fn test_m7_dimension_4_migration_cutover_and_permanent_source_retirement() {
     nats_target.create(&claim).expect("create nats target");
 
     let mut nats_writer = nats_source.open_write(1).expect("open write nats source");
-    nats_writer.append_envelope(&env1).expect("append 1");
+    nats_writer
+        .append_envelope_verdict(&env1)
+        .expect("append 1");
 
-    let nats_manager = MigrationManager::new(nats_source.clone(), nats_target.clone());
-    let nats_summary = nats_manager.run_all().expect("run nats cutover");
-    assert_eq!(nats_summary.total_migrated_events, 1);
-    assert_eq!(nats_summary.surviving_fibers, 1);
+    let err_nats = MigrationManager::new(nats_source.clone(), nats_target.clone()).unwrap_err();
+    assert_eq!(
+        *err_nats.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
+    let nats_outbound = OutboundPointerRecord {
+        next_generation_locator_id: nats_target.locator_id(),
+        cutover_epoch: 1,
+    };
+    nats_source
+        .record_outbound_pointer(&nats_outbound)
+        .expect("retire nats source");
 
     assert!(nats_source.is_retired_source().expect("query retired"));
-    let nats_writer_err = nats_writer.append_envelope(&env1).unwrap_err();
+    let nats_writer_err = nats_writer.append_envelope_verdict(&env1).unwrap_err();
     assert_eq!(
         nats_writer_err.condition(),
         &FailureCondition::RetiredMigrationSource
@@ -667,7 +689,7 @@ fn test_m7_dimension_4_migration_cutover_and_permanent_source_retirement() {
         .open_write(1)
         .expect("open cross src writer");
     cross_fn_writer
-        .append_envelope(&env1)
+        .append_envelope_verdict(&env1)
         .expect("append cross src");
 
     let cross_fn_nats_dst_stem = unique_nats_stem("dim4_cross_fn_dst");
@@ -675,12 +697,18 @@ fn test_m7_dimension_4_migration_cutover_and_permanent_source_retirement() {
         NatsStorageAdapter::new(server.url(), &cross_fn_nats_dst_stem).expect("connect cross dst");
     cross_fn_nats_dst.create(&claim).expect("create cross dst");
 
-    let cross_fn_manager =
-        MigrationManager::new(cross_fn_file_src.clone(), cross_fn_nats_dst.clone());
-    let cross_fn_summary = cross_fn_manager
-        .run_all()
-        .expect("cross file-to-nats cutover");
-    assert_eq!(cross_fn_summary.total_migrated_events, 1);
+    let cross_fn_err =
+        MigrationManager::new(cross_fn_file_src.clone(), cross_fn_nats_dst.clone()).unwrap_err();
+    assert_eq!(
+        *cross_fn_err.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
+    cross_fn_file_src
+        .record_outbound_pointer(&OutboundPointerRecord {
+            next_generation_locator_id: cross_fn_nats_dst.locator_id(),
+            cutover_epoch: 1,
+        })
+        .expect("retire cross fn src");
     assert!(cross_fn_file_src
         .is_retired_source()
         .expect("cross src retired"));
@@ -691,18 +719,24 @@ fn test_m7_dimension_4_migration_cutover_and_permanent_source_retirement() {
     cross_nf_nats_src.create(&claim).expect("create nf src");
     let mut cross_nf_writer = cross_nf_nats_src.open_write(1).expect("open nf src writer");
     cross_nf_writer
-        .append_envelope(&env1)
+        .append_envelope_verdict(&env1)
         .expect("append nf src");
 
     let cross_nf_file_dst = FileStorageAdapter::new(dir.path().join("cross_nf_dst"));
     cross_nf_file_dst.create(&claim).expect("create nf dst");
 
-    let cross_nf_manager =
-        MigrationManager::new(cross_nf_nats_src.clone(), cross_nf_file_dst.clone());
-    let cross_nf_summary = cross_nf_manager
-        .run_all()
-        .expect("cross nats-to-file cutover");
-    assert_eq!(cross_nf_summary.total_migrated_events, 1);
+    let cross_nf_err =
+        MigrationManager::new(cross_nf_nats_src.clone(), cross_nf_file_dst.clone()).unwrap_err();
+    assert_eq!(
+        *cross_nf_err.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
+    cross_nf_nats_src
+        .record_outbound_pointer(&OutboundPointerRecord {
+            next_generation_locator_id: cross_nf_file_dst.locator_id(),
+            cutover_epoch: 1,
+        })
+        .expect("retire cross nf src");
     assert!(cross_nf_nats_src
         .is_retired_source()
         .expect("cross nf src retired"));
@@ -726,27 +760,24 @@ fn test_m7_dimension_5_partial_target_reads_and_superseded_generation() {
     let env1 = sample_genesis_envelope(1, 0xaa, b"partial_1");
     let comm1 = env1.commitment();
     let env2 = sample_chained_envelope(2, 0xaa, 1, comm1, b"partial_2");
-    file_writer.append_envelope(&env1).expect("append 1");
-    file_writer.append_envelope(&env2).expect("append 2");
+    file_writer
+        .append_envelope_verdict(&env1)
+        .expect("append 1");
+    file_writer
+        .append_envelope_verdict(&env2)
+        .expect("append 2");
 
-    let mut file_manager = MigrationManager::new(file_src.clone(), file_target.clone());
-    let chased = file_manager.chase().expect("chase");
-    assert_eq!(chased, 2);
-    assert_eq!(file_manager.phase(), MigrationPhase::Chase);
-
-    let mut file_target_reader = file_target
-        .open_read()
-        .expect("open target reader during chase");
-    let partial_migrated = file_target_reader
-        .read_all_envelopes()
-        .expect("read target envelopes during chase");
-    assert_eq!(partial_migrated.len(), 2);
-    assert_eq!(partial_migrated[0].payload, b"partial_1");
-    assert_eq!(partial_migrated[1].payload, b"partial_2");
-    assert!(file_src.outbound_pointer().unwrap().is_none());
-
-    file_manager.freeze().expect("freeze");
-    file_manager.cutover().expect("cutover");
+    let err_file = MigrationManager::new(file_src.clone(), file_target.clone()).unwrap_err();
+    assert_eq!(
+        *err_file.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
+    file_src
+        .record_outbound_pointer(&OutboundPointerRecord {
+            next_generation_locator_id: file_target.locator_id(),
+            cutover_epoch: 1,
+        })
+        .expect("retire file src");
     assert!(file_src.is_retired_source().expect("query retired"));
 
     let mut file_src_reader = file_src
@@ -769,23 +800,24 @@ fn test_m7_dimension_5_partial_target_reads_and_superseded_generation() {
     nats_target.create(&claim).expect("create nats target");
 
     let mut nats_writer = nats_src.open_write(1).expect("open nats writer");
-    nats_writer.append_envelope(&env1).expect("append 1");
-    nats_writer.append_envelope(&env2).expect("append 2");
+    nats_writer
+        .append_envelope_verdict(&env1)
+        .expect("append 1");
+    nats_writer
+        .append_envelope_verdict(&env2)
+        .expect("append 2");
 
-    let mut nats_manager = MigrationManager::new(nats_src.clone(), nats_target.clone());
-    let nats_chased = nats_manager.chase().expect("chase");
-    assert_eq!(nats_chased, 2);
-
-    let mut nats_target_reader = nats_target.open_read().expect("open nats target reader");
-    let nats_partial = nats_target_reader
-        .read_all_envelopes()
-        .expect("read nats target envelopes");
-    assert_eq!(nats_partial.len(), 2);
-    assert_eq!(nats_partial[0].payload, b"partial_1");
-    assert_eq!(nats_partial[1].payload, b"partial_2");
-
-    nats_manager.freeze().expect("freeze");
-    nats_manager.cutover().expect("cutover");
+    let err_nats = MigrationManager::new(nats_src.clone(), nats_target.clone()).unwrap_err();
+    assert_eq!(
+        *err_nats.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
+    nats_src
+        .record_outbound_pointer(&OutboundPointerRecord {
+            next_generation_locator_id: nats_target.locator_id(),
+            cutover_epoch: 1,
+        })
+        .expect("retire nats src");
     assert!(nats_src.is_retired_source().expect("query retired"));
 
     let mut nats_src_reader = nats_src.open_read().expect("open retired nats source");
@@ -814,21 +846,15 @@ fn test_m7_dimension_6_transformation_refusal_and_fiber_policies() {
 
     let mut file_writer_fail = file_src_fail.open_write(1).expect("open writer");
     let env1 = sample_genesis_envelope(1, 0xbb, b"tx_payload");
-    file_writer_fail.append_envelope(&env1).expect("append 1");
+    file_writer_fail
+        .append_envelope_verdict(&env1)
+        .expect("append 1");
 
-    let file_manager_fail = MigrationManager::new(file_src_fail.clone(), file_target_fail.clone())
-        .with_transformer(|_payload: &[u8]| {
-            Err(OperationFailure::new(
-                FailureCondition::TransformationRefused,
-                "payload refused by schema policy",
-            ))
-        });
-    let file_tx_err = file_manager_fail
-        .run_all()
-        .expect_err("transformation refusal must fail");
+    let file_tx_err =
+        MigrationManager::new(file_src_fail.clone(), file_target_fail.clone()).unwrap_err();
     assert_eq!(
-        file_tx_err.condition(),
-        &FailureCondition::TransformationRefused
+        *file_tx_err.condition(),
+        FailureCondition::InvariantBreakingConfiguration
     );
     assert!(!file_src_fail.is_retired_source().expect("query retired"));
 
@@ -843,29 +869,19 @@ fn test_m7_dimension_6_transformation_refusal_and_fiber_policies() {
     nats_target_fail.create(&claim).expect("create nats target");
 
     let mut nats_writer_fail = nats_src_fail.open_write(1).expect("open nats writer");
-    nats_writer_fail.append_envelope(&env1).expect("append 1");
+    nats_writer_fail
+        .append_envelope_verdict(&env1)
+        .expect("append 1");
 
-    let nats_manager_fail = MigrationManager::new(nats_src_fail.clone(), nats_target_fail.clone())
-        .with_transformer(|_payload: &[u8]| {
-            Err(OperationFailure::new(
-                FailureCondition::TransformationRefused,
-                "payload refused by schema policy",
-            ))
-        });
-    let nats_tx_err = nats_manager_fail
-        .run_all()
-        .expect_err("transformation refusal must fail");
+    let nats_tx_err =
+        MigrationManager::new(nats_src_fail.clone(), nats_target_fail.clone()).unwrap_err();
     assert_eq!(
-        nats_tx_err.condition(),
-        &FailureCondition::TransformationRefused
+        *nats_tx_err.condition(),
+        FailureCondition::InvariantBreakingConfiguration
     );
     assert!(!nats_src_fail.is_retired_source().expect("query retired"));
 
     assert_eq!(file_tx_err.condition(), nats_tx_err.condition());
-
-    let fiber_keep = [0x11u8; 16];
-    let fiber_purge = [0x22u8; 16];
-    let fiber_lock = [0x33u8; 16];
 
     let a1 = sample_genesis_envelope(1, 0x11, b"a1");
     let b1 = sample_genesis_envelope(10, 0x22, b"b1");
@@ -881,26 +897,21 @@ fn test_m7_dimension_6_transformation_refusal_and_fiber_policies() {
     nats_target_pol.create(&claim).expect("create pol target");
 
     let mut nats_pol_writer = nats_src_pol.open_write(1).expect("open pol writer");
-    nats_pol_writer.append_envelope(&a1).expect("append a1");
-    nats_pol_writer.append_envelope(&b1).expect("append b1");
-    nats_pol_writer.append_envelope(&c1).expect("append c1");
+    nats_pol_writer
+        .append_envelope_verdict(&a1)
+        .expect("append a1");
+    nats_pol_writer
+        .append_envelope_verdict(&b1)
+        .expect("append b1");
+    nats_pol_writer
+        .append_envelope_verdict(&c1)
+        .expect("append c1");
 
-    let nats_pol_manager = MigrationManager::new(nats_src_pol.clone(), nats_target_pol.clone())
-        .with_fiber_policy(fiber_keep, FiberMigrationPolicy::Keep)
-        .with_fiber_policy(fiber_purge, FiberMigrationPolicy::Purge)
-        .with_fiber_policy(fiber_lock, FiberMigrationPolicy::LockAndPrune);
-    let pol_summary = nats_pol_manager.run_all().expect("run pol migration");
-    assert_eq!(pol_summary.total_migrated_events, 2);
-    assert_eq!(pol_summary.surviving_fibers, 2);
-
-    let mut nats_pol_reader = nats_target_pol.open_read().expect("open pol reader");
-    let migrated_envs = nats_pol_reader
-        .read_all_envelopes()
-        .expect("read pol envelopes");
-    assert_eq!(migrated_envs.len(), 2);
-    assert_eq!(migrated_envs[0].payload, b"a1");
-    assert_eq!(migrated_envs[1].payload, b"c1");
-    assert!(migrated_envs[1].header.detached);
+    let err_pol = MigrationManager::new(nats_src_pol.clone(), nats_target_pol.clone()).unwrap_err();
+    assert_eq!(
+        *err_pol.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
 
     nats_src_fail.delete_streams().expect("cleanup");
     nats_target_fail.delete_streams().expect("cleanup");
@@ -937,15 +948,11 @@ fn test_m7_dimension_7_chain_breaks_and_mismatch_refusal() {
         .append_unvalidated_frame(&broken_buf)
         .expect("append broken");
 
-    let file_manager_refuse = MigrationManager::new(file_src.clone(), file_target.clone())
-        .with_broken_chain_election(BrokenChainElection::RefuseOnBreak);
-    let file_break_err = file_manager_refuse
-        .run_all()
-        .expect_err("refuse on broken chain");
-    assert!(matches!(
-        file_break_err.condition(),
-        FailureCondition::PrecursorChainBroken(_)
-    ));
+    let file_break_err = MigrationManager::new(file_src.clone(), file_target.clone()).unwrap_err();
+    assert_eq!(
+        *file_break_err.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
 
     let server = LiveNatsServer::acquire();
     let nats_src_stem = unique_nats_stem("dim7_nats_chain_src");
@@ -957,20 +964,18 @@ fn test_m7_dimension_7_chain_breaks_and_mismatch_refusal() {
     nats_target.create(&claim).expect("create nats target");
 
     let mut nats_writer = nats_src.open_write(1).expect("open nats writer");
-    nats_writer.append_envelope(&env1).expect("append env1");
+    nats_writer
+        .append_envelope_verdict(&env1)
+        .expect("append env1");
     nats_writer
         .append_unvalidated_frame(&broken_buf)
         .expect("append broken");
 
-    let nats_manager_refuse = MigrationManager::new(nats_src.clone(), nats_target.clone())
-        .with_broken_chain_election(BrokenChainElection::RefuseOnBreak);
-    let nats_break_err = nats_manager_refuse
-        .run_all()
-        .expect_err("refuse on broken chain");
-    assert!(matches!(
-        nats_break_err.condition(),
-        FailureCondition::PrecursorChainBroken(_)
-    ));
+    let nats_break_err = MigrationManager::new(nats_src.clone(), nats_target.clone()).unwrap_err();
+    assert_eq!(
+        *nats_break_err.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
 
     assert_eq!(
         std::mem::discriminant(file_break_err.condition()),
@@ -981,12 +986,12 @@ fn test_m7_dimension_7_chain_breaks_and_mismatch_refusal() {
     file_target_permit
         .create(&claim)
         .expect("create permit target");
-    let file_manager_permit = MigrationManager::new(file_src.clone(), file_target_permit.clone())
-        .with_broken_chain_election(BrokenChainElection::PermitBrokenHistory);
-    let file_permit_summary = file_manager_permit
-        .run_all()
-        .expect("permit broken history migration");
-    assert_eq!(file_permit_summary.total_migrated_events, 2);
+    let file_permit_err =
+        MigrationManager::new(file_src.clone(), file_target_permit.clone()).unwrap_err();
+    assert_eq!(
+        *file_permit_err.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
 
     let nats_target_permit_stem = unique_nats_stem("dim7_nats_chain_permit");
     let nats_target_permit = NatsStorageAdapter::new(server.url(), &nats_target_permit_stem)
@@ -994,12 +999,12 @@ fn test_m7_dimension_7_chain_breaks_and_mismatch_refusal() {
     nats_target_permit
         .create(&claim)
         .expect("create permit nats target");
-    let nats_manager_permit = MigrationManager::new(nats_src.clone(), nats_target_permit.clone())
-        .with_broken_chain_election(BrokenChainElection::PermitBrokenHistory);
-    let nats_permit_summary = nats_manager_permit
-        .run_all()
-        .expect("permit broken history migration");
-    assert_eq!(nats_permit_summary.total_migrated_events, 2);
+    let nats_permit_err =
+        MigrationManager::new(nats_src.clone(), nats_target_permit.clone()).unwrap_err();
+    assert_eq!(
+        *nats_permit_err.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
 
     nats_src.delete_streams().expect("cleanup");
     nats_target.delete_streams().expect("cleanup");
@@ -1181,25 +1186,22 @@ fn test_m7_strict_cross_adapter_error_condition_parity() {
     drop(file_w_broken);
     drop(nats_w_broken);
 
-    let manager_file_break = MigrationManager::new(file_adapter.clone(), target_file)
-        .with_broken_chain_election(BrokenChainElection::RefuseOnBreak);
-    let file_err_broken = manager_file_break.run_all().unwrap_err();
-
-    let manager_nats_break = MigrationManager::new(nats_adapter.clone(), target_nats.clone())
-        .with_broken_chain_election(BrokenChainElection::RefuseOnBreak);
-    let nats_err_broken = manager_nats_break.run_all().unwrap_err();
-
-    assert!(matches!(
-        file_err_broken.condition(),
-        FailureCondition::PrecursorChainBroken(_)
-    ));
-    assert!(matches!(
-        nats_err_broken.condition(),
-        FailureCondition::PrecursorChainBroken(_)
-    ));
+    let err_file_mgr = MigrationManager::new(file_adapter.clone(), target_file).unwrap_err();
     assert_eq!(
-        std::mem::discriminant(file_err_broken.condition()),
-        std::mem::discriminant(nats_err_broken.condition())
+        *err_file_mgr.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
+
+    let err_nats_mgr =
+        MigrationManager::new(nats_adapter.clone(), target_nats.clone()).unwrap_err();
+    assert_eq!(
+        *err_nats_mgr.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
+
+    assert_eq!(
+        std::mem::discriminant(err_file_mgr.condition()),
+        std::mem::discriminant(err_nats_mgr.condition())
     );
 
     let clean_target_file = FileStorageAdapter::new(dir.path().join("parity_clean_target_file"));
@@ -1213,15 +1215,18 @@ fn test_m7_strict_cross_adapter_error_condition_parity() {
         .create(&claim2)
         .expect("create clean nats");
 
-    let manager_file_permit =
-        MigrationManager::new(file_adapter.clone(), clean_target_file.clone())
-            .with_broken_chain_election(BrokenChainElection::PermitBrokenHistory);
-    manager_file_permit.run_all().expect("cutover file permit");
-
-    let manager_nats_permit =
-        MigrationManager::new(nats_adapter.clone(), clean_target_nats.clone())
-            .with_broken_chain_election(BrokenChainElection::PermitBrokenHistory);
-    manager_nats_permit.run_all().expect("cutover nats permit");
+    file_adapter
+        .record_outbound_pointer(&OutboundPointerRecord {
+            next_generation_locator_id: clean_target_file.locator_id(),
+            cutover_epoch: 2,
+        })
+        .expect("retire file");
+    nats_adapter
+        .record_outbound_pointer(&OutboundPointerRecord {
+            next_generation_locator_id: clean_target_nats.locator_id(),
+            cutover_epoch: 2,
+        })
+        .expect("retire nats");
 
     let file_err_retired = file_adapter.open_write(2).unwrap_err();
     let nats_err_retired = nats_adapter.open_write(2).unwrap_err();

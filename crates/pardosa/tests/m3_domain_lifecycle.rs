@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use pardosa::prelude::*;
 use std::process::Command;
 
