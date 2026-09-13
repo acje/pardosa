@@ -10,7 +10,7 @@ NATS JetStream storage adapter for [Pardosa](https://crates.io/crates/pardosa).
   - `{stem}_meta`: Key-value and message stream for ownership claims, monotonic epochs, and generation cutover pointers.
   - `{stem}_data`: Ordered, append-only event stream recording Pardosa container frames.
 - **Single-Writer Fencing & OCC**: Enforces linearizable single-writer ownership using JetStream sequence expectations and monotonic epoch fences. Stale writes and concurrent writers are rejected deterministically via optimistic concurrency control (OCC).
-- **Subject Namespaces**: Supports custom publish and routing subjects via `.with_subjects(meta_subject, data_subject)`, enabling flexible subject hierarchies, cluster partitions, and wildcard routing independent of stream names.
+- **Deterministic Subject Routing**: Stream and subject names are derived deterministically from the stem: `{stem}_meta` and `{stem}_data` streams binding `{stem}.meta` and `{stem}.data` subjects, with server expected-stream verification.
 - **Synchronous Session Facade**: Bridges asynchronous JetStream operations into Pardosa's synchronous pipeline contracts via `NatsWriterSession` and `NatsReaderSession`.
 
 ## Usage Example
@@ -19,9 +19,8 @@ NATS JetStream storage adapter for [Pardosa](https://crates.io/crates/pardosa).
 use pardosa::prelude::*;
 use pardosa_nats::NatsStorageAdapter;
 
-// Connect to NATS JetStream with custom subject routing
-let adapter = NatsStorageAdapter::new("nats://127.0.0.1:4222", "tenant_orders")?
-    .with_subjects("tenant.orders.meta", "tenant.orders.data");
+// Connect to NATS JetStream with deterministic stream and subject routing
+let adapter = NatsStorageAdapter::new("nats://127.0.0.1:4222", "tenant_orders")?;
 
 // Create writer session with single-writer fencing epoch
 let claim = OwnershipClaimRecord {

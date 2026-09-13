@@ -353,12 +353,18 @@ pub fn read_meta_records(meta_path: &Path) -> Result<MetaRecords, OperationFailu
             format!("failed to open .meta file: {err}"),
         )
     })?;
-    let (_, frames, _) = read_container_frames(&mut file).map_err(|err| {
+    let (header, frames, _) = read_container_frames(&mut file).map_err(|err| {
         OperationFailure::new(
             FailureCondition::OwnershipRecordUnreadable,
             format!("failed to read frames from .meta file: {err}"),
         )
     })?;
+    if header.format_version != CONTAINER_FORMAT_VERSION {
+        return Err(OperationFailure::new(
+            FailureCondition::OwnershipRecordUnreadable,
+            "container header in .meta has invalid format version",
+        ));
+    }
     let mut records = MetaRecords::default();
     for frame in frames {
         let (record, consumed) = OwnershipRecord::decode(&frame).map_err(|err| {
@@ -895,18 +901,6 @@ impl FileStorageAdapter {
                 "artefact append authority permanently retired via outbound pointer per C5.63",
             ));
         }
-        let claim = meta.latest_claim.clone().ok_or_else(|| {
-            OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                "no ownership claim found in .meta per C5.12",
-            )
-        })?;
-        if claim.epoch != carried_epoch {
-            return Err(OperationFailure::new(
-                FailureCondition::StaleEpoch,
-                "carried epoch does not match recorded epoch in .meta per C5.5 and C12.4",
-            ));
-        }
 
         let mut pgno_file = OpenOptions::new()
             .read(true)
@@ -920,6 +914,19 @@ impl FileStorageAdapter {
             })?;
 
         acquire_file_exclusion(&pgno_file, self.exclusion_policy)?;
+
+        let claim = meta.latest_claim.clone().ok_or_else(|| {
+            OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                "no ownership claim found in .meta per C5.12",
+            )
+        })?;
+        if claim.epoch != carried_epoch {
+            return Err(OperationFailure::new(
+                FailureCondition::StaleEpoch,
+                "carried epoch does not match recorded epoch in .meta per C5.5 and C12.4",
+            ));
+        }
 
         let (_, frames, _) = read_container_frames(&mut pgno_file)?;
         pgno_file.seek(SeekFrom::End(0)).map_err(|err| {

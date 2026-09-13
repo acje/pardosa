@@ -1,5 +1,6 @@
 //! JetStream storage adapter implementation for Pardosa.
 
+use pardosa::file::CONTAINER_FORMAT_VERSION;
 use pardosa::prelude::*;
 use std::fmt;
 use std::sync::Arc;
@@ -99,10 +100,19 @@ async fn read_meta_records_async(
         }
     };
     if info.state.messages == 0 {
-        return Ok(NatsMetaRecords::default());
+        return Err(OperationFailure::new(
+            FailureCondition::OwnershipRecordUnreadable,
+            format!("meta stream {meta_stream_name} is empty; missing sequence 1 container header"),
+        ));
     }
     let first = info.state.first_sequence;
     let last = info.state.last_sequence;
+    if first > 1 {
+        return Err(OperationFailure::new(
+            FailureCondition::OwnershipRecordUnreadable,
+            format!("meta stream {meta_stream_name} sequence 1 ContainerHeader missing: first sequence is {first} > 1"),
+        ));
+    }
     let mut records = NatsMetaRecords::default();
     for seq in first..=last {
         let raw = match stream.get_raw_message(seq).await {
@@ -115,12 +125,18 @@ async fn read_meta_records_async(
             }
         };
         if seq == 1 {
-            let (_, consumed) = ContainerHeader::decode(&raw.payload).map_err(|err| {
+            let (header, consumed) = ContainerHeader::decode(&raw.payload).map_err(|err| {
                 OperationFailure::new(
                     FailureCondition::OwnershipRecordUnreadable,
                     format!("failed to decode container header in meta stream at seq 1: {err}"),
                 )
             })?;
+            if header.format_version != CONTAINER_FORMAT_VERSION {
+                return Err(OperationFailure::new(
+                    FailureCondition::OwnershipRecordUnreadable,
+                    "container header in meta stream at seq 1 has unsupported format version",
+                ));
+            }
             if consumed != raw.payload.len() {
                 return Err(OperationFailure::new(
                     FailureCondition::OwnershipRecordUnreadable,
@@ -638,8 +654,8 @@ impl NatsStorageAdapter {
     ) -> Self {
         let meta_stream_name = format!("{stem}_meta");
         let data_stream_name = format!("{stem}_data");
-        let meta_subject = format!("{stem}_meta");
-        let data_subject = format!("{stem}_data");
+        let meta_subject = format!("{stem}.meta");
+        let data_subject = format!("{stem}.data");
         let js = {
             let _guard = runtime.enter();
             async_nats::jetstream::new(client.clone())
@@ -657,9 +673,10 @@ impl NatsStorageAdapter {
         }
     }
 
-    /// Overrides the subjects used for publishing and stream routing.
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    #[doc(hidden)]
     #[must_use]
-    pub fn with_subjects(
+    pub fn with_subjects_for_test(
         mut self,
         meta_subject: impl Into<String>,
         data_subject: impl Into<String>,
@@ -709,6 +726,18 @@ impl NatsStorageAdapter {
     #[must_use]
     pub fn data_stream_name(&self) -> &str {
         &self.data_stream_name
+    }
+
+    /// Returns the ownership record subject name (`{stem}.meta`).
+    #[must_use]
+    pub fn meta_subject(&self) -> &str {
+        &self.meta_subject
+    }
+
+    /// Returns the event data subject name (`{stem}.data`).
+    #[must_use]
+    pub fn data_subject(&self) -> &str {
+        &self.data_subject
     }
 
     /// Returns the presence of artefact streams in JetStream per C5.10.
@@ -781,7 +810,11 @@ impl NatsStorageAdapter {
                 async_nats::header::NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
                 async_nats::HeaderValue::from(0),
             );
-            js.publish_with_headers(
+            init_meta_headers.insert(
+                async_nats::header::NATS_EXPECTED_STREAM,
+                async_nats::HeaderValue::from(meta_name.as_str()),
+            );
+            let header_ack = js.publish_with_headers(
                 meta_subject.clone(),
                 init_meta_headers,
                 header_bytes.to_vec().into(),
@@ -814,6 +847,12 @@ impl NatsStorageAdapter {
                     )
                 }
             })?;
+            if header_ack.stream != meta_name {
+                return Err(OperationFailure::new(
+                    FailureCondition::OwnershipRecordUnreadable,
+                    format!("publish ack stream mismatch: expected {meta_name}, got {}", header_ack.stream),
+                ));
+            }
 
             let mut claim_bytes = Vec::new();
             OwnershipRecord::OwnershipClaim(claim.clone()).encode(&mut claim_bytes);
@@ -825,7 +864,11 @@ impl NatsStorageAdapter {
                 async_nats::header::NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
                 async_nats::HeaderValue::from(1),
             );
-            js.publish_with_headers(meta_subject.clone(), claim_meta_headers, claim_frame.into())
+            claim_meta_headers.insert(
+                async_nats::header::NATS_EXPECTED_STREAM,
+                async_nats::HeaderValue::from(meta_name.as_str()),
+            );
+            let claim_ack = js.publish_with_headers(meta_subject.clone(), claim_meta_headers, claim_frame.into())
                 .await
                 .map_err(|err| {
                     if is_wrong_last_sequence(&err) {
@@ -854,6 +897,12 @@ impl NatsStorageAdapter {
                         )
                     }
                 })?;
+            if claim_ack.stream != meta_name {
+                return Err(OperationFailure::new(
+                    FailureCondition::OwnershipRecordUnreadable,
+                    format!("publish ack stream mismatch: expected {meta_name}, got {}", claim_ack.stream),
+                ));
+            }
 
             js.create_stream(async_nats::jetstream::stream::Config {
                 name: data_name.clone(),
@@ -873,6 +922,10 @@ impl NatsStorageAdapter {
             init_data_headers.insert(
                 async_nats::header::NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
                 async_nats::HeaderValue::from(0),
+            );
+            init_data_headers.insert(
+                async_nats::header::NATS_EXPECTED_STREAM,
+                async_nats::HeaderValue::from(data_name.as_str()),
             );
             let data_ack = js
                 .publish_with_headers(
@@ -908,6 +961,12 @@ impl NatsStorageAdapter {
                         )
                     }
                 })?;
+            if data_ack.stream != data_name {
+                return Err(OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    format!("publish ack stream mismatch: expected {data_name}, got {}", data_ack.stream),
+                ));
+            }
 
             let meta_records = NatsMetaRecords {
                 latest_claim: Some(claim.clone()),
@@ -982,7 +1041,11 @@ impl NatsStorageAdapter {
                 async_nats::header::NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
                 async_nats::HeaderValue::from(0),
             );
-            js.publish_with_headers(
+            init_meta_headers.insert(
+                async_nats::header::NATS_EXPECTED_STREAM,
+                async_nats::HeaderValue::from(meta_name.as_str()),
+            );
+            let header_ack = js.publish_with_headers(
                 meta_subject.clone(),
                 init_meta_headers,
                 header_bytes.to_vec().into(),
@@ -1015,6 +1078,12 @@ impl NatsStorageAdapter {
                     )
                 }
             })?;
+            if header_ack.stream != meta_name {
+                return Err(OperationFailure::new(
+                    FailureCondition::OwnershipRecordUnreadable,
+                    format!("publish ack stream mismatch: expected {meta_name}, got {}", header_ack.stream),
+                ));
+            }
 
             let mut claim_bytes = Vec::new();
             OwnershipRecord::OwnershipClaim(claim_clone).encode(&mut claim_bytes);
@@ -1026,7 +1095,11 @@ impl NatsStorageAdapter {
                 async_nats::header::NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
                 async_nats::HeaderValue::from(1),
             );
-            js.publish_with_headers(meta_subject, claim_meta_headers, claim_frame.into())
+            claim_meta_headers.insert(
+                async_nats::header::NATS_EXPECTED_STREAM,
+                async_nats::HeaderValue::from(meta_name.as_str()),
+            );
+            let claim_ack = js.publish_with_headers(meta_subject, claim_meta_headers, claim_frame.into())
                 .await
                 .map_err(|err| {
                     if is_wrong_last_sequence(&err) {
@@ -1055,6 +1128,12 @@ impl NatsStorageAdapter {
                         )
                     }
                 })?;
+            if claim_ack.stream != meta_name {
+                return Err(OperationFailure::new(
+                    FailureCondition::OwnershipRecordUnreadable,
+                    format!("publish ack stream mismatch: expected {meta_name}, got {}", claim_ack.stream),
+                ));
+            }
 
             Ok(())
         })
@@ -1122,6 +1201,10 @@ impl NatsStorageAdapter {
                 async_nats::header::NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
                 async_nats::HeaderValue::from(0),
             );
+            init_data_headers.insert(
+                async_nats::header::NATS_EXPECTED_STREAM,
+                async_nats::HeaderValue::from(data_name.as_str()),
+            );
             let data_ack = js
                 .publish_with_headers(
                     data_subject.clone(),
@@ -1156,6 +1239,12 @@ impl NatsStorageAdapter {
                         )
                     }
                 })?;
+            if data_ack.stream != data_name {
+                return Err(OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    format!("publish ack stream mismatch: expected {data_name}, got {}", data_ack.stream),
+                ));
+            }
 
             let engine = NatsEngine {
                 client,
@@ -1400,6 +1489,7 @@ impl NatsStorageAdapter {
     ) -> Result<(), OperationFailure> {
         let js = self.js.clone();
         let meta_subject = self.meta_subject.clone();
+        let meta_name = self.meta_stream_name.clone();
         let record_clone = record.clone();
         let handle = self.runtime.handle().clone();
 
@@ -1409,7 +1499,13 @@ impl NatsStorageAdapter {
             let mut record_frame = Vec::new();
             ContainerFrame::encode_payload(&record_bytes, &mut record_frame);
 
-            js.publish(meta_subject, record_frame.into())
+            let mut headers = async_nats::HeaderMap::new();
+            headers.insert(
+                async_nats::header::NATS_EXPECTED_STREAM,
+                async_nats::HeaderValue::from(meta_name.as_str()),
+            );
+
+            let pub_ack = js.publish_with_headers(meta_subject, headers, record_frame.into())
                 .await
                 .map_err(|err| {
                     OperationFailure::new(
@@ -1424,6 +1520,13 @@ impl NatsStorageAdapter {
                         format!("failed to ack meta frame: {err}"),
                     )
                 })?;
+
+            if pub_ack.stream != meta_name {
+                return Err(OperationFailure::new(
+                    FailureCondition::OwnershipRecordUnreadable,
+                    format!("publish ack stream mismatch: expected {meta_name}, got {}", pub_ack.stream),
+                ));
+            }
 
             Ok(())
         })
@@ -1695,6 +1798,10 @@ impl StorageEngine for NatsEngine {
         headers.insert(
             async_nats::header::NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
             async_nats::HeaderValue::from(self.last_data_seq),
+        );
+        headers.insert(
+            async_nats::header::NATS_EXPECTED_STREAM,
+            async_nats::HeaderValue::from(self.data_stream_name.as_str()),
         );
 
         let js = self.js.clone();
@@ -2028,6 +2135,7 @@ impl StorageEngine for NatsEngine {
         }
         let js = self.js.clone();
         let meta_subject = self.meta_subject.clone();
+        let meta_name = self.meta_stream_name.clone();
         let handle = self.runtime.handle().clone();
         let timeout = self.publish_timeout;
         let record_clone = record.clone();
@@ -2037,8 +2145,14 @@ impl StorageEngine for NatsEngine {
             let mut record_frame = Vec::new();
             ContainerFrame::encode_payload(&record_bytes, &mut record_frame);
 
+            let mut headers = async_nats::HeaderMap::new();
+            headers.insert(
+                async_nats::header::NATS_EXPECTED_STREAM,
+                async_nats::HeaderValue::from(meta_name.as_str()),
+            );
+
             let pub_future = js
-                .publish(meta_subject, record_frame.into())
+                .publish_with_headers(meta_subject, headers, record_frame.into())
                 .await
                 .map_err(|err| {
                     OperationFailure::new(
@@ -2065,7 +2179,20 @@ impl StorageEngine for NatsEngine {
         })?;
 
         match ack {
-            WriteLandingVerdict::Landed(_) => {}
+            WriteLandingVerdict::Landed(pub_ack) => {
+                if pub_ack.stream != self.meta_stream_name {
+                    self.uncertain = true;
+                    let detail = format!(
+                        "publish ack stream mismatch on meta record: expected {}, got {}",
+                        self.meta_stream_name, pub_ack.stream
+                    );
+                    self.uncertain_diagnostic = Some(detail.clone());
+                    return Err(OperationFailure::new(
+                        FailureCondition::OwnershipRecordUnreadable,
+                        detail,
+                    ));
+                }
+            }
             WriteLandingVerdict::Undetermined { .. } => {
                 self.uncertain = true;
                 let detail = diagnostic

@@ -710,3 +710,156 @@ fn test_m4_fold_and_for_each_envelopes_borrowed_views() {
         .expect("for_each_envelope");
     assert_eq!(visited_count, 20);
 }
+
+#[test]
+fn test_file_reopen_same_stream_append_continuation_matches_batch() {
+    let dir = TestDir::new("reopen_continuation");
+    let stem_a = dir.path().join("store_a");
+    let stem_b = dir.path().join("store_b");
+
+    let adapter_a = FileStorageAdapter::new(&stem_a);
+    let adapter_b = FileStorageAdapter::new(&stem_b);
+    let claim = sample_claim(1);
+
+    let fiber1 = [0x11; 16];
+    let fiber2 = [0x22; 16];
+    let fiber3 = [0x33; 16];
+
+    let mut events_n = Vec::new();
+    let mut event_num = 1u8;
+    for _round in 0..4 {
+        events_n.push((fiber1, [event_num; 16], format!("payload-{event_num}").into_bytes()));
+        event_num += 1;
+        events_n.push((fiber2, [event_num; 16], format!("payload-{event_num}").into_bytes()));
+        event_num += 1;
+        events_n.push((fiber3, [event_num; 16], format!("payload-{event_num}").into_bytes()));
+        event_num += 1;
+    }
+    assert_eq!(events_n.len(), 12);
+
+    let mut events_m = Vec::new();
+    for _round in 0..3 {
+        events_m.push((fiber1, [event_num; 16], format!("payload-{event_num}").into_bytes()));
+        event_num += 1;
+        events_m.push((fiber2, [event_num; 16], format!("payload-{event_num}").into_bytes()));
+        event_num += 1;
+        events_m.push((fiber3, [event_num; 16], format!("payload-{event_num}").into_bytes()));
+        event_num += 1;
+    }
+    assert_eq!(events_m.len(), 9);
+
+    let mut writer_a = adapter_a.create(&claim).expect("create writer a");
+    for (fiber_id, event_id, payload) in &events_n {
+        writer_a
+            .append_to_fiber(*fiber_id, *event_id, payload.clone())
+            .expect("append to writer a");
+    }
+    drop(writer_a);
+
+    let mut reader_a = adapter_a.open_read().expect("open reader a mid");
+    let mid_envelopes = reader_a.read_all_envelopes().expect("read all mid");
+    assert_eq!(mid_envelopes.len(), 12);
+    drop(reader_a);
+
+    let mut writer_a = adapter_a.open_write(1).expect("reopen writer a");
+    for (fiber_id, event_id, payload) in &events_m {
+        writer_a
+            .append_to_fiber(*fiber_id, *event_id, payload.clone())
+            .expect("append continuation to writer a");
+    }
+    drop(writer_a);
+
+    let mut writer_b = adapter_b.create(&claim).expect("create writer b");
+    for (fiber_id, event_id, payload) in &events_n {
+        writer_b
+            .append_to_fiber(*fiber_id, *event_id, payload.clone())
+            .expect("batch append n to writer b");
+    }
+    for (fiber_id, event_id, payload) in &events_m {
+        writer_b
+            .append_to_fiber(*fiber_id, *event_id, payload.clone())
+            .expect("batch append m to writer b");
+    }
+    drop(writer_b);
+
+    let final_writer_a = adapter_a.open_write(1).expect("final open write a");
+    let final_writer_b = adapter_b.open_write(1).expect("final open write b");
+
+    assert_eq!(
+        final_writer_a.rolling_commitment().current_commitment(),
+        final_writer_b.rolling_commitment().current_commitment()
+    );
+    assert_eq!(
+        final_writer_a.rolling_commitment().frame_count(),
+        final_writer_b.rolling_commitment().frame_count()
+    );
+    assert_eq!(final_writer_a.rolling_commitment().frame_count(), 21);
+
+    for fiber_id in [fiber1, fiber2, fiber3] {
+        let handle_a = final_writer_a.fiber(fiber_id).expect("fiber handle a");
+        let handle_b = final_writer_b.fiber(fiber_id).expect("fiber handle b");
+        assert_eq!(handle_a.event_count(), handle_b.event_count());
+        assert_eq!(handle_a.precursor(), handle_b.precursor());
+        assert_eq!(handle_a.state(), handle_b.state());
+
+        let latest_a = final_writer_a.get_latest(fiber_id).expect("latest a").unwrap();
+        let latest_b = final_writer_b.get_latest(fiber_id).expect("latest b").unwrap();
+        assert_eq!(latest_a.header.event_id, latest_b.header.event_id);
+        assert_eq!(latest_a.header.precursor, latest_b.header.precursor);
+        assert_eq!(latest_a.header.fiber_id, latest_b.header.fiber_id);
+        assert_eq!(latest_a.payload, latest_b.payload);
+    }
+    drop(final_writer_a);
+    drop(final_writer_b);
+
+    let mut final_reader_a = adapter_a.open_read().expect("final open read a");
+    let mut final_reader_b = adapter_b.open_read().expect("final open read b");
+    let envs_a = final_reader_a.read_all_envelopes().expect("read all a");
+    let envs_b = final_reader_b.read_all_envelopes().expect("read all b");
+    assert_eq!(envs_a.len(), 21);
+    assert_eq!(envs_b.len(), 21);
+
+    for (ea, eb) in envs_a.iter().zip(envs_b.iter()) {
+        assert_eq!(ea.header.event_id, eb.header.event_id);
+        assert_eq!(ea.header.fiber_id, eb.header.fiber_id);
+        assert_eq!(ea.header.precursor, eb.header.precursor);
+        assert_eq!(ea.header.precursor_hash, eb.header.precursor_hash);
+        assert_eq!(ea.header.detached, eb.header.detached);
+        assert_eq!(ea.payload, eb.payload);
+    }
+}
+
+#[test]
+fn test_file_read_meta_records_missing_seq1_fails_closed() {
+    let dir = TestDir::new("meta_missing_seq1");
+    let meta_path = dir.path().join("corrupted.meta");
+    fs::write(&meta_path, b"not_a_header").expect("write invalid header");
+
+    let err = pardosa::file::read_meta_records(&meta_path).expect_err("must fail closed");
+    assert_eq!(*err.condition(), FailureCondition::OwnershipRecordUnreadable);
+
+    let empty_meta_path = dir.path().join("empty.meta");
+    fs::write(&empty_meta_path, b"").expect("write empty meta");
+    let err_empty = pardosa::file::read_meta_records(&empty_meta_path).expect_err("must fail closed on empty");
+    assert_eq!(*err_empty.condition(), FailureCondition::OwnershipRecordUnreadable);
+}
+
+#[test]
+fn test_file_open_write_concurrent_writer_rejected_while_holding_lock() {
+    let dir = TestDir::new("open_write_concurrent");
+    let base_path = dir.path().join("store");
+    let adapter = FileStorageAdapter::new(&base_path);
+    let claim = sample_claim(1);
+
+    let writer = adapter.create(&claim).expect("create");
+    drop(writer);
+
+    let writer1 = adapter.open_write(1).expect("first open write holds exclusion");
+    let err = adapter.open_write(1).expect_err("concurrent open write must be rejected");
+    assert_eq!(*err.condition(), FailureCondition::AnotherOwnerHoldsExclusion);
+
+    drop(writer1);
+
+    let writer2 = adapter.open_write(1).expect("open write succeeds after lock released");
+    drop(writer2);
+}
