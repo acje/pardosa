@@ -1322,13 +1322,19 @@ impl<T: PardosaType, const MAX: usize> PardosaType for EventVec<T, MAX> {
         let mut items = Vec::with_capacity(initial_capacity);
         for _ in 0..count {
             let (item, consumed) = T::decode_type(&buf[cursor..])?;
-            if cursor + consumed > buf.len() {
+            let next_cursor = cursor
+                .checked_add(consumed)
+                .ok_or_else(|| DecodeError::TruncatedPayload {
+                    expected: usize::MAX,
+                    available: buf.len(),
+                })?;
+            if next_cursor > buf.len() {
                 return Err(DecodeError::TruncatedPayload {
-                    expected: cursor + consumed,
+                    expected: next_cursor,
                     available: buf.len(),
                 });
             }
-            cursor += consumed;
+            cursor = next_cursor;
             items.push(item);
         }
         Ok((Self::new(items)?, cursor))
