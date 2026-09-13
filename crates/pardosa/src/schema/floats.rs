@@ -76,6 +76,7 @@ impl From<OrderedF32> for f32 {
 }
 
 impl PardosaType for OrderedF32 {
+    const TYPE_DEPTH: usize = 0;
     fn descriptor_node() -> DescriptorNode {
         DescriptorNode::OrderedF32
     }
@@ -169,6 +170,7 @@ impl From<OrderedF64> for f64 {
 }
 
 impl PardosaType for OrderedF64 {
+    const TYPE_DEPTH: usize = 0;
     fn descriptor_node() -> DescriptorNode {
         DescriptorNode::OrderedF64
     }
@@ -273,6 +275,7 @@ impl TryFrom<EventF32> for OrderedF32 {
 }
 
 impl PardosaType for EventF32 {
+    const TYPE_DEPTH: usize = 0;
     fn descriptor_node() -> DescriptorNode {
         DescriptorNode::Enum {
             name: "EventF32".to_string(),
@@ -424,6 +427,7 @@ impl TryFrom<EventF64> for OrderedF64 {
 }
 
 impl PardosaType for EventF64 {
+    const TYPE_DEPTH: usize = 0;
     fn descriptor_node() -> DescriptorNode {
         DescriptorNode::Enum {
             name: "EventF64".to_string(),

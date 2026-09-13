@@ -32,14 +32,14 @@ fn test_readme_derived_order_event_compiles() {
         Cancelled = 3,
     }
 
-    assert_eq!(OrderEvent::schema_version(), 1);
+    assert_eq!(OrderEvent::SCHEMA_VERSION, 1);
     let identity = OrderEvent::schema_identity();
     assert_ne!(identity.as_bytes(), &[0u8; 32]);
 }
 
 #[test]
 fn test_user_event_schema_version_and_identity() {
-    assert_eq!(UserEvent::schema_version(), 1);
+    assert_eq!(UserEvent::SCHEMA_VERSION, 1);
     let desc = UserEvent::schema_descriptor();
     match desc {
         DescriptorNode::Enum {
@@ -782,5 +782,317 @@ fn test_compile_fail_missing_schema_version_attribute() {
             "missing mandatory `#[pardosa(version = N)]` attribute on PardosaSchema root"
         ),
         "stderr must cite missing mandatory version attribute:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_compile_fail_override_schema_version() {
+    let code = r#"
+        use pardosa::prelude::*;
+
+        #[derive(Debug, PartialEq, Eq)]
+        enum ManualSchemaEvent {
+            Tombstone,
+        }
+
+        impl PardosaSchema for ManualSchemaEvent {
+            const SCHEMA_VERSION: u32 = 1;
+            fn schema_version() -> u32 { 1 }
+            fn schema_descriptor() -> DescriptorNode { DescriptorNode::U8 }
+            fn encode_payload(&self, _buf: &mut Vec<u8>) -> Result<(), EncodeError> { Ok(()) }
+            fn decode_payload(_buf: &[u8]) -> Result<Self, DecodeError> { Ok(Self::Tombstone) }
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(
+        !ok,
+        "overriding schema_version in PardosaSchema impl must fail compilation"
+    );
+    assert!(
+        stderr.contains("E0407") || stderr.contains("is not a member of trait `PardosaSchema`"),
+        "stderr must cite E0407:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_m1_hygiene_reserved_field_names() {
+    #[derive(Debug, PartialEq, Eq, Clone, PardosaType)]
+    struct ReservedFieldsStruct {
+        consumed: u32,
+        cursor: u32,
+        buf: u32,
+        value: u32,
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, PardosaType)]
+    #[repr(u8)]
+    enum ReservedFieldsEnum {
+        Data {
+            consumed: u32,
+            cursor: u32,
+            buf: u32,
+            value: u32,
+        } = 0,
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, PardosaSchema)]
+    #[repr(u8)]
+    #[pardosa(version = 1)]
+    enum ReservedFieldsSchema {
+        #[pardosa(tombstone)]
+        Tombstone = 0,
+        Data {
+            consumed: u32,
+            cursor: u32,
+            buf: u32,
+            value: u32,
+        } = 1,
+    }
+
+    let s = ReservedFieldsStruct {
+        consumed: 1,
+        cursor: 2,
+        buf: 3,
+        value: 4,
+    };
+    let mut s_buf = Vec::new();
+    s.encode_type(&mut s_buf).unwrap();
+    let (s_decoded, s_consumed) = ReservedFieldsStruct::decode_type(&s_buf).unwrap();
+    assert_eq!(s_consumed, s_buf.len());
+    assert_eq!(s_decoded, s);
+
+    let e = ReservedFieldsEnum::Data {
+        consumed: 10,
+        cursor: 20,
+        buf: 30,
+        value: 40,
+    };
+    let mut e_buf = Vec::new();
+    e.encode_type(&mut e_buf).unwrap();
+    let (e_decoded, e_consumed) = ReservedFieldsEnum::decode_type(&e_buf).unwrap();
+    assert_eq!(e_consumed, e_buf.len());
+    assert_eq!(e_decoded, e);
+
+    let schema_event = ReservedFieldsSchema::Data {
+        consumed: 100,
+        cursor: 200,
+        buf: 300,
+        value: 400,
+    };
+    let mut schema_buf = Vec::new();
+    schema_event.encode_payload(&mut schema_buf).unwrap();
+    let schema_decoded = ReservedFieldsSchema::decode_payload(&schema_buf).unwrap();
+    assert_eq!(schema_decoded, schema_event);
+}
+
+#[test]
+fn test_m2_macro_qualification_shadowing_vec() {
+    #[allow(unused_macros)]
+    macro_rules! vec {
+        ($($t:tt)*) => {
+            ::std::vec::Vec::new()
+        };
+    }
+
+    #[derive(Debug, PartialEq, Eq, PardosaType)]
+    struct ShadowedStruct {
+        value: u32,
+    }
+
+    #[derive(Debug, PartialEq, Eq, PardosaType)]
+    #[repr(u8)]
+    enum ShadowedEnum {
+        Variant { code: u16 } = 0,
+    }
+
+    #[derive(Debug, PartialEq, Eq, PardosaSchema)]
+    #[repr(u8)]
+    #[pardosa(version = 1)]
+    enum ShadowedSchema {
+        #[pardosa(tombstone)]
+        Tombstone = 0,
+        Event {
+            tag: u8,
+        } = 1,
+    }
+
+    let node = ShadowedStruct::descriptor_node();
+    match node {
+        DescriptorNode::Struct { fields, .. } => {
+            assert_eq!(
+                fields.len(),
+                1,
+                "fields must be populated despite local vec! macro"
+            );
+            assert_eq!(fields[0].name, "value");
+        }
+        other => panic!("expected Struct descriptor node, got {other:?}"),
+    }
+
+    let enum_node = ShadowedEnum::descriptor_node();
+    match enum_node {
+        DescriptorNode::Enum { variants, .. } => {
+            assert_eq!(
+                variants.len(),
+                1,
+                "variants must be populated despite local vec! macro"
+            );
+        }
+        other => panic!("expected Enum descriptor node, got {other:?}"),
+    }
+
+    let schema_node = ShadowedSchema::schema_descriptor();
+    match schema_node {
+        DescriptorNode::Enum { variants, .. } => {
+            assert_eq!(
+                variants.len(),
+                2,
+                "schema variants must be populated despite local vec! macro"
+            );
+        }
+        other => panic!("expected Enum descriptor node, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_m3_checked_cursor_advancement_composition() {
+    #[derive(Debug, PartialEq, Eq, Clone)]
+    struct BadConsumedType;
+
+    impl PardosaType for BadConsumedType {
+        const TYPE_DEPTH: usize = 0;
+        fn descriptor_node() -> DescriptorNode {
+            DescriptorNode::U8
+        }
+        fn encode_type(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
+            buf.push(0);
+            Ok(())
+        }
+        fn decode_type(_buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+            Ok((Self, usize::MAX))
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, PardosaType)]
+    struct ComposedStruct {
+        bad: BadConsumedType,
+        after: u8,
+    }
+
+    let err = ComposedStruct::decode_type(&[0u8; 10]).unwrap_err();
+    assert_eq!(
+        err,
+        DecodeError::TruncatedPayload {
+            expected: usize::MAX,
+            available: 10,
+        }
+    );
+}
+
+#[test]
+fn test_h1_type_depth_const_values() {
+    assert_eq!(u32::TYPE_DEPTH, 0);
+    assert_eq!(Option::<u32>::TYPE_DEPTH, 1);
+    assert_eq!(EventVec::<u32, 10>::TYPE_DEPTH, 1);
+    assert_eq!(Option::<Option<u32>>::TYPE_DEPTH, 2);
+    assert_eq!(EventVec::<Option<u32>, 10>::TYPE_DEPTH, 2);
+
+    #[derive(PardosaType)]
+    struct LeafStruct {
+        a: u32,
+    }
+    assert_eq!(LeafStruct::TYPE_DEPTH, 1);
+
+    #[derive(PardosaType)]
+    struct NestedStruct {
+        inner: LeafStruct,
+    }
+    assert_eq!(NestedStruct::TYPE_DEPTH, 2);
+}
+
+#[test]
+fn test_compile_fail_h1_mutual_recursion() {
+    let code = r#"
+        use pardosa::prelude::*;
+
+        #[derive(PardosaType)]
+        struct A {
+            b: EventVec<B, 1>,
+        }
+
+        #[derive(PardosaType)]
+        struct B {
+            a: EventVec<A, 1>,
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(!ok, "mutual recursion cycle must fail compilation");
+    assert!(
+        stderr.contains("cycle detected") || stderr.contains("recursion limit"),
+        "stderr must cite cycle or recursion limit:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_compile_fail_h1_type_alias_recursion() {
+    let code = r#"
+        use pardosa::prelude::*;
+
+        type NodeAlias = Node;
+
+        #[derive(PardosaType)]
+        struct Node {
+            next: EventVec<NodeAlias, 1>,
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(!ok, "type alias cycle must fail compilation");
+    assert!(
+        stderr.contains("cycle detected") || stderr.contains("recursion limit"),
+        "stderr must cite cycle or recursion limit:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_compile_fail_version_zero() {
+    let code = r#"
+        use pardosa::prelude::*;
+
+        #[derive(Debug, PartialEq, Eq, PardosaSchema)]
+        #[repr(u8)]
+        #[pardosa(version = 0)]
+        enum ZeroVersionEvent {
+            #[pardosa(tombstone)]
+            Tombstone = 0,
+            Action = 1,
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(!ok, "version = 0 must fail compilation");
+    assert!(
+        stderr.contains("schema version must be non-zero"),
+        "stderr must cite non-zero version:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_compile_fail_duplicate_version() {
+    let code = r#"
+        use pardosa::prelude::*;
+
+        #[derive(Debug, PartialEq, Eq, PardosaSchema)]
+        #[repr(u8)]
+        #[pardosa(version = 1, version = 2)]
+        enum DuplicateVersionEvent {
+            #[pardosa(tombstone)]
+            Tombstone = 0,
+            Action = 1,
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(!ok, "duplicate version must fail compilation");
+    assert!(
+        stderr.contains("duplicate `version` attribute"),
+        "stderr must cite duplicate version attribute:\n{stderr}"
     );
 }

@@ -87,6 +87,8 @@ fn expand_pardosa_type_struct(
     let ident_str = ident.to_string();
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
+    let mut field_types = Vec::new();
+
     let (desc, encode_body, decode_body) = match &data_struct.fields {
         Fields::Unit => (
             quote! {
@@ -121,14 +123,16 @@ fn expand_pardosa_type_struct(
             } else {
                 let mut field_descriptors = Vec::new();
                 let mut field_idents = Vec::new();
+                let mut field_vars = Vec::new();
                 let mut field_encodes = Vec::new();
                 let mut field_decodes = Vec::new();
 
-                for f in &fields.named {
-                    let fident = f.ident.as_ref().unwrap();
+                for (idx, f) in fields.named.iter().enumerate() {
+                    let fident = f.ident.as_ref().expect("named field has ident");
                     let fname_str = fident.to_string();
                     let fty = &f.ty;
                     check_type_for_issues(fty, ident)?;
+                    field_types.push(fty);
 
                     field_descriptors.push(quote! {
                         ::pardosa::schema::FieldDescriptor {
@@ -137,14 +141,17 @@ fn expand_pardosa_type_struct(
                         }
                     });
 
+                    let field_var = syn::Ident::new(&format!("__pardosa_field_{idx}"), f.span());
                     field_idents.push(fident);
+                    field_vars.push(field_var.clone());
+
                     field_encodes.push(quote! {
-                        <#fty as ::pardosa::schema::PardosaType>::encode_type(&self.#fident, buf)?;
+                        <#fty as ::pardosa::schema::PardosaType>::encode_type(&self.#fident, __pardosa_buf)?;
                     });
 
                     field_decodes.push(quote! {
-                        let (#fident, consumed) = <#fty as ::pardosa::schema::PardosaType>::decode_type(&buf[cursor..])?;
-                        cursor += consumed;
+                        let (#field_var, __pardosa_consumed) = <#fty as ::pardosa::schema::PardosaType>::decode_type(&__pardosa_buf[__pardosa_cursor..])?;
+                        __pardosa_cursor = ::pardosa::encoding::checked_advance(__pardosa_cursor, __pardosa_consumed, __pardosa_buf.len())?;
                     });
                 }
 
@@ -152,7 +159,7 @@ fn expand_pardosa_type_struct(
                     quote! {
                         ::pardosa::schema::DescriptorNode::Struct {
                             name: #ident_str.to_string(),
-                            fields: vec![#(#field_descriptors),*],
+                            fields: ::std::vec![#(#field_descriptors),*],
                         }
                     },
                     quote! {
@@ -160,9 +167,9 @@ fn expand_pardosa_type_struct(
                         ::std::result::Result::Ok(())
                     },
                     quote! {
-                        let mut cursor = 0;
+                        let mut __pardosa_cursor = 0usize;
                         #(#field_decodes)*
-                        ::std::result::Result::Ok((Self { #(#field_idents),* }, cursor))
+                        ::std::result::Result::Ok((Self { #(#field_idents: #field_vars),* }, __pardosa_cursor))
                     },
                 )
             }
@@ -185,17 +192,17 @@ fn expand_pardosa_type_struct(
                 )
             } else {
                 let mut field_descriptors = Vec::new();
-                let mut field_indices = Vec::new();
-                let mut field_idents = Vec::new();
+                let mut field_vars = Vec::new();
                 let mut field_encodes = Vec::new();
                 let mut field_decodes = Vec::new();
 
                 for (idx, f) in fields.unnamed.iter().enumerate() {
                     let syn_idx = syn::Index::from(idx);
-                    let idx_ident = syn::Ident::new(&format!("f{}", idx), f.span());
-                    let fname_str = format!("_{}", idx);
+                    let field_var = syn::Ident::new(&format!("__pardosa_field_{idx}"), f.span());
+                    let fname_str = format!("_{idx}");
                     let fty = &f.ty;
                     check_type_for_issues(fty, ident)?;
+                    field_types.push(fty);
 
                     field_descriptors.push(quote! {
                         ::pardosa::schema::FieldDescriptor {
@@ -204,15 +211,14 @@ fn expand_pardosa_type_struct(
                         }
                     });
 
-                    field_indices.push(syn_idx.clone());
-                    field_idents.push(idx_ident.clone());
+                    field_vars.push(field_var.clone());
                     field_encodes.push(quote! {
-                        <#fty as ::pardosa::schema::PardosaType>::encode_type(&self.#syn_idx, buf)?;
+                        <#fty as ::pardosa::schema::PardosaType>::encode_type(&self.#syn_idx, __pardosa_buf)?;
                     });
 
                     field_decodes.push(quote! {
-                        let (#idx_ident, consumed) = <#fty as ::pardosa::schema::PardosaType>::decode_type(&buf[cursor..])?;
-                        cursor += consumed;
+                        let (#field_var, __pardosa_consumed) = <#fty as ::pardosa::schema::PardosaType>::decode_type(&__pardosa_buf[__pardosa_cursor..])?;
+                        __pardosa_cursor = ::pardosa::encoding::checked_advance(__pardosa_cursor, __pardosa_consumed, __pardosa_buf.len())?;
                     });
                 }
 
@@ -220,7 +226,7 @@ fn expand_pardosa_type_struct(
                     quote! {
                         ::pardosa::schema::DescriptorNode::Struct {
                             name: #ident_str.to_string(),
-                            fields: vec![#(#field_descriptors),*],
+                            fields: ::std::vec![#(#field_descriptors),*],
                         }
                     },
                     quote! {
@@ -228,29 +234,60 @@ fn expand_pardosa_type_struct(
                         ::std::result::Result::Ok(())
                     },
                     quote! {
-                        let mut cursor = 0;
+                        let mut __pardosa_cursor = 0usize;
                         #(#field_decodes)*
-                        ::std::result::Result::Ok((Self(#(#field_idents),*), cursor))
+                        ::std::result::Result::Ok((Self(#(#field_vars),*), __pardosa_cursor))
                     },
                 )
             }
         }
     };
 
+    let type_depth_tokens = if field_types.is_empty() {
+        quote! { 0usize }
+    } else {
+        quote! {
+            {
+                let mut __pardosa_max_depth = 0usize;
+                #(
+                    let __pardosa_d = <#field_types as ::pardosa::schema::PardosaType>::TYPE_DEPTH + 1;
+                    if __pardosa_d > __pardosa_max_depth {
+                        __pardosa_max_depth = __pardosa_d;
+                    }
+                )*
+                assert!(__pardosa_max_depth <= ::pardosa::schema::MAX_DESCRIPTOR_DEPTH);
+                __pardosa_max_depth
+            }
+        }
+    };
+
+    let const_assert = if input.generics.params.is_empty() {
+        quote! {
+            const _: () = assert!(<#ident as ::pardosa::schema::PardosaType>::TYPE_DEPTH <= ::pardosa::schema::MAX_DESCRIPTOR_DEPTH);
+        }
+    } else {
+        quote! {}
+    };
+
     Ok(quote! {
         impl #impl_generics ::pardosa::schema::PardosaType for #ident #ty_generics #where_clause {
+            const TYPE_DEPTH: usize = #type_depth_tokens;
+
             fn descriptor_node() -> ::pardosa::schema::DescriptorNode {
+                assert!(Self::TYPE_DEPTH <= ::pardosa::schema::MAX_DESCRIPTOR_DEPTH);
                 #desc
             }
 
-            fn encode_type(&self, buf: &mut ::std::vec::Vec<u8>) -> ::std::result::Result<(), ::pardosa::encoding::EncodeError> {
+            fn encode_type(&self, __pardosa_buf: &mut ::std::vec::Vec<u8>) -> ::std::result::Result<(), ::pardosa::encoding::EncodeError> {
                 #encode_body
             }
 
-            fn decode_type(buf: &[u8]) -> ::std::result::Result<(Self, usize), ::pardosa::encoding::DecodeError> {
+            fn decode_type(__pardosa_buf: &[u8]) -> ::std::result::Result<(Self, usize), ::pardosa::encoding::DecodeError> {
                 #decode_body
             }
         }
+
+        #const_assert
     })
 }
 
@@ -319,6 +356,7 @@ fn expand_pardosa_type_enum(
     let mut variant_descriptor_tokens = Vec::new();
     let mut encode_match_arms = Vec::new();
     let mut decode_match_arms = Vec::new();
+    let mut variant_depth_exprs = Vec::new();
 
     for (variant, disc_val, disc_expr) in &variant_data {
         let vident = &variant.ident;
@@ -337,14 +375,14 @@ fn expand_pardosa_type_enum(
                 if discriminant_width == 1 {
                     encode_match_arms.push(quote! {
                         Self::#vident => {
-                            buf.push(#disc_expr as u8);
+                            __pardosa_buf.push(#disc_expr as u8);
                             ::std::result::Result::Ok(())
                         }
                     });
                 } else {
                     encode_match_arms.push(quote! {
                         Self::#vident => {
-                            buf.extend_from_slice(&(#disc_expr as u16).to_le_bytes());
+                            __pardosa_buf.extend_from_slice(&(#disc_expr as u16).to_le_bytes());
                             ::std::result::Result::Ok(())
                         }
                     });
@@ -356,6 +394,10 @@ fn expand_pardosa_type_enum(
             }
             Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
                 let ty = &fields.unnamed[0].ty;
+                variant_depth_exprs.push(quote! {
+                    <#ty as ::pardosa::schema::PardosaType>::TYPE_DEPTH + 1
+                });
+
                 variant_descriptor_tokens.push(quote! {
                     ::pardosa::schema::VariantDescriptor {
                         discriminant: #disc_expr as u32,
@@ -366,38 +408,48 @@ fn expand_pardosa_type_enum(
 
                 if discriminant_width == 1 {
                     encode_match_arms.push(quote! {
-                        Self::#vident(val) => {
-                            buf.push(#disc_expr as u8);
-                            <#ty as ::pardosa::schema::PardosaType>::encode_type(val, buf)
+                        Self::#vident(__pardosa_field_0) => {
+                            __pardosa_buf.push(#disc_expr as u8);
+                            <#ty as ::pardosa::schema::PardosaType>::encode_type(__pardosa_field_0, __pardosa_buf)
                         }
                     });
                 } else {
                     encode_match_arms.push(quote! {
-                        Self::#vident(val) => {
-                            buf.extend_from_slice(&(#disc_expr as u16).to_le_bytes());
-                            <#ty as ::pardosa::schema::PardosaType>::encode_type(val, buf)
+                        Self::#vident(__pardosa_field_0) => {
+                            __pardosa_buf.extend_from_slice(&(#disc_expr as u16).to_le_bytes());
+                            <#ty as ::pardosa::schema::PardosaType>::encode_type(__pardosa_field_0, __pardosa_buf)
                         }
                     });
                 }
 
                 decode_match_arms.push(quote! {
                     #disc_val => {
-                        let (val, inner_consumed) = <#ty as ::pardosa::schema::PardosaType>::decode_type(&buf[#discriminant_width as usize..])?;
-                        let consumed = (#discriminant_width as usize) + inner_consumed;
-                        ::std::result::Result::Ok((Self::#vident(val), consumed))
+                        if __pardosa_buf.len() < #discriminant_width as usize {
+                            return ::std::result::Result::Err(::pardosa::encoding::DecodeError::TruncatedPayload {
+                                expected: #discriminant_width as usize,
+                                available: __pardosa_buf.len(),
+                            });
+                        }
+                        let (__pardosa_field_0, __pardosa_consumed) = <#ty as ::pardosa::schema::PardosaType>::decode_type(&__pardosa_buf[#discriminant_width as usize..])?;
+                        let __pardosa_cursor = ::pardosa::encoding::checked_advance(#discriminant_width as usize, __pardosa_consumed, __pardosa_buf.len())?;
+                        ::std::result::Result::Ok((Self::#vident(__pardosa_field_0), __pardosa_cursor))
                     }
                 });
             }
             Fields::Named(fields) => {
                 let mut field_descriptors = Vec::new();
                 let mut field_idents = Vec::new();
+                let mut field_vars = Vec::new();
                 let mut field_encodes = Vec::new();
                 let mut field_decodes = Vec::new();
 
-                for f in &fields.named {
-                    let fident = f.ident.as_ref().unwrap();
+                for (idx, f) in fields.named.iter().enumerate() {
+                    let fident = f.ident.as_ref().expect("named field has ident");
                     let fname_str = fident.to_string();
                     let fty = &f.ty;
+                    variant_depth_exprs.push(quote! {
+                        <#fty as ::pardosa::schema::PardosaType>::TYPE_DEPTH + 2
+                    });
 
                     field_descriptors.push(quote! {
                         ::pardosa::schema::FieldDescriptor {
@@ -406,14 +458,17 @@ fn expand_pardosa_type_enum(
                         }
                     });
 
+                    let field_var = syn::Ident::new(&format!("__pardosa_field_{idx}"), f.span());
                     field_idents.push(fident);
+                    field_vars.push(field_var.clone());
+
                     field_encodes.push(quote! {
-                        <#fty as ::pardosa::schema::PardosaType>::encode_type(#fident, buf)?;
+                        <#fty as ::pardosa::schema::PardosaType>::encode_type(#field_var, __pardosa_buf)?;
                     });
 
                     field_decodes.push(quote! {
-                        let (#fident, consumed) = <#fty as ::pardosa::schema::PardosaType>::decode_type(&buf[cursor..])?;
-                        cursor += consumed;
+                        let (#field_var, __pardosa_consumed) = <#fty as ::pardosa::schema::PardosaType>::decode_type(&__pardosa_buf[__pardosa_cursor..])?;
+                        __pardosa_cursor = ::pardosa::encoding::checked_advance(__pardosa_cursor, __pardosa_consumed, __pardosa_buf.len())?;
                     });
                 }
 
@@ -424,23 +479,23 @@ fn expand_pardosa_type_enum(
                         name: #vname_str.to_string(),
                         payload: ::std::option::Option::Some(::pardosa::schema::DescriptorNode::Struct {
                             name: #struct_name.to_string(),
-                            fields: vec![#(#field_descriptors),*],
+                            fields: ::std::vec![#(#field_descriptors),*],
                         }),
                     }
                 });
 
                 if discriminant_width == 1 {
                     encode_match_arms.push(quote! {
-                        Self::#vident { #(#field_idents),* } => {
-                            buf.push(#disc_expr as u8);
+                        Self::#vident { #(#field_idents: #field_vars),* } => {
+                            __pardosa_buf.push(#disc_expr as u8);
                             #(#field_encodes)*
                             ::std::result::Result::Ok(())
                         }
                     });
                 } else {
                     encode_match_arms.push(quote! {
-                        Self::#vident { #(#field_idents),* } => {
-                            buf.extend_from_slice(&(#disc_expr as u16).to_le_bytes());
+                        Self::#vident { #(#field_idents: #field_vars),* } => {
+                            __pardosa_buf.extend_from_slice(&(#disc_expr as u16).to_le_bytes());
                             #(#field_encodes)*
                             ::std::result::Result::Ok(())
                         }
@@ -449,22 +504,31 @@ fn expand_pardosa_type_enum(
 
                 decode_match_arms.push(quote! {
                     #disc_val => {
-                        let mut cursor = #discriminant_width as usize;
+                        if __pardosa_buf.len() < #discriminant_width as usize {
+                            return ::std::result::Result::Err(::pardosa::encoding::DecodeError::TruncatedPayload {
+                                expected: #discriminant_width as usize,
+                                available: __pardosa_buf.len(),
+                            });
+                        }
+                        let mut __pardosa_cursor = #discriminant_width as usize;
                         #(#field_decodes)*
-                        ::std::result::Result::Ok((Self::#vident { #(#field_idents),* }, cursor))
+                        ::std::result::Result::Ok((Self::#vident { #(#field_idents: #field_vars),* }, __pardosa_cursor))
                     }
                 });
             }
             Fields::Unnamed(fields) => {
                 let mut field_descriptors = Vec::new();
-                let mut field_idents = Vec::new();
+                let mut field_vars = Vec::new();
                 let mut field_encodes = Vec::new();
                 let mut field_decodes = Vec::new();
 
                 for (idx, f) in fields.unnamed.iter().enumerate() {
-                    let idx_ident = syn::Ident::new(&format!("f{}", idx), f.span());
-                    let fname_str = format!("_{}", idx);
+                    let field_var = syn::Ident::new(&format!("__pardosa_field_{idx}"), f.span());
+                    let fname_str = format!("_{idx}");
                     let fty = &f.ty;
+                    variant_depth_exprs.push(quote! {
+                        <#fty as ::pardosa::schema::PardosaType>::TYPE_DEPTH + 2
+                    });
 
                     field_descriptors.push(quote! {
                         ::pardosa::schema::FieldDescriptor {
@@ -473,14 +537,14 @@ fn expand_pardosa_type_enum(
                         }
                     });
 
-                    field_idents.push(idx_ident.clone());
+                    field_vars.push(field_var.clone());
                     field_encodes.push(quote! {
-                        <#fty as ::pardosa::schema::PardosaType>::encode_type(#idx_ident, buf)?;
+                        <#fty as ::pardosa::schema::PardosaType>::encode_type(#field_var, __pardosa_buf)?;
                     });
 
                     field_decodes.push(quote! {
-                        let (#idx_ident, consumed) = <#fty as ::pardosa::schema::PardosaType>::decode_type(&buf[cursor..])?;
-                        cursor += consumed;
+                        let (#field_var, __pardosa_consumed) = <#fty as ::pardosa::schema::PardosaType>::decode_type(&__pardosa_buf[__pardosa_cursor..])?;
+                        __pardosa_cursor = ::pardosa::encoding::checked_advance(__pardosa_cursor, __pardosa_consumed, __pardosa_buf.len())?;
                     });
                 }
 
@@ -491,23 +555,23 @@ fn expand_pardosa_type_enum(
                         name: #vname_str.to_string(),
                         payload: ::std::option::Option::Some(::pardosa::schema::DescriptorNode::Struct {
                             name: #struct_name.to_string(),
-                            fields: vec![#(#field_descriptors),*],
+                            fields: ::std::vec![#(#field_descriptors),*],
                         }),
                     }
                 });
 
                 if discriminant_width == 1 {
                     encode_match_arms.push(quote! {
-                        Self::#vident(#(#field_idents),*) => {
-                            buf.push(#disc_expr as u8);
+                        Self::#vident(#(#field_vars),*) => {
+                            __pardosa_buf.push(#disc_expr as u8);
                             #(#field_encodes)*
                             ::std::result::Result::Ok(())
                         }
                     });
                 } else {
                     encode_match_arms.push(quote! {
-                        Self::#vident(#(#field_idents),*) => {
-                            buf.extend_from_slice(&(#disc_expr as u16).to_le_bytes());
+                        Self::#vident(#(#field_vars),*) => {
+                            __pardosa_buf.extend_from_slice(&(#disc_expr as u16).to_le_bytes());
                             #(#field_encodes)*
                             ::std::result::Result::Ok(())
                         }
@@ -516,9 +580,15 @@ fn expand_pardosa_type_enum(
 
                 decode_match_arms.push(quote! {
                     #disc_val => {
-                        let mut cursor = #discriminant_width as usize;
+                        if __pardosa_buf.len() < #discriminant_width as usize {
+                            return ::std::result::Result::Err(::pardosa::encoding::DecodeError::TruncatedPayload {
+                                expected: #discriminant_width as usize,
+                                available: __pardosa_buf.len(),
+                            });
+                        }
+                        let mut __pardosa_cursor = #discriminant_width as usize;
                         #(#field_decodes)*
-                        ::std::result::Result::Ok((Self::#vident(#(#field_idents),*), cursor))
+                        ::std::result::Result::Ok((Self::#vident(#(#field_vars),*), __pardosa_cursor))
                     }
                 });
             }
@@ -527,45 +597,74 @@ fn expand_pardosa_type_enum(
 
     let decode_disc_extract = if discriminant_width == 1 {
         quote! {
-            if buf.is_empty() {
+            if __pardosa_buf.is_empty() {
                 return ::std::result::Result::Err(::pardosa::encoding::DecodeError::TruncatedPayload {
                     expected: 1,
                     available: 0,
                 });
             }
-            let disc = buf[0] as u32;
+            let disc = __pardosa_buf[0] as u32;
         }
     } else {
         quote! {
-            if buf.len() < 2 {
+            if __pardosa_buf.len() < 2 {
                 return ::std::result::Result::Err(::pardosa::encoding::DecodeError::TruncatedPayload {
                     expected: 2,
-                    available: buf.len(),
+                    available: __pardosa_buf.len(),
                 });
             }
-            let disc = u16::from_le_bytes([buf[0], buf[1]]) as u32;
+            let disc = u16::from_le_bytes([__pardosa_buf[0], __pardosa_buf[1]]) as u32;
         }
+    };
+
+    let type_depth_tokens = if variant_depth_exprs.is_empty() {
+        quote! { 0usize }
+    } else {
+        quote! {
+            {
+                let mut __pardosa_max_depth = 0usize;
+                #(
+                    let __pardosa_d = #variant_depth_exprs;
+                    if __pardosa_d > __pardosa_max_depth {
+                        __pardosa_max_depth = __pardosa_d;
+                    }
+                )*
+                assert!(__pardosa_max_depth <= ::pardosa::schema::MAX_DESCRIPTOR_DEPTH);
+                __pardosa_max_depth
+            }
+        }
+    };
+
+    let const_assert = if input.generics.params.is_empty() {
+        quote! {
+            const _: () = assert!(<#ident as ::pardosa::schema::PardosaType>::TYPE_DEPTH <= ::pardosa::schema::MAX_DESCRIPTOR_DEPTH);
+        }
+    } else {
+        quote! {}
     };
 
     Ok(quote! {
         impl #impl_generics ::pardosa::schema::PardosaType for #ident #ty_generics #where_clause {
+            const TYPE_DEPTH: usize = #type_depth_tokens;
+
             fn descriptor_node() -> ::pardosa::schema::DescriptorNode {
+                assert!(Self::TYPE_DEPTH <= ::pardosa::schema::MAX_DESCRIPTOR_DEPTH);
                 ::pardosa::schema::DescriptorNode::Enum {
                     name: #enum_name_str.to_string(),
                     discriminant_width: #discriminant_width,
-                    variants: vec![
+                    variants: ::std::vec![
                         #(#variant_descriptor_tokens),*
                     ],
                 }
             }
 
-            fn encode_type(&self, buf: &mut ::std::vec::Vec<u8>) -> ::std::result::Result<(), ::pardosa::encoding::EncodeError> {
+            fn encode_type(&self, __pardosa_buf: &mut ::std::vec::Vec<u8>) -> ::std::result::Result<(), ::pardosa::encoding::EncodeError> {
                 match self {
                     #(#encode_match_arms),*
                 }
             }
 
-            fn decode_type(buf: &[u8]) -> ::std::result::Result<(Self, usize), ::pardosa::encoding::DecodeError> {
+            fn decode_type(__pardosa_buf: &[u8]) -> ::std::result::Result<(Self, usize), ::pardosa::encoding::DecodeError> {
                 #decode_disc_extract
                 match disc {
                     #(#decode_match_arms,)*
@@ -575,6 +674,8 @@ fn expand_pardosa_type_enum(
                 }
             }
         }
+
+        #const_assert
     })
 }
 
@@ -679,14 +780,14 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                 if discriminant_width == 1 {
                     encode_match_arms.push(quote! {
                         Self::#vident => {
-                            buf.push(#disc_expr as u8);
+                            __pardosa_buf.push(#disc_expr as u8);
                             ::std::result::Result::Ok(())
                         }
                     });
                 } else {
                     encode_match_arms.push(quote! {
                         Self::#vident => {
-                            buf.extend_from_slice(&(#disc_expr as u16).to_le_bytes());
+                            __pardosa_buf.extend_from_slice(&(#disc_expr as u16).to_le_bytes());
                             ::std::result::Result::Ok(())
                         }
                     });
@@ -695,10 +796,10 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                 decode_match_arms.push(quote! {
                     #disc_val => {
                         let consumed = #discriminant_width as usize;
-                        if consumed != buf.len() {
+                        if consumed != __pardosa_buf.len() {
                             return ::std::result::Result::Err(::pardosa::encoding::DecodeError::TruncatedPayload {
                                 expected: consumed,
-                                available: buf.len(),
+                                available: __pardosa_buf.len(),
                             });
                         }
                         ::std::result::Result::Ok(Self::#vident)
@@ -717,42 +818,49 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
 
                 if discriminant_width == 1 {
                     encode_match_arms.push(quote! {
-                        Self::#vident(val) => {
-                            buf.push(#disc_expr as u8);
-                            <#ty as ::pardosa::schema::PardosaType>::encode_type(val, buf)
+                        Self::#vident(__pardosa_field_0) => {
+                            __pardosa_buf.push(#disc_expr as u8);
+                            <#ty as ::pardosa::schema::PardosaType>::encode_type(__pardosa_field_0, __pardosa_buf)
                         }
                     });
                 } else {
                     encode_match_arms.push(quote! {
-                        Self::#vident(val) => {
-                            buf.extend_from_slice(&(#disc_expr as u16).to_le_bytes());
-                            <#ty as ::pardosa::schema::PardosaType>::encode_type(val, buf)
+                        Self::#vident(__pardosa_field_0) => {
+                            __pardosa_buf.extend_from_slice(&(#disc_expr as u16).to_le_bytes());
+                            <#ty as ::pardosa::schema::PardosaType>::encode_type(__pardosa_field_0, __pardosa_buf)
                         }
                     });
                 }
 
                 decode_match_arms.push(quote! {
                     #disc_val => {
-                        let (val, inner_consumed) = <#ty as ::pardosa::schema::PardosaType>::decode_type(&buf[#discriminant_width as usize..])?;
-                        let consumed = (#discriminant_width as usize) + inner_consumed;
-                        if consumed != buf.len() {
+                        if __pardosa_buf.len() < #discriminant_width as usize {
                             return ::std::result::Result::Err(::pardosa::encoding::DecodeError::TruncatedPayload {
-                                expected: consumed,
-                                available: buf.len(),
+                                expected: #discriminant_width as usize,
+                                available: __pardosa_buf.len(),
                             });
                         }
-                        ::std::result::Result::Ok(Self::#vident(val))
+                        let (__pardosa_field_0, __pardosa_consumed) = <#ty as ::pardosa::schema::PardosaType>::decode_type(&__pardosa_buf[#discriminant_width as usize..])?;
+                        let __pardosa_cursor = ::pardosa::encoding::checked_advance(#discriminant_width as usize, __pardosa_consumed, __pardosa_buf.len())?;
+                        if __pardosa_cursor != __pardosa_buf.len() {
+                            return ::std::result::Result::Err(::pardosa::encoding::DecodeError::TruncatedPayload {
+                                expected: __pardosa_cursor,
+                                available: __pardosa_buf.len(),
+                            });
+                        }
+                        ::std::result::Result::Ok(Self::#vident(__pardosa_field_0))
                     }
                 });
             }
             Fields::Named(fields) => {
                 let mut field_descriptors = Vec::new();
                 let mut field_idents = Vec::new();
+                let mut field_vars = Vec::new();
                 let mut field_encodes = Vec::new();
                 let mut field_decodes = Vec::new();
 
-                for f in &fields.named {
-                    let fident = f.ident.as_ref().unwrap();
+                for (idx, f) in fields.named.iter().enumerate() {
+                    let fident = f.ident.as_ref().expect("named field has ident");
                     let fname_str = fident.to_string();
                     let fty = &f.ty;
 
@@ -763,14 +871,17 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                         }
                     });
 
+                    let field_var = syn::Ident::new(&format!("__pardosa_field_{idx}"), f.span());
                     field_idents.push(fident);
+                    field_vars.push(field_var.clone());
+
                     field_encodes.push(quote! {
-                        <#fty as ::pardosa::schema::PardosaType>::encode_type(#fident, buf)?;
+                        <#fty as ::pardosa::schema::PardosaType>::encode_type(#field_var, __pardosa_buf)?;
                     });
 
                     field_decodes.push(quote! {
-                        let (#fident, consumed) = <#fty as ::pardosa::schema::PardosaType>::decode_type(&buf[cursor..])?;
-                        cursor += consumed;
+                        let (#field_var, __pardosa_consumed) = <#fty as ::pardosa::schema::PardosaType>::decode_type(&__pardosa_buf[__pardosa_cursor..])?;
+                        __pardosa_cursor = ::pardosa::encoding::checked_advance(__pardosa_cursor, __pardosa_consumed, __pardosa_buf.len())?;
                     });
                 }
 
@@ -781,23 +892,23 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                         name: #vname_str.to_string(),
                         payload: ::std::option::Option::Some(::pardosa::schema::DescriptorNode::Struct {
                             name: #struct_name.to_string(),
-                            fields: vec![#(#field_descriptors),*],
+                            fields: ::std::vec![#(#field_descriptors),*],
                         }),
                     }
                 });
 
                 if discriminant_width == 1 {
                     encode_match_arms.push(quote! {
-                        Self::#vident { #(#field_idents),* } => {
-                            buf.push(#disc_expr as u8);
+                        Self::#vident { #(#field_idents: #field_vars),* } => {
+                            __pardosa_buf.push(#disc_expr as u8);
                             #(#field_encodes)*
                             ::std::result::Result::Ok(())
                         }
                     });
                 } else {
                     encode_match_arms.push(quote! {
-                        Self::#vident { #(#field_idents),* } => {
-                            buf.extend_from_slice(&(#disc_expr as u16).to_le_bytes());
+                        Self::#vident { #(#field_idents: #field_vars),* } => {
+                            __pardosa_buf.extend_from_slice(&(#disc_expr as u16).to_le_bytes());
                             #(#field_encodes)*
                             ::std::result::Result::Ok(())
                         }
@@ -806,27 +917,33 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
 
                 decode_match_arms.push(quote! {
                     #disc_val => {
-                        let mut cursor = #discriminant_width as usize;
-                        #(#field_decodes)*
-                        if cursor != buf.len() {
+                        if __pardosa_buf.len() < #discriminant_width as usize {
                             return ::std::result::Result::Err(::pardosa::encoding::DecodeError::TruncatedPayload {
-                                expected: cursor,
-                                available: buf.len(),
+                                expected: #discriminant_width as usize,
+                                available: __pardosa_buf.len(),
                             });
                         }
-                        ::std::result::Result::Ok(Self::#vident { #(#field_idents),* })
+                        let mut __pardosa_cursor = #discriminant_width as usize;
+                        #(#field_decodes)*
+                        if __pardosa_cursor != __pardosa_buf.len() {
+                            return ::std::result::Result::Err(::pardosa::encoding::DecodeError::TruncatedPayload {
+                                expected: __pardosa_cursor,
+                                available: __pardosa_buf.len(),
+                            });
+                        }
+                        ::std::result::Result::Ok(Self::#vident { #(#field_idents: #field_vars),* })
                     }
                 });
             }
             Fields::Unnamed(fields) => {
                 let mut field_descriptors = Vec::new();
-                let mut field_idents = Vec::new();
+                let mut field_vars = Vec::new();
                 let mut field_encodes = Vec::new();
                 let mut field_decodes = Vec::new();
 
                 for (idx, f) in fields.unnamed.iter().enumerate() {
-                    let idx_ident = syn::Ident::new(&format!("f{}", idx), f.span());
-                    let fname_str = format!("_{}", idx);
+                    let field_var = syn::Ident::new(&format!("__pardosa_field_{idx}"), f.span());
+                    let fname_str = format!("_{idx}");
                     let fty = &f.ty;
 
                     field_descriptors.push(quote! {
@@ -836,14 +953,14 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                         }
                     });
 
-                    field_idents.push(idx_ident.clone());
+                    field_vars.push(field_var.clone());
                     field_encodes.push(quote! {
-                        <#fty as ::pardosa::schema::PardosaType>::encode_type(#idx_ident, buf)?;
+                        <#fty as ::pardosa::schema::PardosaType>::encode_type(#field_var, __pardosa_buf)?;
                     });
 
                     field_decodes.push(quote! {
-                        let (#idx_ident, consumed) = <#fty as ::pardosa::schema::PardosaType>::decode_type(&buf[cursor..])?;
-                        cursor += consumed;
+                        let (#field_var, __pardosa_consumed) = <#fty as ::pardosa::schema::PardosaType>::decode_type(&__pardosa_buf[__pardosa_cursor..])?;
+                        __pardosa_cursor = ::pardosa::encoding::checked_advance(__pardosa_cursor, __pardosa_consumed, __pardosa_buf.len())?;
                     });
                 }
 
@@ -854,23 +971,23 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                         name: #vname_str.to_string(),
                         payload: ::std::option::Option::Some(::pardosa::schema::DescriptorNode::Struct {
                             name: #struct_name.to_string(),
-                            fields: vec![#(#field_descriptors),*],
+                            fields: ::std::vec![#(#field_descriptors),*],
                         }),
                     }
                 });
 
                 if discriminant_width == 1 {
                     encode_match_arms.push(quote! {
-                        Self::#vident(#(#field_idents),*) => {
-                            buf.push(#disc_expr as u8);
+                        Self::#vident(#(#field_vars),*) => {
+                            __pardosa_buf.push(#disc_expr as u8);
                             #(#field_encodes)*
                             ::std::result::Result::Ok(())
                         }
                     });
                 } else {
                     encode_match_arms.push(quote! {
-                        Self::#vident(#(#field_idents),*) => {
-                            buf.extend_from_slice(&(#disc_expr as u16).to_le_bytes());
+                        Self::#vident(#(#field_vars),*) => {
+                            __pardosa_buf.extend_from_slice(&(#disc_expr as u16).to_le_bytes());
                             #(#field_encodes)*
                             ::std::result::Result::Ok(())
                         }
@@ -879,15 +996,21 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
 
                 decode_match_arms.push(quote! {
                     #disc_val => {
-                        let mut cursor = #discriminant_width as usize;
-                        #(#field_decodes)*
-                        if cursor != buf.len() {
+                        if __pardosa_buf.len() < #discriminant_width as usize {
                             return ::std::result::Result::Err(::pardosa::encoding::DecodeError::TruncatedPayload {
-                                expected: cursor,
-                                available: buf.len(),
+                                expected: #discriminant_width as usize,
+                                available: __pardosa_buf.len(),
                             });
                         }
-                        ::std::result::Result::Ok(Self::#vident(#(#field_idents),*))
+                        let mut __pardosa_cursor = #discriminant_width as usize;
+                        #(#field_decodes)*
+                        if __pardosa_cursor != __pardosa_buf.len() {
+                            return ::std::result::Result::Err(::pardosa::encoding::DecodeError::TruncatedPayload {
+                                expected: __pardosa_cursor,
+                                available: __pardosa_buf.len(),
+                            });
+                        }
+                        ::std::result::Result::Ok(Self::#vident(#(#field_vars),*))
                     }
                 });
             }
@@ -898,23 +1021,23 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
 
     let decode_disc_extract = if discriminant_width == 1 {
         quote! {
-            if buf.is_empty() {
+            if __pardosa_buf.is_empty() {
                 return ::std::result::Result::Err(::pardosa::encoding::DecodeError::TruncatedPayload {
                     expected: 1,
                     available: 0,
                 });
             }
-            let disc = buf[0] as u32;
+            let disc = __pardosa_buf[0] as u32;
         }
     } else {
         quote! {
-            if buf.len() < 2 {
+            if __pardosa_buf.len() < 2 {
                 return ::std::result::Result::Err(::pardosa::encoding::DecodeError::TruncatedPayload {
                     expected: 2,
-                    available: buf.len(),
+                    available: __pardosa_buf.len(),
                 });
             }
-            let disc = u16::from_le_bytes([buf[0], buf[1]]) as u32;
+            let disc = u16::from_le_bytes([__pardosa_buf[0], __pardosa_buf[1]]) as u32;
         }
     };
 
@@ -922,27 +1045,23 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
         impl ::pardosa::schema::PardosaSchema for #enum_name {
             const SCHEMA_VERSION: u32 = #schema_version;
 
-            fn schema_version() -> u32 {
-                Self::SCHEMA_VERSION
-            }
-
             fn schema_descriptor() -> ::pardosa::schema::DescriptorNode {
                 ::pardosa::schema::DescriptorNode::Enum {
                     name: #enum_name_str.to_string(),
                     discriminant_width: #discriminant_width,
-                    variants: vec![
+                    variants: ::std::vec![
                         #(#variant_descriptor_tokens),*
                     ],
                 }
             }
 
-            fn encode_payload(&self, buf: &mut ::std::vec::Vec<u8>) -> ::std::result::Result<(), ::pardosa::encoding::EncodeError> {
+            fn encode_payload(&self, __pardosa_buf: &mut ::std::vec::Vec<u8>) -> ::std::result::Result<(), ::pardosa::encoding::EncodeError> {
                 match self {
                     #(#encode_match_arms),*
                 }
             }
 
-            fn decode_payload(buf: &[u8]) -> ::std::result::Result<Self, ::pardosa::encoding::DecodeError> {
+            fn decode_payload(__pardosa_buf: &[u8]) -> ::std::result::Result<Self, ::pardosa::encoding::DecodeError> {
                 #decode_disc_extract
                 match disc {
                     #(#decode_match_arms,)*
@@ -956,28 +1075,41 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
 }
 
 fn parse_schema_version(input: &DeriveInput) -> syn::Result<u32> {
+    let mut found_version: Option<u32> = None;
     for attr in &input.attrs {
         if attr.path().is_ident("pardosa") {
-            let mut version = None;
             attr.parse_nested_meta(|meta| {
                 if meta.path.is_ident("version") {
+                    if found_version.is_some() {
+                        return Err(syn::Error::new_spanned(
+                            &meta.path,
+                            "duplicate `version` attribute on PardosaSchema root",
+                        ));
+                    }
                     let value = meta.value()?;
                     let lit: syn::LitInt = value.parse()?;
-                    version = Some(lit.base10_parse::<u32>()?);
+                    let v = lit.base10_parse::<u32>()?;
+                    if v == 0 {
+                        return Err(syn::Error::new_spanned(
+                            &lit,
+                            "schema version must be non-zero (version = 0 is reserved per C8.2)",
+                        ));
+                    }
+                    found_version = Some(v);
                     Ok(())
                 } else {
                     Ok(())
                 }
             })?;
-            if let Some(v) = version {
-                return Ok(v);
-            }
         }
     }
-    Err(syn::Error::new_spanned(
-        input,
-        "missing mandatory `#[pardosa(version = N)]` attribute on PardosaSchema root",
-    ))
+    match found_version {
+        Some(v) => Ok(v),
+        None => Err(syn::Error::new_spanned(
+            input,
+            "missing mandatory `#[pardosa(version = N)]` attribute on PardosaSchema root",
+        )),
+    }
 }
 
 fn check_tombstone_attr(attrs: &[Attribute]) -> syn::Result<bool> {
@@ -1036,12 +1168,12 @@ fn check_type_for_issues(ty: &Type, enum_name: &syn::Ident) -> syn::Result<()> {
                         "unsupported type `Vec`: unbounded collections are excluded per C6.23; use `EventVec<T, MAX>` or `EventBytes<MAX>` instead",
                     ));
                 }
-                if &seg.ident == enum_name {
+                if &seg.ident == enum_name || seg.ident == "Self" {
                     return Err(syn::Error::new_spanned(
                         ty,
                         format!(
                             "cycle detected: recursive type `{}` is not permitted in schema descriptor per C6.22 (S4)",
-                            enum_name
+                            seg.ident
                         ),
                     ));
                 }
@@ -1153,6 +1285,13 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_cycle_self() {
+        let input: DeriveInput = parse_str("struct Node { children: EventVec<Self, 1> }").unwrap();
+        let err = expand_pardosa_type(&input).unwrap_err();
+        assert!(err.to_string().contains("cycle detected"));
+    }
+
+    #[test]
     fn test_valid_enum_passes() {
         let input: DeriveInput = parse_str(
             "#[pardosa(version = 2)] enum MyEvent { #[pardosa(tombstone)] Tombstone = 0, Created(u32) = 1 }"
@@ -1170,6 +1309,24 @@ mod tests {
         assert!(err.to_string().contains(
             "missing mandatory `#[pardosa(version = N)]` attribute on PardosaSchema root"
         ));
+    }
+
+    #[test]
+    fn test_reject_version_zero() {
+        let input: DeriveInput = parse_str(
+            "#[pardosa(version = 0)] enum MyEvent { #[pardosa(tombstone)] Tombstone = 0, Created(u32) = 1 }"
+        ).unwrap();
+        let err = expand_pardosa_schema(&input).unwrap_err();
+        assert!(err.to_string().contains("schema version must be non-zero"));
+    }
+
+    #[test]
+    fn test_reject_duplicate_version() {
+        let input: DeriveInput = parse_str(
+            "#[pardosa(version = 1, version = 2)] enum MyEvent { #[pardosa(tombstone)] Tombstone = 0, Created(u32) = 1 }"
+        ).unwrap();
+        let err = expand_pardosa_schema(&input).unwrap_err();
+        assert!(err.to_string().contains("duplicate `version` attribute"));
     }
 
     #[test]

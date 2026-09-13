@@ -1617,6 +1617,31 @@ impl OwnershipRecord {
     }
 }
 
+/// Advances a decode buffer cursor by `consumed` bytes, checking for arithmetic overflow
+/// and ensuring the new cursor position does not exceed `total_len`.
+///
+/// # Errors
+/// Returns [`DecodeError::TruncatedPayload`] if `cursor + consumed` overflows or exceeds `total_len`.
+pub fn checked_advance(
+    cursor: usize,
+    consumed: usize,
+    total_len: usize,
+) -> Result<usize, DecodeError> {
+    let next_cursor = cursor
+        .checked_add(consumed)
+        .ok_or(DecodeError::TruncatedPayload {
+            expected: usize::MAX,
+            available: total_len,
+        })?;
+    if next_cursor > total_len {
+        return Err(DecodeError::TruncatedPayload {
+            expected: next_cursor,
+            available: total_len,
+        });
+    }
+    Ok(next_cursor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1965,6 +1990,30 @@ mod tests {
                     constraint: ValueConstraint::TooLong
                 }
             ) || matches!(err_policy, DecodeError::TruncatedPayload { .. })
+        );
+    }
+
+    #[test]
+    fn test_checked_advance() {
+        assert_eq!(checked_advance(0, 5, 10).unwrap(), 5);
+        assert_eq!(checked_advance(5, 5, 10).unwrap(), 10);
+
+        let err_over = checked_advance(5, 6, 10).unwrap_err();
+        assert_eq!(
+            err_over,
+            DecodeError::TruncatedPayload {
+                expected: 11,
+                available: 10,
+            }
+        );
+
+        let err_overflow = checked_advance(5, usize::MAX, 10).unwrap_err();
+        assert_eq!(
+            err_overflow,
+            DecodeError::TruncatedPayload {
+                expected: usize::MAX,
+                available: 10,
+            }
         );
     }
 }

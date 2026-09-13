@@ -750,7 +750,7 @@ impl DescriptorNode {
                 FailureCondition::ValueConstraintViolated {
                     constraint: ValueConstraint::TooLong,
                 },
-                "descriptor nesting depth exceeds maximum depth of 16 per C8.2",
+                "descriptor nesting depth exceeds implementation depth limit of 16 (structural completeness per C8.2)",
             ));
         }
         match self {
@@ -937,17 +937,12 @@ pub trait PardosaSchema: Sized {
     /// Declared schema version constant.
     const SCHEMA_VERSION: u32;
 
-    /// Returns declared schema version.
-    fn schema_version() -> u32 {
-        Self::SCHEMA_VERSION
-    }
-
     /// Returns root schema descriptor AST node.
     fn schema_descriptor() -> DescriptorNode;
 
     /// Derives schema identity.
     fn schema_identity() -> SchemaIdentity {
-        let desc = SchemaDescriptor::new(Self::schema_version(), Self::schema_descriptor());
+        let desc = SchemaDescriptor::new(Self::SCHEMA_VERSION, Self::schema_descriptor());
         let admitted = AdmittedDescriptor::try_from_descriptor(desc)
             .expect("PardosaSchema must produce a valid schema descriptor");
         SchemaIdentity::from_descriptor(&admitted)
@@ -968,6 +963,9 @@ pub trait PardosaSchema: Sized {
 
 /// Trait implemented by admitted types composing event payloads.
 pub trait PardosaType: Sized {
+    /// Maximum nesting depth of this type in schema descriptor AST.
+    const TYPE_DEPTH: usize;
+
     /// Returns descriptor node for this admitted type.
     fn descriptor_node() -> DescriptorNode;
 
@@ -985,6 +983,7 @@ pub trait PardosaType: Sized {
 }
 
 impl PardosaType for u8 {
+    const TYPE_DEPTH: usize = 0;
     fn descriptor_node() -> DescriptorNode {
         DescriptorNode::U8
     }
@@ -1004,6 +1003,7 @@ impl PardosaType for u8 {
 }
 
 impl PardosaType for u16 {
+    const TYPE_DEPTH: usize = 0;
     fn descriptor_node() -> DescriptorNode {
         DescriptorNode::U16
     }
@@ -1023,6 +1023,7 @@ impl PardosaType for u16 {
 }
 
 impl PardosaType for u32 {
+    const TYPE_DEPTH: usize = 0;
     fn descriptor_node() -> DescriptorNode {
         DescriptorNode::U32
     }
@@ -1042,6 +1043,7 @@ impl PardosaType for u32 {
 }
 
 impl PardosaType for u64 {
+    const TYPE_DEPTH: usize = 0;
     fn descriptor_node() -> DescriptorNode {
         DescriptorNode::U64
     }
@@ -1066,6 +1068,7 @@ impl PardosaType for u64 {
 }
 
 impl PardosaType for i8 {
+    const TYPE_DEPTH: usize = 0;
     fn descriptor_node() -> DescriptorNode {
         DescriptorNode::I8
     }
@@ -1085,6 +1088,7 @@ impl PardosaType for i8 {
 }
 
 impl PardosaType for i16 {
+    const TYPE_DEPTH: usize = 0;
     fn descriptor_node() -> DescriptorNode {
         DescriptorNode::I16
     }
@@ -1104,6 +1108,7 @@ impl PardosaType for i16 {
 }
 
 impl PardosaType for i32 {
+    const TYPE_DEPTH: usize = 0;
     fn descriptor_node() -> DescriptorNode {
         DescriptorNode::I32
     }
@@ -1123,6 +1128,7 @@ impl PardosaType for i32 {
 }
 
 impl PardosaType for i64 {
+    const TYPE_DEPTH: usize = 0;
     fn descriptor_node() -> DescriptorNode {
         DescriptorNode::I64
     }
@@ -1147,6 +1153,7 @@ impl PardosaType for i64 {
 }
 
 impl PardosaType for bool {
+    const TYPE_DEPTH: usize = 0;
     fn descriptor_node() -> DescriptorNode {
         DescriptorNode::Bool
     }
@@ -1170,6 +1177,7 @@ impl PardosaType for bool {
 }
 
 impl PardosaType for Timestamp {
+    const TYPE_DEPTH: usize = 0;
     fn descriptor_node() -> DescriptorNode {
         DescriptorNode::Timestamp
     }
@@ -1183,6 +1191,7 @@ impl PardosaType for Timestamp {
 }
 
 impl PardosaType for Uuid {
+    const TYPE_DEPTH: usize = 0;
     fn descriptor_node() -> DescriptorNode {
         DescriptorNode::Uuid
     }
@@ -1196,6 +1205,7 @@ impl PardosaType for Uuid {
 }
 
 impl<T: PardosaType> PardosaType for Option<T> {
+    const TYPE_DEPTH: usize = T::TYPE_DEPTH + 1;
     fn descriptor_node() -> DescriptorNode {
         DescriptorNode::Option {
             inner: Box::new(T::descriptor_node()),
@@ -1232,6 +1242,7 @@ impl<T: PardosaType> PardosaType for Option<T> {
 }
 
 impl<const MAX: usize> PardosaType for EventString<MAX> {
+    const TYPE_DEPTH: usize = 0;
     fn descriptor_node() -> DescriptorNode {
         assert!(
             MAX <= u32::MAX as usize,
@@ -1251,6 +1262,7 @@ impl<const MAX: usize> PardosaType for EventString<MAX> {
 }
 
 impl<const MAX: usize> PardosaType for NonEmptyEventString<MAX> {
+    const TYPE_DEPTH: usize = 0;
     fn descriptor_node() -> DescriptorNode {
         assert!(
             MAX <= u32::MAX as usize,
@@ -1270,6 +1282,7 @@ impl<const MAX: usize> PardosaType for NonEmptyEventString<MAX> {
 }
 
 impl<const MAX: usize> PardosaType for EventBytes<MAX> {
+    const TYPE_DEPTH: usize = 0;
     fn descriptor_node() -> DescriptorNode {
         assert!(
             MAX <= u32::MAX as usize,
@@ -1289,6 +1302,7 @@ impl<const MAX: usize> PardosaType for EventBytes<MAX> {
 }
 
 impl<T: PardosaType, const MAX: usize> PardosaType for EventVec<T, MAX> {
+    const TYPE_DEPTH: usize = T::TYPE_DEPTH + 1;
     fn descriptor_node() -> DescriptorNode {
         assert!(
             MAX <= u32::MAX as usize,
@@ -1662,6 +1676,7 @@ mod tests {
         struct ZeroWire;
 
         impl PardosaType for ZeroWire {
+            const TYPE_DEPTH: usize = 0;
             fn descriptor_node() -> DescriptorNode {
                 DescriptorNode::Struct {
                     name: "ZeroWire".to_string(),
