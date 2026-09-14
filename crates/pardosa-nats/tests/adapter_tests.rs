@@ -413,6 +413,22 @@ fn test_nats_incomplete_creation_c5_10() {
     let wrong_epoch_err = adapter.open_write(999).unwrap_err();
     assert_eq!(wrong_epoch_err.condition(), &FailureCondition::StaleEpoch);
 
+    let missing_desc_err = adapter.open_write(1).unwrap_err();
+    assert_eq!(
+        missing_desc_err.condition(),
+        &FailureCondition::MissingSchemaDescriptor
+    );
+
+    let desc = sample_descriptor();
+    let mut desc_bytes = Vec::new();
+    desc.root().encode(&mut desc_bytes).unwrap();
+    adapter
+        .record_meta_record_for_test(&OwnershipRecord::SchemaDescriptor {
+            schema_version: desc.version(),
+            descriptor_bytes: desc_bytes,
+        })
+        .expect("record descriptor");
+
     let mut writer = adapter
         .open_write(1)
         .expect("complete creation via open_write");
@@ -446,6 +462,16 @@ fn test_nats_complete_creation_validation_and_error_propagation() {
     adapter
         .record_inbound_pointer(&inbound)
         .expect("record inbound pointer on incomplete meta");
+
+    let desc = sample_descriptor();
+    let mut desc_bytes = Vec::new();
+    desc.root().encode(&mut desc_bytes).unwrap();
+    adapter
+        .record_meta_record_for_test(&OwnershipRecord::SchemaDescriptor {
+            schema_version: desc.version(),
+            descriptor_bytes: desc_bytes,
+        })
+        .expect("record schema descriptor on incomplete meta");
 
     let mut claim_b = claim_a.clone();
     claim_b.epoch = 2;

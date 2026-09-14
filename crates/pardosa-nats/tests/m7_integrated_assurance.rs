@@ -452,6 +452,24 @@ fn test_m7_dimension_1_concurrent_create_and_incomplete_creation() {
         file_reader.admission(),
         OpenAdmission::IncompleteCreation(_)
     ));
+    let file_desc_err = file_incomplete_adapter
+        .complete_creation(&claim)
+        .unwrap_err();
+    assert_eq!(
+        file_desc_err.condition(),
+        &FailureCondition::MissingSchemaDescriptor
+    );
+
+    let desc = sample_descriptor();
+    let mut desc_bytes = Vec::new();
+    desc.root().encode(&mut desc_bytes).unwrap();
+    file_incomplete_adapter
+        .record_meta_record_for_test(&OwnershipRecord::SchemaDescriptor {
+            schema_version: desc.version(),
+            descriptor_bytes: desc_bytes.clone(),
+        })
+        .expect("record file descriptor");
+
     let mut file_completed = file_incomplete_adapter
         .complete_creation(&claim)
         .expect("complete file creation");
@@ -512,6 +530,21 @@ fn test_m7_dimension_1_concurrent_create_and_incomplete_creation() {
         nats_stale_open_err.condition(),
         &FailureCondition::StaleEpoch
     );
+    let nats_desc_err = nats_incomplete_adapter
+        .complete_creation(&claim)
+        .unwrap_err();
+    assert_eq!(
+        nats_desc_err.condition(),
+        &FailureCondition::MissingSchemaDescriptor
+    );
+
+    nats_incomplete_adapter
+        .record_meta_record_for_test(&OwnershipRecord::SchemaDescriptor {
+            schema_version: desc.version(),
+            descriptor_bytes: desc_bytes,
+        })
+        .expect("record nats descriptor");
+
     let mut nats_completed = nats_incomplete_adapter
         .complete_creation(&claim)
         .expect("complete nats creation");

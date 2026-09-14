@@ -21,9 +21,7 @@ pub trait StorageEngine {
     /// Returns [`OperationFailure`] with [`crate::store::FailureCondition::StaleEpoch`] if carried epoch is superseded.
     /// Returns [`OperationFailure`] with [`crate::store::FailureCondition::RetiredMigrationSource`] if retired.
     /// Returns [`OperationFailure`] with [`crate::store::FailureCondition::OwnershipRecordUnreadable`] if uncertain or unreadable.
-    fn check_authority(&self) -> Result<(), OperationFailure> {
-        Ok(())
-    }
+    fn check_authority(&self) -> Result<(), OperationFailure>;
 
     /// Appends a raw frame block, returning the write landing verdict with sequence or frame count.
     ///

@@ -218,14 +218,6 @@ pub trait MigrationTarget {
     /// # Errors
     /// Returns [`OperationFailure`] if epoch metadata cannot be read.
     fn current_epoch(&self) -> Result<u64, OperationFailure>;
-    /// Appends an inbound pointer record to this target metadata per C6.16.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if recording fails.
-    fn record_inbound_pointer(
-        &self,
-        pointer: &InboundPointerRecord,
-    ) -> Result<(), OperationFailure>;
 }
 
 impl MigrationSource for FileStorageAdapter {
@@ -254,13 +246,6 @@ impl MigrationTarget for FileStorageAdapter {
 
     fn current_epoch(&self) -> Result<u64, OperationFailure> {
         self.current_epoch()
-    }
-
-    fn record_inbound_pointer(
-        &self,
-        pointer: &InboundPointerRecord,
-    ) -> Result<(), OperationFailure> {
-        self.record_inbound_pointer(pointer)
     }
 }
 

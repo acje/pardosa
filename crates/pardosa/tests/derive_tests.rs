@@ -370,7 +370,7 @@ fn test_f32_derived_payload_schema_identity_and_admission_mismatch() {
 }
 
 #[test]
-fn test_v21_schema_descriptor_golden_wire_bytes_and_conflicting_rejection() {
+fn test_v21_schema_descriptor_golden_wire_bytes_and_persistence() {
     let v21_descriptor = SchemaDescriptor::new(
         21,
         DescriptorNode::Enum {

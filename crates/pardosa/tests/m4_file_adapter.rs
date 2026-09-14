@@ -96,7 +96,10 @@ fn test_m4_strict_create_and_refuse_existing() {
     assert_eq!(err.condition(), &FailureCondition::StoreAlreadyExists);
 
     let genesis = EventEnvelope::genesis([1; 16], [2; 16], b"first-event").unwrap();
-    let _ = writer.append_envelope_verdict(&genesis);
+    assert!(matches!(
+        writer.append_envelope_verdict(&genesis),
+        Ok(WriteLandingVerdict::Landed(_))
+    ));
 }
 
 #[test]
@@ -268,6 +271,24 @@ fn test_m4_incomplete_creation_and_orphan() {
         reader.admission(),
         OpenAdmission::IncompleteCreation(_)
     ));
+
+    let missing_desc_err = adapter
+        .complete_creation(&claim)
+        .expect_err("complete creation must refuse when schema descriptor is missing per C8.2");
+    assert_eq!(
+        *missing_desc_err.condition(),
+        FailureCondition::MissingSchemaDescriptor
+    );
+
+    let desc = AdmittedDescriptor::default_for_test();
+    let mut desc_bytes = Vec::new();
+    desc.root().encode(&mut desc_bytes).unwrap();
+    adapter
+        .record_meta_record_for_test(&OwnershipRecord::SchemaDescriptor {
+            schema_version: desc.version(),
+            descriptor_bytes: desc_bytes,
+        })
+        .expect("record schema descriptor");
 
     let mut writer = adapter
         .complete_creation(&claim)

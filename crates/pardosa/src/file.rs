@@ -808,6 +808,7 @@ impl FileStorageAdapter {
     ///
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::StoreAlreadyExists`] if .meta already exists.
+    #[cfg(any(test, feature = "unstable-test-support"))]
     pub fn create_incomplete_meta_only(
         &self,
         claim: &OwnershipClaimRecord,
@@ -859,6 +860,7 @@ impl FileStorageAdapter {
     /// Completes creation of an artefact where .meta exists without .pgno per C5.10.
     ///
     /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::MissingSchemaDescriptor`] if schema descriptor is missing or invalid.
     /// Returns [`OperationFailure`] if state is not incomplete creation or if creation fails.
     pub fn complete_creation(
         &self,
@@ -873,6 +875,18 @@ impl FileStorageAdapter {
         }
 
         let meta = read_meta_records(&self.meta_path)?;
+        let descriptor = meta.schema_descriptor.as_ref().ok_or_else(|| {
+            OperationFailure::new(
+                FailureCondition::MissingSchemaDescriptor,
+                "schema descriptor missing in .meta per C8.2",
+            )
+        })?;
+        AdmittedDescriptor::try_from_descriptor(descriptor.clone()).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::MissingSchemaDescriptor,
+                format!("schema descriptor in .meta is invalid per C8.2: {err}"),
+            )
+        })?;
         let durable_claim = meta.latest_claim.as_ref().ok_or_else(|| {
             OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
@@ -942,6 +956,7 @@ impl FileStorageAdapter {
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::NoArtefactExists`] if artefact is missing.
     /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipUnestablished`] if opening orphan .pgno.
+    /// Returns [`OperationFailure`] with [`FailureCondition::MissingSchemaDescriptor`] if schema descriptor is missing or invalid.
     /// Returns [`OperationFailure`] with [`FailureCondition::StaleEpoch`] if carried epoch is superseded.
     /// Returns [`OperationFailure`] with [`FailureCondition::AnotherOwnerHoldsExclusion`] if lock is held.
     /// Returns [`OperationFailure`] with [`FailureCondition::ExclusionUnavailable`] if lock unsupported.
@@ -1004,6 +1019,19 @@ impl FileStorageAdapter {
                 "artefact append authority permanently retired via outbound pointer per C5.63",
             ));
         }
+
+        let descriptor = meta.schema_descriptor.as_ref().ok_or_else(|| {
+            OperationFailure::new(
+                FailureCondition::MissingSchemaDescriptor,
+                "schema descriptor missing in .meta per C8.2",
+            )
+        })?;
+        AdmittedDescriptor::try_from_descriptor(descriptor.clone()).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::MissingSchemaDescriptor,
+                format!("schema descriptor in .meta is invalid per C8.2: {err}"),
+            )
+        })?;
 
         let claim = meta.latest_claim.clone().ok_or_else(|| {
             OperationFailure::new(
@@ -1172,7 +1200,12 @@ impl FileStorageAdapter {
         self.record_meta_record_for_test(&OwnershipRecord::OutboundPointer(pointer.clone()))
     }
 
-    pub(crate) fn record_inbound_pointer(
+    /// Appends an inbound generation pointer record to the .meta file for test support.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    pub fn record_inbound_pointer(
         &self,
         pointer: &InboundPointerRecord,
     ) -> Result<(), OperationFailure> {
@@ -2725,7 +2758,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_persists_schema_descriptor_and_enforces_immutability() {
+    fn test_create_persists_schema_descriptor_and_readback() {
         let temp_dir = tempfile::tempdir().unwrap();
         let stem = temp_dir.path().join("schema_creation");
         let adapter = FileStorageAdapter::new(&stem);
@@ -2747,6 +2780,33 @@ mod tests {
 
         let reader = adapter.open_read().expect("open reader");
         assert_eq!(reader.schema_descriptor(), Some(desc.descriptor()));
+    }
+
+    #[test]
+    fn test_complete_creation_and_open_write_fail_on_missing_schema_descriptor() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stem = temp_dir.path().join("missing_schema");
+        let adapter = FileStorageAdapter::new(&stem);
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1u8; 16],
+            boot_id: [2u8; 16],
+            process_id: 12345,
+            process_start_time_ns: 1_000_000,
+            claim_time_ns: 2_000_000,
+            operator_label: "test-operator".to_string(),
+        };
+        adapter.create_incomplete_meta_only(&claim).unwrap();
+        let err_complete = adapter.complete_creation(&claim).unwrap_err();
+        assert_eq!(
+            *err_complete.condition(),
+            FailureCondition::MissingSchemaDescriptor
+        );
+        let err_open_write = adapter.open_write(1).unwrap_err();
+        assert_eq!(
+            *err_open_write.condition(),
+            FailureCondition::MissingSchemaDescriptor
+        );
     }
 
     #[test]

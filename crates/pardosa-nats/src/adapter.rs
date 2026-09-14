@@ -1092,6 +1092,7 @@ impl NatsStorageAdapter {
     ///
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::StoreAlreadyExists`] if meta stream already exists.
+    #[cfg(any(test, feature = "unstable-test-support"))]
     pub fn create_incomplete_meta_only(
         &self,
         claim: &OwnershipClaimRecord,
@@ -1285,6 +1286,7 @@ impl NatsStorageAdapter {
     /// Completes creation of an artefact where `{stem}_meta` exists without `{stem}_data` per C5.10.
     ///
     /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::MissingSchemaDescriptor`] if schema descriptor is missing or invalid.
     /// Returns [`OperationFailure`] if state is not incomplete creation or if creation fails.
     pub fn complete_creation(
         &self,
@@ -1311,6 +1313,18 @@ impl NatsStorageAdapter {
 
         run_future(&handle, async move {
             let meta_records = read_meta_records_async(&js, &meta_name).await?;
+            let descriptor = meta_records.schema_descriptor.as_ref().ok_or_else(|| {
+                OperationFailure::new(
+                    FailureCondition::MissingSchemaDescriptor,
+                    "schema descriptor missing in meta stream per C8.2",
+                )
+            })?;
+            AdmittedDescriptor::try_from_descriptor(descriptor.clone()).map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::MissingSchemaDescriptor,
+                    format!("schema descriptor in meta stream is invalid per C8.2: {err}"),
+                )
+            })?;
             let durable_claim = meta_records.latest_claim.as_ref().ok_or_else(|| {
                 OperationFailure::new(
                     FailureCondition::OwnershipRecordUnreadable,
@@ -1423,6 +1437,7 @@ impl NatsStorageAdapter {
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::NoArtefactExists`] if streams are missing.
     /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipUnestablished`] if opening orphan data stream.
+    /// Returns [`OperationFailure`] with [`FailureCondition::MissingSchemaDescriptor`] if schema descriptor is missing or invalid.
     /// Returns [`OperationFailure`] with [`FailureCondition::StaleEpoch`] if carried epoch is superseded.
     pub fn open_write(&self, carried_epoch: u64) -> Result<NatsWriterSession, OperationFailure> {
         let handle = self.runtime.handle().clone();
@@ -1479,6 +1494,18 @@ impl NatsStorageAdapter {
                 "artefact append authority permanently retired via outbound pointer per C5.63",
             ));
         }
+        let descriptor = meta.schema_descriptor.as_ref().ok_or_else(|| {
+            OperationFailure::new(
+                FailureCondition::MissingSchemaDescriptor,
+                "schema descriptor missing in meta stream per C8.2",
+            )
+        })?;
+        AdmittedDescriptor::try_from_descriptor(descriptor.clone()).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::MissingSchemaDescriptor,
+                format!("schema descriptor in meta stream is invalid per C8.2: {err}"),
+            )
+        })?;
         let claim = meta.latest_claim.clone().ok_or_else(|| {
             OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
@@ -1736,7 +1763,12 @@ impl NatsStorageAdapter {
         self.record_ownership_record_internal(&OwnershipRecord::OutboundPointer(pointer.clone()))
     }
 
-    pub(crate) fn record_inbound_pointer(
+    /// Appends an inbound generation pointer record to the meta stream for test support.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    pub fn record_inbound_pointer(
         &self,
         pointer: &InboundPointerRecord,
     ) -> Result<(), OperationFailure> {
@@ -2492,13 +2524,6 @@ impl MigrationTarget for NatsStorageAdapter {
     fn current_epoch(&self) -> Result<u64, OperationFailure> {
         let meta = self.read_meta_records()?;
         Ok(meta.latest_claim.map_or(0, |c| c.epoch))
-    }
-
-    fn record_inbound_pointer(
-        &self,
-        pointer: &InboundPointerRecord,
-    ) -> Result<(), OperationFailure> {
-        self.record_inbound_pointer(pointer)
     }
 }
 

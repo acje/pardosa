@@ -698,32 +698,44 @@ fn run_rustc(code: &str) -> (bool, String) {
         .expect("parent deps directory")
         .to_path_buf();
 
-    let entries = std::fs::read_dir(&deps_dir)
-        .unwrap_or_else(|e| panic!("failed to read deps dir {}: {e}", deps_dir.display()));
-    let mut rlibs = Vec::new();
-    for entry in entries {
-        let entry =
-            entry.unwrap_or_else(|e| panic!("failed to read entry in {}: {e}", deps_dir.display()));
-        let p = entry.path();
-        if let Some(s) = p.file_name().and_then(|n| n.to_str()) {
-            if s.starts_with("libpardosa-") && s.ends_with(".rlib") {
-                rlibs.push(p.clone());
+    let target_debug = deps_dir.parent().expect("target/debug dir");
+    let lib_rlib = target_debug.join("libpardosa.rlib");
+    if !lib_rlib.exists() {
+        let cargo_cmd = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let _ = Command::new(&cargo_cmd)
+            .args(["build", "-p", "pardosa", "--lib"])
+            .output();
+    }
+    let rlib = if lib_rlib.exists() {
+        lib_rlib
+    } else {
+        let entries = std::fs::read_dir(&deps_dir)
+            .unwrap_or_else(|e| panic!("failed to read deps dir {}: {e}", deps_dir.display()));
+        let mut rlibs = Vec::new();
+        for entry in entries {
+            let entry = entry
+                .unwrap_or_else(|e| panic!("failed to read entry in {}: {e}", deps_dir.display()));
+            let p = entry.path();
+            if let Some(s) = p.file_name().and_then(|n| n.to_str()) {
+                if s.starts_with("libpardosa-") && s.ends_with(".rlib") {
+                    rlibs.push(p.clone());
+                }
             }
         }
-    }
-    let rlib = match rlibs.len() {
-        0 => panic!(
-            "could not locate libpardosa rlib in deps directory: {}",
-            deps_dir.display()
-        ),
-        1 => rlibs.remove(0),
-        _ => {
-            rlibs.sort_by_key(|p| {
-                std::fs::metadata(p)
-                    .and_then(|m| m.modified())
-                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-            });
-            rlibs.pop().unwrap()
+        match rlibs.len() {
+            0 => panic!(
+                "could not locate libpardosa rlib in deps directory: {}",
+                deps_dir.display()
+            ),
+            1 => rlibs.remove(0),
+            _ => {
+                rlibs.sort_by_key(|p| {
+                    std::fs::metadata(p)
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                });
+                rlibs.pop().unwrap()
+            }
         }
     };
 
@@ -1345,6 +1357,61 @@ fn test_compile_fail_and_positive_controls_external_boundary() {
         fw_reuse_stderr.contains("use of moved value") || fw_reuse_stderr.contains("E0382"),
         "rejection must be use of moved value: {fw_reuse_stderr}"
     );
+
+    let file_adapter_incomplete_meta_code = r#"
+        use pardosa::prelude::*;
+        use pardosa::file::FileStorageAdapter;
+        pub fn run_invalid(adapter: &FileStorageAdapter, claim: &OwnershipClaimRecord) {
+            let _ = adapter.create_incomplete_meta_only(claim);
+        }
+    "#;
+    let (incomplete_meta_ok, incomplete_meta_stderr) = run_rustc(file_adapter_incomplete_meta_code);
+    assert!(
+        !incomplete_meta_ok,
+        "FileStorageAdapter::create_incomplete_meta_only must not be accessible without test features"
+    );
+    assert!(
+        incomplete_meta_stderr.contains("no method named `create_incomplete_meta_only`")
+            || incomplete_meta_stderr.contains("E0599"),
+        "rejection must cite missing method: {incomplete_meta_stderr}"
+    );
+
+    let migration_target_record_inbound_code = r#"
+        use pardosa::prelude::*;
+        use pardosa::migration::MigrationTarget;
+        pub fn run_invalid<T: MigrationTarget>(target: &T, pointer: &InboundPointerRecord) {
+            let _ = target.record_inbound_pointer(pointer);
+        }
+    "#;
+    let (target_inbound_ok, target_inbound_stderr) =
+        run_rustc(migration_target_record_inbound_code);
+    assert!(
+        !target_inbound_ok,
+        "MigrationTarget must not expose record_inbound_pointer"
+    );
+    assert!(
+        target_inbound_stderr.contains("no method named `record_inbound_pointer`")
+            || target_inbound_stderr.contains("E0599"),
+        "rejection must cite missing method: {target_inbound_stderr}"
+    );
+
+    let file_adapter_record_inbound_code = r#"
+        use pardosa::prelude::*;
+        use pardosa::file::FileStorageAdapter;
+        pub fn run_invalid(adapter: &FileStorageAdapter, pointer: &InboundPointerRecord) {
+            let _ = adapter.record_inbound_pointer(pointer);
+        }
+    "#;
+    let (adapter_inbound_ok, adapter_inbound_stderr) = run_rustc(file_adapter_record_inbound_code);
+    assert!(
+        !adapter_inbound_ok,
+        "FileStorageAdapter::record_inbound_pointer must not be accessible without test features"
+    );
+    assert!(
+        adapter_inbound_stderr.contains("no method named `record_inbound_pointer`")
+            || adapter_inbound_stderr.contains("E0599"),
+        "rejection must cite missing method: {adapter_inbound_stderr}"
+    );
 }
 
 #[test]
@@ -1713,6 +1780,10 @@ struct MockEngine {
 impl StorageEngine for MockEngine {
     fn carried_epoch(&self) -> u64 {
         42
+    }
+
+    fn check_authority(&self) -> Result<(), OperationFailure> {
+        Ok(())
     }
 
     fn append_block(&mut self, block: &[u8]) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
