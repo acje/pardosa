@@ -20,6 +20,10 @@ fn sample_claim(epoch: u64) -> OwnershipClaimRecord {
     }
 }
 
+fn sample_descriptor() -> AdmittedDescriptor {
+    AdmittedDescriptor::default_for_test()
+}
+
 fn sample_envelope(seq: u64) -> EventEnvelope {
     let mut event_id = [0u8; 16];
     event_id[0..8].copy_from_slice(&seq.to_le_bytes());
@@ -55,18 +59,19 @@ fn test_nats_strict_create_and_refuse_existing() {
     assert_eq!(adapter.try_presence().unwrap(), ArtefactPresence::None);
 
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create should succeed");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create should succeed");
     assert_eq!(adapter.try_presence().unwrap(), ArtefactPresence::Both);
     assert_eq!(writer.carried_epoch(), 1);
     assert_eq!(writer.rolling_commitment().frame_count(), 0);
 
-    let err = adapter.create(&claim).unwrap_err();
+    let err = adapter.create(&claim, &sample_descriptor()).unwrap_err();
     assert_eq!(err.condition(), &FailureCondition::StoreAlreadyExists);
 
-    let frame_count = writer
-        .append_raw_frame(b"first-event")
-        .expect("append frame");
-    assert_eq!(frame_count, 1);
+    let env = EventEnvelope::genesis([1; 16], [2; 16], b"first-event").unwrap();
+    let verdict = writer.append_envelope_verdict(&env).expect("append frame");
+    assert_eq!(verdict, WriteLandingVerdict::Landed(1));
     assert_eq!(writer.rolling_commitment().frame_count(), 1);
 
     adapter.delete_streams().expect("cleanup");
@@ -102,7 +107,7 @@ fn test_nats_concurrent_create_exactly_one_winner() {
         handles.push(thread::spawn(move || {
             let adapter = NatsStorageAdapter::new(&server_url, &stem_clone).expect("connect");
             let claim = sample_claim(thread_idx as u64 + 1);
-            match adapter.create(&claim) {
+            match adapter.create(&claim, &sample_descriptor()) {
                 Ok(_writer) => {
                     winners_clone.fetch_add(1, Ordering::SeqCst);
                 }
@@ -133,21 +138,35 @@ fn test_nats_two_writer_occ_collision() {
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
     let claim = sample_claim(1);
 
-    let mut writer1 = adapter.create(&claim).expect("create writer 1");
+    let mut writer1 = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer 1");
     let mut writer2 = adapter.open_write(1).expect("open writer 2");
 
-    let count1 = writer1
-        .append_raw_frame(b"writer-1-event-1")
+    let env1 = EventEnvelope::genesis([1; 16], [2; 16], b"writer-1-event-1").unwrap();
+    let verdict1 = writer1
+        .append_envelope_verdict(&env1)
         .expect("writer 1 append");
-    assert_eq!(count1, 1);
+    assert_eq!(verdict1, WriteLandingVerdict::Landed(1));
 
-    let err2 = writer2.append_raw_frame(b"writer-2-event-1").unwrap_err();
+    let env2 = EventEnvelope::genesis([2; 16], [3; 16], b"writer-2-event-1").unwrap();
+    let err2 = writer2.append_envelope_verdict(&env2).unwrap_err();
     assert_eq!(err2.condition(), &FailureCondition::ConcurrencyConflict);
 
-    let count1_b = writer1
-        .append_raw_frame(b"writer-1-event-2")
+    let env3 = EventEnvelope {
+        header: EnvelopeHeader {
+            event_id: [3; 16],
+            fiber_id: [2; 16],
+            detached: false,
+            precursor: env1.header.event_id,
+            precursor_hash: env1.commitment(),
+        },
+        payload: b"writer-1-event-2".to_vec(),
+    };
+    let verdict1_b = writer1
+        .append_envelope_verdict(&env3)
         .expect("writer 1 second append");
-    assert_eq!(count1_b, 2);
+    assert_eq!(verdict1_b, WriteLandingVerdict::Landed(2));
 
     adapter.delete_streams().expect("cleanup");
 }
@@ -159,7 +178,9 @@ fn test_nats_per_landing_epoch_verification_and_stale_epoch() {
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
     let claim1 = sample_claim(1);
 
-    let mut writer1 = adapter.create(&claim1).expect("create writer epoch 1");
+    let mut writer1 = adapter
+        .create(&claim1, &sample_descriptor())
+        .expect("create writer epoch 1");
     assert_eq!(writer1.carried_epoch(), 1);
 
     let env1 = EventEnvelope::genesis([0x01; 16], [0xaa; 16], b"event-epoch-1").unwrap();
@@ -223,7 +244,9 @@ fn test_nats_indeterminate_landing_verdict() {
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
     let claim = sample_claim(1);
 
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
 
     let env1 = EventEnvelope::genesis([0x01; 16], [0xaa; 16], b"normal-event").unwrap();
     let mut buf1 = Vec::new();
@@ -298,7 +321,9 @@ fn test_nats_read_only_open_permits_concurrent_readers() {
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
     let claim = sample_claim(1);
 
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
     for seq in 1..=10 {
         let env = sample_envelope(seq);
         writer
@@ -338,7 +363,9 @@ fn test_nats_continuous_rolling_commitment() {
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
     let claim = sample_claim(1);
 
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
     for seq in 1..=5 {
         let env = sample_envelope(seq);
         writer
@@ -390,8 +417,9 @@ fn test_nats_incomplete_creation_c5_10() {
         .open_write(1)
         .expect("complete creation via open_write");
     assert_eq!(adapter.try_presence().unwrap(), ArtefactPresence::Both);
-    let count = writer.append_raw_frame(b"completed-event").expect("append");
-    assert_eq!(count, 1);
+    let env = EventEnvelope::genesis([1; 16], [2; 16], b"completed-event").unwrap();
+    let verdict = writer.append_envelope_verdict(&env).expect("append");
+    assert_eq!(verdict, WriteLandingVerdict::Landed(1));
 
     adapter.delete_streams().expect("cleanup");
 }
@@ -519,7 +547,9 @@ fn test_nats_interleaved_open_coherent_snapshot() {
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
     let claim = sample_claim(1);
 
-    let mut writer1 = adapter.create(&claim).expect("create writer 1");
+    let mut writer1 = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer 1");
     let fiber_id = [0x99; 16];
     let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"first").unwrap();
     writer1.append_envelope_verdict(&genesis).expect("append 1");
@@ -675,7 +705,9 @@ fn test_nats_reader_capability_no_transport_escape() {
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
     let claim = sample_claim(1);
 
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
     let fiber_id = [0x55; 16];
     let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"first").unwrap();
     writer.append_envelope_verdict(&genesis).expect("append");
@@ -861,11 +893,11 @@ fn test_nats_c8_2_schema_completeness() {
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
     let claim = sample_claim(1);
 
-    let mut writer = adapter.create(&claim).expect("create writer");
     let admitted_valid = AdmittedDescriptor::try_from_descriptor(valid_schema.clone()).unwrap();
-    writer
-        .set_schema_descriptor(&admitted_valid)
-        .expect("set valid schema descriptor");
+    let writer = adapter
+        .create(&claim, &admitted_valid)
+        .expect("create writer");
+    drop(writer);
 
     let reader = adapter.open_read().expect("open reader");
     assert_eq!(reader.schema_descriptor(), Some(&valid_schema));
@@ -893,13 +925,15 @@ fn test_nats_format_vectors_roundtrip() {
             let (env, _) = EventEnvelope::decode(&bytes).unwrap();
             let stem = unique_stem(&format!("format_vec_{idx}"));
             let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
-            let mut writer = adapter.create(&claim).expect("create writer");
+            let writer = adapter
+                .create(&claim, &sample_descriptor())
+                .expect("create writer");
+            drop(writer);
             let mut env_buf = Vec::new();
             env.encode(&mut env_buf);
-            writer
-                .append_unvalidated_frame(&env_buf)
+            adapter
+                .append_unvalidated_frame_for_test(&env_buf)
                 .expect("append raw frame");
-            drop(writer);
 
             let mut reader = adapter.open_read().expect("open reader");
             let read_envelopes = reader
@@ -919,7 +953,9 @@ fn test_nats_create_append_then_read_in_same_session() {
     let stem = unique_stem("same_sess_read");
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
 
     let fiber = [0x42; 16];
     let event_id1 = [1u8; 16];
@@ -970,7 +1006,9 @@ fn test_nats_adapter_retirement_and_generation_records() {
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
     let claim = sample_claim(1);
 
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
     let env = EventEnvelope {
         header: EnvelopeHeader {
             event_id: [0x01; 16],
@@ -1025,7 +1063,9 @@ fn test_nats_session_fiber_handle_and_point_lookup() {
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
     let claim = sample_claim(1);
 
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
     let fiber_id = [0x77; 16];
     let domain_key = "account:77";
     let derived_id = derive_fiber_id(domain_key);
@@ -1134,7 +1174,9 @@ fn test_nats_append_to_fiber_rejects_stale_epoch() {
     let stem = format!("stale_fiber_{}_{}", std::process::id(), 99);
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
     let claim1 = sample_claim(1);
-    let mut writer1 = adapter.create(&claim1).expect("create writer 1");
+    let mut writer1 = adapter
+        .create(&claim1, &sample_descriptor())
+        .expect("create writer 1");
     let fiber_id = [0x88; 16];
 
     let verdict1 = writer1
@@ -1166,50 +1208,30 @@ fn test_nats_append_to_fiber_rejects_stale_epoch() {
 }
 
 #[test]
-fn test_nats_append_raw_frame_rejects_stale_epoch() {
+fn test_nats_append_envelope_verdict_rejects_stale_epoch() {
     let server = LiveNatsServer::acquire();
     let stem = format!("stale_raw_{}_{}", std::process::id(), 99);
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
     let claim1 = sample_claim(1);
-    let mut writer1 = adapter.create(&claim1).expect("create writer 1");
+    let mut writer1 = adapter
+        .create(&claim1, &sample_descriptor())
+        .expect("create writer 1");
 
-    let count1 = writer1.append_raw_frame(b"raw-1").expect("append raw 1");
-    assert_eq!(count1, 1);
-
-    let claim2 = sample_claim(2);
-    adapter
-        .record_ownership_claim_for_test(&claim2)
-        .expect("record claim 2");
-
-    let err = writer1
-        .append_raw_frame(b"raw-2")
-        .expect_err("stale epoch append_raw_frame must be rejected");
-    assert_eq!(*err.condition(), FailureCondition::StaleEpoch);
-
-    adapter.delete_streams().expect("cleanup");
-}
-
-#[test]
-fn test_nats_append_unvalidated_frame_rejects_stale_epoch() {
-    let server = LiveNatsServer::acquire();
-    let stem = format!("stale_unvalidated_{}_{}", std::process::id(), 101);
-    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
-    let claim1 = sample_claim(1);
-    let mut writer1 = adapter.create(&claim1).expect("create writer 1");
-
-    let count1 = writer1
-        .append_unvalidated_frame(b"raw-1")
+    let env1 = EventEnvelope::genesis([1; 16], [2; 16], b"raw-1").unwrap();
+    let verdict1 = writer1
+        .append_envelope_verdict(&env1)
         .expect("append raw 1");
-    assert_eq!(count1, 1);
+    assert_eq!(verdict1, WriteLandingVerdict::Landed(1));
 
     let claim2 = sample_claim(2);
     adapter
         .record_ownership_claim_for_test(&claim2)
         .expect("record claim 2");
 
+    let env2 = EventEnvelope::genesis([2; 16], [3; 16], b"raw-2").unwrap();
     let err = writer1
-        .append_unvalidated_frame(b"raw-2")
-        .expect_err("stale epoch append_unvalidated_frame must be rejected");
+        .append_envelope_verdict(&env2)
+        .expect_err("stale epoch append must be rejected");
     assert_eq!(*err.condition(), FailureCondition::StaleEpoch);
 
     adapter.delete_streams().expect("cleanup");
@@ -1221,7 +1243,9 @@ fn test_nats_append_frame_rejects_malformed_boolean_discriminant() {
     let stem = format!("malformed_bool_nats_{}", std::process::id());
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
     let fiber_id = [0x55; 16];
     let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"initial").unwrap();
     let mut bytes = Vec::new();
@@ -1242,7 +1266,9 @@ fn test_nats_reader_retains_broken_slot_after_read_all_envelopes_error() {
     let stem = format!("reader_retains_broken_nats_{}", std::process::id());
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
     let fiber_id = [0x77; 16];
     let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"initial").unwrap();
     writer
@@ -1265,8 +1291,9 @@ fn test_nats_reader_retains_broken_slot_after_read_all_envelopes_error() {
     };
     let mut broken_bytes = Vec::new();
     broken_env.encode(&mut broken_bytes);
-    writer
-        .append_unvalidated_frame(&broken_bytes)
+    drop(writer);
+    adapter
+        .append_unvalidated_frame_for_test(&broken_bytes)
         .expect("append raw frame");
 
     let read_err = reader.read_all_envelopes().unwrap_err();
@@ -1292,7 +1319,9 @@ fn test_nats_append_frame_rejects_short_payload_under_85_bytes() {
     let stem = format!("short_payload_nats_{}", std::process::id());
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
     let short_payload = [0u8; 84];
     let err = writer
         .append_frame_verdict(&short_payload)
@@ -1312,7 +1341,9 @@ fn test_nats_open_write_watermark_binds_to_consumed_sequence() {
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
     let claim = sample_claim(1);
 
-    let mut writer1 = adapter.create(&claim).expect("create writer 1");
+    let mut writer1 = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer 1");
     let fiber_id = [0x42; 16];
     let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"first").unwrap();
     writer1.append_envelope_verdict(&genesis).expect("append 1");
@@ -1336,20 +1367,22 @@ fn test_nats_open_write_watermark_binds_to_consumed_sequence() {
 }
 
 #[test]
-fn test_nats_append_raw_frame_envelope_pre_landing_admission_and_refusal() {
+fn test_nats_append_frame_verdict_envelope_pre_landing_admission_and_refusal() {
     let server = LiveNatsServer::acquire();
     let stem = unique_stem("h3_raw_nats");
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
     let claim = sample_claim(1);
 
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
     let fiber_id = [0x88; 16];
     let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"initial").unwrap();
     let mut gen_bytes = Vec::new();
     genesis.encode(&mut gen_bytes);
 
     writer
-        .append_raw_frame(&gen_bytes)
+        .append_frame_verdict(&gen_bytes)
         .expect("append raw genesis");
     let seq_before = writer.last_sequence();
 
@@ -1357,7 +1390,7 @@ fn test_nats_append_raw_frame_envelope_pre_landing_admission_and_refusal() {
     let mut dup_bytes = Vec::new();
     dup_genesis.encode(&mut dup_bytes);
 
-    let err = writer.append_raw_frame(&dup_bytes).unwrap_err();
+    let err = writer.append_frame_verdict(&dup_bytes).unwrap_err();
     assert_eq!(
         *err.condition(),
         FailureCondition::PrecursorChainBroken(None)
@@ -1378,7 +1411,7 @@ fn test_nats_append_raw_frame_envelope_pre_landing_admission_and_refusal() {
     child.encode(&mut child_bytes);
 
     writer
-        .append_raw_frame(&child_bytes)
+        .append_frame_verdict(&child_bytes)
         .expect("append raw child");
     assert!(writer.last_sequence() > seq_before);
     let handle = writer.fiber(fiber_id).unwrap();
@@ -1393,42 +1426,22 @@ fn test_nats_unvalidated_frame_revokes_point_lookup_and_append() {
     let stem = format!("unvalidated_revokes_nats_{}", std::process::id());
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
     let fiber_id = [0x55; 16];
+    drop(writer);
 
-    writer
-        .append_unvalidated_frame(b"unvalidated-nats-frame")
+    adapter
+        .append_unvalidated_frame_for_test(b"unvalidated-nats-frame")
         .expect("append unvalidated frame");
 
-    let err_latest = writer.get_latest(fiber_id).unwrap_err();
-    assert_eq!(*err_latest.condition(), FailureCondition::EnvelopeMismatch);
-    assert!(err_latest
-        .to_string()
-        .contains("session contains unindexed raw frames; point lookup unavailable"));
+    let err_open = adapter.open_write(1).unwrap_err();
+    assert_eq!(*err_open.condition(), FailureCondition::EnvelopeMismatch);
 
-    let err_fiber = writer.fiber(fiber_id).unwrap_err();
+    let reader = adapter.open_read().expect("open reader");
+    let err_fiber = reader.fiber(fiber_id).unwrap_err();
     assert_eq!(*err_fiber.condition(), FailureCondition::EnvelopeMismatch);
-    assert!(err_fiber
-        .to_string()
-        .contains("session contains unindexed raw frames; point lookup unavailable"));
-
-    let err_append_fiber = writer
-        .append_to_fiber(fiber_id, [0x01; 16], b"payload")
-        .unwrap_err();
-    assert_eq!(
-        *err_append_fiber.condition(),
-        FailureCondition::EnvelopeMismatch
-    );
-
-    let env = EventEnvelope::genesis([0x02; 16], fiber_id, b"envelope").unwrap();
-    let err_append_env = writer.append_envelope_verdict(&env).unwrap_err();
-    assert_eq!(
-        *err_append_env.condition(),
-        FailureCondition::EnvelopeMismatch
-    );
-    assert!(err_append_env
-        .to_string()
-        .contains("session contains unindexed raw frames; append unavailable"));
 
     adapter.delete_streams().expect("cleanup");
 }
@@ -1440,7 +1453,9 @@ fn test_nats_writer_retains_uncertain_diagnostic_on_undetermined_landing() {
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
     let claim = sample_claim(1);
 
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
     assert_eq!(writer.uncertain_diagnostic(), None);
 
     let env1 = EventEnvelope::genesis([0x01; 16], [0xaa; 16], b"normal-event").unwrap();
@@ -1485,7 +1500,9 @@ fn test_nats_presend_refusal_does_not_poison_session() {
     let stem = unique_stem("presend_refusal");
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
     assert_eq!(writer.uncertain_diagnostic(), None);
 
     let env1 = EventEnvelope::genesis([0x01; 16], [0xaa; 16], b"normal-event").unwrap();
@@ -1534,72 +1551,14 @@ fn test_nats_presend_refusal_does_not_poison_session() {
 }
 
 #[test]
-fn test_nats_metadata_presend_refusal_does_not_poison_session() {
-    let server = LiveNatsServer::acquire();
-    let stem = unique_stem("metadata_presend_refusal");
-    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
-    let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create writer");
-    assert_eq!(writer.uncertain_diagnostic(), None);
-
-    let env1 = EventEnvelope::genesis([0x01; 16], [0xaa; 16], b"normal-event").unwrap();
-    let mut buf1 = Vec::new();
-    env1.encode(&mut buf1);
-    let verdict1 = writer
-        .append_frame_verdict(&buf1)
-        .expect("normal append verdict");
-    assert!(matches!(verdict1, WriteLandingVerdict::Landed(_)));
-    assert_eq!(writer.uncertain_diagnostic(), None);
-
-    let oversized_record = OwnershipRecord::SchemaDescriptor {
-        schema_version: 1,
-        descriptor_bytes: vec![0x42; 2 * 1024 * 1024],
-    };
-    let err = writer
-        .record_ownership_record(&oversized_record)
-        .expect_err("oversized metadata must be refused pre-send");
-    assert_eq!(
-        *err.condition(),
-        FailureCondition::OwnershipRecordUnreadable
-    );
-    assert!(
-        err.to_string().contains("max payload size exceeded")
-            || err.to_string().contains("failed to publish meta frame")
-    );
-    assert_eq!(
-        writer.uncertain_diagnostic(),
-        None,
-        "pre-send metadata refusal must not poison writer session"
-    );
-
-    let env2 = EventEnvelope {
-        header: EnvelopeHeader {
-            event_id: [0x02; 16],
-            fiber_id: [0xaa; 16],
-            detached: false,
-            precursor: env1.header.event_id,
-            precursor_hash: env1.commitment(),
-        },
-        payload: b"recovery-event".to_vec(),
-    };
-    let mut buf2 = Vec::new();
-    env2.encode(&mut buf2);
-    let verdict2 = writer
-        .append_frame_verdict(&buf2)
-        .expect("subsequent small valid append must succeed after pre-send metadata refusal");
-    assert!(matches!(verdict2, WriteLandingVerdict::Landed(_)));
-    assert_eq!(writer.uncertain_diagnostic(), None);
-
-    adapter.delete_streams().expect("cleanup");
-}
-
-#[test]
 fn test_nats_metadata_authority_checks_and_borrowed_claim() {
     let server = LiveNatsServer::acquire();
     let stem = format!("meta_auth_nats_{}", std::process::id());
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
 
     let borrowed_claim: &OwnershipClaimRecord = writer.claim();
     assert_eq!(borrowed_claim.epoch, 1);
@@ -1613,20 +1572,9 @@ fn test_nats_metadata_authority_checks_and_borrowed_claim() {
         .record_ownership_record(&OwnershipRecord::OwnershipClaim(claim2))
         .expect("append epoch 2");
 
-    let choice = RescuePolicyChoiceRecord {
-        policy_tag: 0,
-        parameter_payload: vec![],
-    };
-    let err_meta = writer
-        .record_ownership_record(&OwnershipRecord::RescuePolicyChoice(choice))
-        .unwrap_err();
-    assert_eq!(*err_meta.condition(), FailureCondition::StaleEpoch);
-
-    let descriptor =
-        AdmittedDescriptor::try_from_descriptor(SchemaDescriptor::new(1, DescriptorNode::U64))
-            .unwrap();
-    let err_schema = writer.set_schema_descriptor(&descriptor).unwrap_err();
-    assert_eq!(*err_schema.condition(), FailureCondition::StaleEpoch);
+    let env = EventEnvelope::genesis([0x01; 16], [0xaa; 16], b"payload").unwrap();
+    let err_append = writer.append_envelope_verdict(&env).unwrap_err();
+    assert_eq!(*err_append.condition(), FailureCondition::StaleEpoch);
 
     let sync_err = writer.sync().unwrap_err();
     assert_eq!(*sync_err.condition(), FailureCondition::StaleEpoch);
@@ -1644,7 +1592,9 @@ fn test_nats_read_all_frames_does_not_advance_occ_watermark() {
     let stem = format!("occ_sync_nats_{}", std::process::id());
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
     let claim = sample_claim(1);
-    let mut writer_a = adapter.create(&claim).expect("create writer A");
+    let mut writer_a = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer A");
     let mut writer_b = adapter.open_write(1).expect("open writer B");
 
     let fiber_id = [0xbb; 16];
@@ -1669,9 +1619,12 @@ fn test_nats_migration_read_rejects_malformed_envelope() {
     let stem = format!("migration_malformed_nats_{}", std::process::id());
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create writer");
-    writer
-        .append_unvalidated_frame(b"short-payload")
+    let writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
+    drop(writer);
+    adapter
+        .append_unvalidated_frame_for_test(b"short-payload")
         .expect("append short frame");
 
     let mut reader = adapter.open_read().expect("open reader");
@@ -1696,7 +1649,9 @@ fn test_readme_nats_storage_adapter_example_compiles() {
         claim_time_ns: 2_000_000,
         operator_label: "service-worker".to_string(),
     };
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
 
     let fiber_id = derive_fiber_id("order-9876");
     let event_id = [1u8; 16];
@@ -1719,7 +1674,9 @@ fn test_nats_replay_bounded_batching_exact_order_and_commitment() {
     let stem = unique_stem("replay_batching_order");
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
 
     let frame_count = 75u64;
     let mut expected_payloads = Vec::with_capacity(frame_count as usize);
@@ -1794,7 +1751,9 @@ fn test_nats_projection_replay_equivalence_baseline_vs_streaming() {
     let stem = unique_stem("proj_equiv");
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
 
     let frame_count = 100u64;
     for seq in 1..=frame_count {
@@ -1836,7 +1795,9 @@ fn test_nats_replay_corrupted_frame_refusal() {
     let stem = unique_stem("replay_corrupt");
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
 
     let env = sample_envelope(1);
     writer
@@ -1886,7 +1847,9 @@ fn test_nats_incremental_recovery_open_writer_and_reader_identical_state() {
     let stem = unique_stem("nats_incremental_rec");
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
 
     let fiber1 = [0x11; 16];
     let fiber2 = [0x22; 16];
@@ -2010,8 +1973,11 @@ fn test_nats_unreadable_newer_claim_halts_writes_zero_data_appends() {
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
 
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create should succeed");
-    writer.append_raw_frame(b"frame-1").expect("first frame");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create should succeed");
+    let env1 = EventEnvelope::genesis([1; 16], [2; 16], b"frame-1").unwrap();
+    writer.append_envelope_verdict(&env1).expect("first frame");
     let seq_before = writer.last_sequence();
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -2033,8 +1999,9 @@ fn test_nats_unreadable_newer_claim_halts_writes_zero_data_appends() {
             .expect("ack malformed claim");
     });
 
+    let env2 = EventEnvelope::genesis([2; 16], [3; 16], b"frame-2-should-fail").unwrap();
     let err = writer
-        .append_raw_frame(b"frame-2-should-fail")
+        .append_envelope_verdict(&env2)
         .expect_err("unreadable newer claim must halt write");
     assert_eq!(
         *err.condition(),
@@ -2063,8 +2030,11 @@ fn test_nats_unreadable_retirement_record_halts_writes_zero_data_appends() {
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
 
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create should succeed");
-    writer.append_raw_frame(b"frame-1").expect("first frame");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create should succeed");
+    let env1 = EventEnvelope::genesis([1; 16], [2; 16], b"frame-1").unwrap();
+    writer.append_envelope_verdict(&env1).expect("first frame");
     let seq_before = writer.last_sequence();
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -2090,8 +2060,9 @@ fn test_nats_unreadable_retirement_record_halts_writes_zero_data_appends() {
             .expect("ack malformed retirement");
     });
 
+    let env2 = EventEnvelope::genesis([2; 16], [3; 16], b"frame-2-should-fail").unwrap();
     let err = writer
-        .append_raw_frame(b"frame-2-should-fail")
+        .append_envelope_verdict(&env2)
         .expect_err("unreadable retirement record must halt write");
     assert_eq!(
         *err.condition(),
@@ -2120,7 +2091,9 @@ fn test_nats_routing_stream_mismatch_marks_session_uncertain() {
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
 
     let claim = sample_claim(1);
-    let _writer = adapter.create(&claim).expect("create writer");
+    let _writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create writer");
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let rogue_stem = unique_stem("rogue_stream");
@@ -2154,10 +2127,11 @@ fn test_nats_routing_stream_mismatch_marks_session_uncertain() {
         .with_subjects_for_test(adapter.meta_subject().to_string(), rogue_subject);
     let mut mismatched_writer = mismatched_adapter.open_write(1).expect("open write");
 
-    let err = mismatched_writer
-        .append_raw_frame(b"mismatched-payload")
-        .expect_err("mismatched stream ack must yield undetermined landing");
-    assert_eq!(*err.condition(), FailureCondition::TransportUnavailable);
+    let env1 = EventEnvelope::genesis([1; 16], [2; 16], b"mismatched-payload").unwrap();
+    let verdict = mismatched_writer
+        .append_envelope_verdict(&env1)
+        .expect("mismatched stream ack must yield undetermined landing");
+    assert!(matches!(verdict, WriteLandingVerdict::Undetermined { .. }));
     assert!(mismatched_writer.uncertain_diagnostic().is_some());
     let diag = mismatched_writer.uncertain_diagnostic().unwrap();
     assert!(
@@ -2165,8 +2139,9 @@ fn test_nats_routing_stream_mismatch_marks_session_uncertain() {
             || diag.contains("expected stream does not match")
     );
 
+    let env2 = EventEnvelope::genesis([2; 16], [3; 16], b"subsequent-write").unwrap();
     let err2 = mismatched_writer
-        .append_raw_frame(b"subsequent-write")
+        .append_envelope_verdict(&env2)
         .expect_err("uncertain session must refuse writes");
     assert!(err2.to_string().contains("uncertain state"));
 
@@ -2320,7 +2295,9 @@ fn test_nats_reopen_same_stream_append_continuation_matches_batch() {
     }
     assert_eq!(events_m.len(), 9);
 
-    let mut writer_a = adapter_a.create(&claim).expect("create writer a");
+    let mut writer_a = adapter_a
+        .create(&claim, &sample_descriptor())
+        .expect("create writer a");
     for (fiber_id, event_id, payload) in &events_n {
         writer_a
             .append_to_fiber(*fiber_id, *event_id, payload.clone())
@@ -2341,7 +2318,9 @@ fn test_nats_reopen_same_stream_append_continuation_matches_batch() {
     }
     drop(writer_a);
 
-    let mut writer_b = adapter_b.create(&claim).expect("create writer b");
+    let mut writer_b = adapter_b
+        .create(&claim, &sample_descriptor())
+        .expect("create writer b");
     for (fiber_id, event_id, payload) in &events_n {
         writer_b
             .append_to_fiber(*fiber_id, *event_id, payload.clone())
@@ -2464,8 +2443,11 @@ fn test_nats_data_stream_missing_seq1_fails_closed() {
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
     let claim = sample_claim(1);
 
-    let mut writer = adapter.create(&claim).expect("create stream");
-    writer.append_raw_frame(b"frame-1").expect("append frame");
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create stream");
+    let env1 = EventEnvelope::genesis([1; 16], [2; 16], b"frame-1").unwrap();
+    writer.append_envelope_verdict(&env1).expect("append frame");
     drop(writer);
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -2566,7 +2548,9 @@ fn test_nats_existing_stream_legacy_underscore_routing_reopen_and_append_continu
         event_num += 1;
     }
 
-    let mut writer_a = adapter_a.create(&claim).expect("create writer a");
+    let mut writer_a = adapter_a
+        .create(&claim, &sample_descriptor())
+        .expect("create writer a");
     for (fiber_id, event_id, payload) in &events_n {
         writer_a
             .append_to_fiber(*fiber_id, *event_id, payload.clone())
@@ -2582,7 +2566,9 @@ fn test_nats_existing_stream_legacy_underscore_routing_reopen_and_append_continu
     }
     drop(writer_a);
 
-    let mut writer_b = adapter_b.create(&claim).expect("create writer b");
+    let mut writer_b = adapter_b
+        .create(&claim, &sample_descriptor())
+        .expect("create writer b");
     for (fiber_id, event_id, payload) in &events_n {
         writer_b
             .append_to_fiber(*fiber_id, *event_id, payload.clone())

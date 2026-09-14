@@ -1,13 +1,11 @@
 //! Unified storage pipeline owning fiber handles, caching, and state verification per C5 and C6.
 
-#[cfg(any(test, feature = "unstable-test-support"))]
-use crate::encoding::OwnershipRecord;
 use crate::encoding::{
     EventEnvelope, EventEnvelopeRef, InboundPointerRecord, MigrationEndRecord,
     MigrationStartRecord, OutboundPointerRecord, OwnershipClaimRecord, RescuePolicyChoiceRecord,
 };
 use crate::file::{ContainerFrame, RollingCommitment};
-use crate::schema::{derive_fiber_id, AdmittedDescriptor, SchemaDescriptor};
+use crate::schema::{derive_fiber_id, SchemaDescriptor};
 use crate::store::engine::StorageEngine;
 use crate::store::fiber_handle::FiberHandle;
 use crate::store::session_index::SessionIndex;
@@ -229,33 +227,6 @@ impl<E: StorageEngine> Store<E> {
         }
     }
 
-    /// Attaches and validates an admitted schema descriptor to the artefact per C8.2.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if authority verification or storage write fails.
-    pub fn set_schema_descriptor(
-        &mut self,
-        descriptor: &AdmittedDescriptor,
-    ) -> Result<(), OperationFailure> {
-        self.check_session_authority()?;
-        if let Some(existing) = self.schema_descriptor() {
-            if existing == descriptor.descriptor() {
-                return Ok(());
-            }
-            return Err(OperationFailure::new(
-                FailureCondition::SchemaMismatch,
-                "cannot mutate schema descriptor: conflicting descriptor submitted",
-            ));
-        }
-        if !self.fiber_index.is_empty() || self.fiber_index.has_raw_frames() {
-            return Err(OperationFailure::new(
-                FailureCondition::SchemaMismatch,
-                "cannot set schema descriptor after data events have already landed",
-            ));
-        }
-        self.engine.set_schema_descriptor(descriptor)
-    }
-
     /// Returns the outbound pointer record, if recorded.
     #[must_use]
     pub fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
@@ -284,84 +255,6 @@ impl<E: StorageEngine> Store<E> {
     #[must_use]
     pub fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
         self.engine.rescue_policy_choice()
-    }
-
-    /// Records an arbitrary ownership record into metadata for test support.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if authority verification or recording fails.
-    #[cfg(any(test, feature = "unstable-test-support"))]
-    pub fn record_meta_record_for_test(
-        &mut self,
-        record: &OwnershipRecord,
-    ) -> Result<(), OperationFailure> {
-        self.check_session_authority()?;
-        self.engine.record_meta_record(record)
-    }
-
-    /// Records an outbound pointer record into metadata for test support.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if recording fails.
-    #[cfg(any(test, feature = "unstable-test-support"))]
-    pub fn record_outbound_pointer_for_test(
-        &mut self,
-        pointer: &OutboundPointerRecord,
-    ) -> Result<(), OperationFailure> {
-        self.check_session_authority()?;
-        self.engine.record_outbound_pointer(pointer)
-    }
-
-    /// Records an inbound pointer record into metadata for test support.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if recording fails.
-    #[cfg(any(test, feature = "unstable-test-support"))]
-    pub fn record_inbound_pointer_for_test(
-        &mut self,
-        pointer: &InboundPointerRecord,
-    ) -> Result<(), OperationFailure> {
-        self.check_session_authority()?;
-        self.engine.record_inbound_pointer(pointer)
-    }
-
-    /// Records a migration start record into metadata for test support.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if recording fails.
-    #[cfg(any(test, feature = "unstable-test-support"))]
-    pub fn record_migration_start_for_test(
-        &mut self,
-        start: &MigrationStartRecord,
-    ) -> Result<(), OperationFailure> {
-        self.check_session_authority()?;
-        self.engine.record_migration_start(start)
-    }
-
-    /// Records a migration end record into metadata for test support.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if recording fails.
-    #[cfg(any(test, feature = "unstable-test-support"))]
-    pub fn record_migration_end_for_test(
-        &mut self,
-        end: &MigrationEndRecord,
-    ) -> Result<(), OperationFailure> {
-        self.check_session_authority()?;
-        self.engine.record_migration_end(end)
-    }
-
-    /// Records a rescue policy choice record into metadata for test support.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if recording fails.
-    #[cfg(any(test, feature = "unstable-test-support"))]
-    pub fn record_rescue_policy_choice_for_test(
-        &mut self,
-        choice: &RescuePolicyChoiceRecord,
-    ) -> Result<(), OperationFailure> {
-        self.check_session_authority()?;
-        self.engine.record_rescue_policy_choice(choice)
     }
 
     /// Synchronizes storage buffers to durable medium.
@@ -442,69 +335,6 @@ impl<E: StorageEngine> Store<E> {
         domain_key: &str,
     ) -> Result<Option<&EventEnvelope>, OperationFailure> {
         self.get_latest(derive_fiber_id(domain_key))
-    }
-
-    fn append_frame_raw_internal(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
-        let mut frame_buf = Vec::new();
-        ContainerFrame::encode_payload(payload, &mut frame_buf);
-        let verdict = self.engine.append_block(&frame_buf)?;
-        match verdict {
-            WriteLandingVerdict::Landed(_) => {
-                self.rolling_commitment.update_frame(&frame_buf);
-                Ok(self.rolling_commitment.frame_count())
-            }
-            WriteLandingVerdict::Undetermined { carried_epoch } => {
-                self.uncertain = true;
-                let diag = self
-                    .engine
-                    .uncertain_diagnostic()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| {
-                        format!("writer session in uncertain state; reconciliation required: write landing undetermined for carried epoch {carried_epoch} per C5.16")
-                    });
-                self.uncertain_diagnostic = Some(diag.clone());
-                Err(OperationFailure::new(
-                    FailureCondition::TransportUnavailable,
-                    diag,
-                ))
-            }
-        }
-    }
-
-    /// Appends a raw frame payload without session index pre-admission validation.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if write or sync fails.
-    #[deprecated(
-        note = "lossy append folds landing uncertainty; use append_frame_verdict per C5.16"
-    )]
-    pub fn append_raw_frame(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
-        self.check_session_authority()?;
-        if payload.len() >= 85 {
-            if let Ok((env, consumed)) = EventEnvelope::decode(payload) {
-                if consumed == payload.len() {
-                    self.fiber_index.validate_append(&env)?;
-                    let count = self.append_frame_raw_internal(payload)?;
-                    self.fiber_index.commit_envelope_unchecked(env);
-                    return Ok(count);
-                }
-            }
-        }
-        let count = self.append_frame_raw_internal(payload)?;
-        self.fiber_index.mark_has_raw_frames();
-        Ok(count)
-    }
-
-    /// Appends an unvalidated raw frame directly to the container for testing or migration recovery.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if authority verification or storage write fails.
-    #[doc(hidden)]
-    pub fn append_unvalidated_frame(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
-        self.check_session_authority()?;
-        let count = self.append_frame_raw_internal(payload)?;
-        self.fiber_index.mark_has_raw_frames();
-        Ok(count)
     }
 
     /// Appends a framed payload byte slice, returning a [`WriteLandingVerdict`].
@@ -1001,43 +831,6 @@ mod tests {
             self.meta_records.schema_descriptor.as_ref()
         }
 
-        fn set_schema_descriptor(
-            &mut self,
-            descriptor: &AdmittedDescriptor,
-        ) -> Result<(), OperationFailure> {
-            if let Some(existing) = self.meta_records.schema_descriptor.as_ref() {
-                if existing == descriptor.descriptor() {
-                    return Ok(());
-                }
-                return Err(OperationFailure::new(
-                    FailureCondition::SchemaMismatch,
-                    "conflicting schema descriptor already recorded in metadata",
-                ));
-            }
-            if !self.blocks.is_empty() {
-                return Err(OperationFailure::new(
-                    FailureCondition::SchemaMismatch,
-                    "cannot set schema descriptor after data events have already landed",
-                ));
-            }
-            self.meta_records.schema_descriptor = Some(descriptor.descriptor().clone());
-            Ok(())
-        }
-
-        fn record_meta_record(&mut self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
-            match record {
-                OwnershipRecord::OwnershipClaim(claim) => {
-                    self.meta_records.latest_claim = Some(claim.clone());
-                }
-                OwnershipRecord::OutboundPointer(pointer) => {
-                    self.meta_records.outbound_pointer = Some(pointer.clone());
-                    self.retired = true;
-                }
-                _ => {}
-            }
-            Ok(())
-        }
-
         fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
             self.meta_records.outbound_pointer.as_ref()
         }
@@ -1279,27 +1072,10 @@ mod tests {
         engine.retired = true;
         let mut store = Store::open_writer(engine).expect("open writer");
 
-        let err_meta = store
-            .record_meta_record_for_test(&OwnershipRecord::RescuePolicyChoice(
-                RescuePolicyChoiceRecord {
-                    policy_tag: 0,
-                    parameter_payload: vec![],
-                },
-            ))
-            .unwrap_err();
+        let genesis = EventEnvelope::genesis([0x01; 16], [0x11; 16], b"payload").unwrap();
+        let err_append = store.append_envelope_verdict(&genesis).unwrap_err();
         assert_eq!(
-            *err_meta.condition(),
-            FailureCondition::RetiredMigrationSource
-        );
-
-        let descriptor = AdmittedDescriptor::try_from_descriptor(SchemaDescriptor::new(
-            1,
-            crate::schema::DescriptorNode::U64,
-        ))
-        .unwrap();
-        let err_schema = store.set_schema_descriptor(&descriptor).unwrap_err();
-        assert_eq!(
-            *err_schema.condition(),
+            *err_append.condition(),
             FailureCondition::RetiredMigrationSource
         );
 
@@ -1377,17 +1153,6 @@ mod tests {
 
         fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
             self.inner.schema_descriptor()
-        }
-
-        fn set_schema_descriptor(
-            &mut self,
-            descriptor: &AdmittedDescriptor,
-        ) -> Result<(), OperationFailure> {
-            self.inner.set_schema_descriptor(descriptor)
-        }
-
-        fn record_meta_record(&mut self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
-            self.inner.record_meta_record(record)
         }
 
         fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {

@@ -52,6 +52,27 @@ fn sample_claim(epoch: u64) -> OwnershipClaimRecord {
     }
 }
 
+fn sample_descriptor() -> AdmittedDescriptor {
+    AdmittedDescriptor::default_for_test()
+}
+
+fn sample_envelope(seq: u64) -> EventEnvelope {
+    let mut event_id = [0u8; 16];
+    event_id[0..8].copy_from_slice(&seq.to_le_bytes());
+    let mut fiber_id = [0u8; 16];
+    fiber_id[0..8].copy_from_slice(&seq.to_le_bytes());
+    EventEnvelope {
+        header: EnvelopeHeader {
+            event_id,
+            fiber_id,
+            detached: false,
+            precursor: [0u8; 16],
+            precursor_hash: [0u8; 32],
+        },
+        payload: format!("event-seq-{seq}").into_bytes(),
+    }
+}
+
 fn sample_genesis_envelope(event_id_byte: u8, fiber_id_byte: u8, payload: &[u8]) -> EventEnvelope {
     EventEnvelope {
         header: EnvelopeHeader {
@@ -173,11 +194,10 @@ fn test_m7_symmetric_schema_completeness() {
     let file_adapter = FileStorageAdapter::new(dir.path().join("file_schema_store"));
     let claim = sample_claim(1);
 
-    let mut file_writer = file_adapter.create(&claim).expect("create file writer");
     let admitted_schema = AdmittedDescriptor::try_from_descriptor(valid_schema.clone()).unwrap();
-    file_writer
-        .set_schema_descriptor(&admitted_schema)
-        .expect("set schema file");
+    let file_writer = file_adapter
+        .create(&claim, &admitted_schema)
+        .expect("create file writer");
     drop(file_writer);
 
     let file_reader = file_adapter.open_read().expect("open file reader");
@@ -189,10 +209,9 @@ fn test_m7_symmetric_schema_completeness() {
     let nats_adapter =
         NatsStorageAdapter::new(server.url(), &nats_stem).expect("connect nats adapter");
 
-    let mut nats_writer = nats_adapter.create(&claim).expect("create nats writer");
-    nats_writer
-        .set_schema_descriptor(&admitted_schema)
-        .expect("set schema nats");
+    let nats_writer = nats_adapter
+        .create(&claim, &admitted_schema)
+        .expect("create nats writer");
     drop(nats_writer);
 
     let nats_reader = nats_adapter.open_read().expect("open nats reader");
@@ -227,15 +246,17 @@ fn test_m7_symmetric_format_vectors_roundtrip() {
 
     let dir = TestDir::new("sym_vectors_file");
     let file_adapter = FileStorageAdapter::new(dir.path().join("vectors_store"));
-    let mut file_writer = file_adapter.create(&claim).expect("create file writer");
+    let file_writer = file_adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create file writer");
+    drop(file_writer);
     for env in &valid_envelopes {
         let mut env_buf = Vec::new();
         env.encode(&mut env_buf);
-        file_writer
-            .append_unvalidated_frame(&env_buf)
+        file_adapter
+            .append_unvalidated_frame_for_test(&env_buf)
             .expect("append file raw frame");
     }
-    drop(file_writer);
 
     let mut file_reader = file_adapter.open_read().expect("open file reader");
     let file_read_envelopes = file_reader
@@ -251,15 +272,17 @@ fn test_m7_symmetric_format_vectors_roundtrip() {
     let nats_stem = unique_nats_stem("sym_vectors_nats");
     let nats_adapter =
         NatsStorageAdapter::new(server.url(), &nats_stem).expect("connect nats adapter");
-    let mut nats_writer = nats_adapter.create(&claim).expect("create nats writer");
+    let nats_writer = nats_adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create nats writer");
+    drop(nats_writer);
     for env in &valid_envelopes {
         let mut env_buf = Vec::new();
         env.encode(&mut env_buf);
-        nats_writer
-            .append_unvalidated_frame(&env_buf)
+        nats_adapter
+            .append_unvalidated_frame_for_test(&env_buf)
             .expect("append nats raw frame");
     }
-    drop(nats_writer);
 
     let mut nats_reader = nats_adapter.open_read().expect("open nats reader");
     let nats_read_envelopes = nats_reader
@@ -312,15 +335,23 @@ fn test_m7_symmetric_strict_create_and_open_refusal() {
 
     let file_store_path = dir.path().join("strict_file_store");
     let file_adapter = FileStorageAdapter::new(&file_store_path);
-    let file_writer = file_adapter.create(&claim).expect("create file");
+    let file_writer = file_adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create file");
     assert_eq!(file_writer.carried_epoch(), 1);
-    let file_dup_err = file_adapter.create(&claim).unwrap_err();
+    let file_dup_err = file_adapter
+        .create(&claim, &sample_descriptor())
+        .unwrap_err();
 
     let nats_stem = unique_nats_stem("sym_strict_store");
     let nats_adapter = NatsStorageAdapter::new(server.url(), &nats_stem).expect("connect nats");
-    let nats_writer = nats_adapter.create(&claim).expect("create nats");
+    let nats_writer = nats_adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create nats");
     assert_eq!(nats_writer.carried_epoch(), 1);
-    let nats_dup_err = nats_adapter.create(&claim).unwrap_err();
+    let nats_dup_err = nats_adapter
+        .create(&claim, &sample_descriptor())
+        .unwrap_err();
 
     assert_eq!(
         file_dup_err.condition(),
@@ -353,7 +384,7 @@ fn test_m7_dimension_1_concurrent_create_and_incomplete_creation() {
         file_handles.push(thread::spawn(move || {
             let adapter = FileStorageAdapter::new(&path_clone);
             let claim = sample_claim(1);
-            match adapter.create(&claim) {
+            match adapter.create(&claim, &sample_descriptor()) {
                 Ok(_) => {
                     winners.fetch_add(1, Ordering::SeqCst);
                 }
@@ -384,7 +415,7 @@ fn test_m7_dimension_1_concurrent_create_and_incomplete_creation() {
         nats_handles.push(thread::spawn(move || {
             let adapter = NatsStorageAdapter::new(&url, &stem).expect("connect nats");
             let claim = sample_claim(1);
-            match adapter.create(&claim) {
+            match adapter.create(&claim, &sample_descriptor()) {
                 Ok(_) => {
                     winners.fetch_add(1, Ordering::SeqCst);
                 }
@@ -428,16 +459,20 @@ fn test_m7_dimension_1_concurrent_create_and_incomplete_creation() {
         file_incomplete_adapter.try_presence().unwrap(),
         ArtefactPresence::Both
     );
+    let env_completed = EventEnvelope::genesis([1; 16], [2; 16], b"completed-frame").unwrap();
     file_completed
-        .append_raw_frame(b"completed-frame")
+        .append_envelope_verdict(&env_completed)
         .expect("append after completion");
     drop(file_completed);
 
     let orphan_path = dir.path().join("orphan_file");
     let orphan_adapter = FileStorageAdapter::new(&orphan_path);
-    let mut orphan_writer = orphan_adapter.create(&claim).expect("create orphan store");
+    let mut orphan_writer = orphan_adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create orphan store");
+    let env_orphan = EventEnvelope::genesis([2; 16], [3; 16], b"orphan-frame").unwrap();
     orphan_writer
-        .append_raw_frame(b"orphan-frame")
+        .append_envelope_verdict(&env_orphan)
         .expect("append orphan frame");
     drop(orphan_writer);
     fs::remove_file(orphan_adapter.meta_path()).expect("remove meta to make orphan");
@@ -485,7 +520,7 @@ fn test_m7_dimension_1_concurrent_create_and_incomplete_creation() {
         ArtefactPresence::Both
     );
     nats_completed
-        .append_raw_frame(b"completed-frame")
+        .append_envelope_verdict(&env_completed)
         .expect("append after completion");
 
     let cas_absent_err = evaluate_claim_cas(&RecordedOwnership::Absent, None, &claim).unwrap_err();
@@ -508,7 +543,9 @@ fn test_m7_dimension_2_overlapping_writers_and_epoch_fencing() {
     let dir = TestDir::new("dim2_writers_file");
     let file_store_path = dir.path().join("writers_store");
     let file_adapter = FileStorageAdapter::new(&file_store_path);
-    let mut file_writer1 = file_adapter.create(&claim1).expect("create file writer 1");
+    let mut file_writer1 = file_adapter
+        .create(&claim1, &sample_descriptor())
+        .expect("create file writer 1");
     let file_adapter2 = FileStorageAdapter::new(&file_store_path);
     let file_exclusion_err = file_adapter2.open_write(1).unwrap_err();
     assert_eq!(
@@ -516,27 +553,33 @@ fn test_m7_dimension_2_overlapping_writers_and_epoch_fencing() {
         &FailureCondition::AnotherOwnerHoldsExclusion
     );
 
+    let env_f1 = EventEnvelope::genesis([1; 16], [2; 16], b"file-frame-1").unwrap();
     let _ = file_writer1
-        .append_raw_frame(b"file-frame-1")
+        .append_envelope_verdict(&env_f1)
         .expect("append 1");
     let claim2 = sample_claim(2);
     file_adapter
         .record_ownership_claim_for_test(&claim2)
         .expect("supersede file claim");
-    let file_stale_err = file_writer1.append_raw_frame(b"file-frame-2").unwrap_err();
+    let env_f2 = EventEnvelope::genesis([2; 16], [3; 16], b"file-frame-2").unwrap();
+    let file_stale_err = file_writer1.append_envelope_verdict(&env_f2).unwrap_err();
     assert_eq!(file_stale_err.condition(), &FailureCondition::StaleEpoch);
 
     let server = LiveNatsServer::acquire();
     let nats_stem = unique_nats_stem("dim2_writers_nats");
     let nats_adapter = NatsStorageAdapter::new(server.url(), &nats_stem).expect("connect nats");
-    let mut nats_writer1 = nats_adapter.create(&claim1).expect("create nats writer 1");
+    let mut nats_writer1 = nats_adapter
+        .create(&claim1, &sample_descriptor())
+        .expect("create nats writer 1");
     let mut nats_writer2 = nats_adapter.open_write(1).expect("open nats writer 2");
 
+    let env_n1 = EventEnvelope::genesis([1; 16], [2; 16], b"nats-frame-1").unwrap();
     let count1 = nats_writer1
-        .append_raw_frame(b"nats-frame-1")
+        .append_envelope_verdict(&env_n1)
         .expect("append 1");
-    assert_eq!(count1, 1);
-    let nats_occ_err = nats_writer2.append_raw_frame(b"nats-frame-2").unwrap_err();
+    assert_eq!(count1, WriteLandingVerdict::Landed(1));
+    let env_n2 = EventEnvelope::genesis([2; 16], [3; 16], b"nats-frame-2").unwrap();
+    let nats_occ_err = nats_writer2.append_envelope_verdict(&env_n2).unwrap_err();
     assert_eq!(
         nats_occ_err.condition(),
         &FailureCondition::ConcurrencyConflict
@@ -545,7 +588,8 @@ fn test_m7_dimension_2_overlapping_writers_and_epoch_fencing() {
     nats_adapter
         .record_ownership_claim_for_test(&claim2)
         .expect("supersede nats claim");
-    let nats_stale_err = nats_writer1.append_raw_frame(b"nats-frame-3").unwrap_err();
+    let env_n3 = EventEnvelope::genesis([3; 16], [4; 16], b"nats-frame-3").unwrap();
+    let nats_stale_err = nats_writer1.append_envelope_verdict(&env_n3).unwrap_err();
     assert_eq!(nats_stale_err.condition(), &FailureCondition::StaleEpoch);
 
     assert_eq!(file_stale_err.condition(), nats_stale_err.condition());
@@ -560,7 +604,9 @@ fn test_m7_dimension_3_unreadable_ownership_and_indeterminate_verdict() {
     let nats_adapter = NatsStorageAdapter::new(server.url(), &nats_stem).expect("connect nats");
     let claim = sample_claim(1);
 
-    let mut nats_writer = nats_adapter.create(&claim).expect("create nats writer");
+    let mut nats_writer = nats_adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create nats writer");
     let env1 = EventEnvelope::genesis([0x01; 16], [0x11; 16], b"clean-frame").unwrap();
     let mut buf1 = Vec::new();
     env1.encode(&mut buf1);
@@ -589,11 +635,17 @@ fn test_m7_dimension_3_unreadable_ownership_and_indeterminate_verdict() {
     let dir = TestDir::new("dim3_corrupt_file");
     let file_store_path = dir.path().join("corrupt_meta_store");
     let file_adapter = FileStorageAdapter::new(&file_store_path);
-    let mut file_writer = file_adapter.create(&claim).expect("create file writer");
-    file_writer.append_raw_frame(b"frame-1").expect("append 1");
+    let mut file_writer = file_adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create file writer");
+    let env_cf1 = EventEnvelope::genesis([1; 16], [2; 16], b"frame-1").unwrap();
+    file_writer
+        .append_envelope_verdict(&env_cf1)
+        .expect("append 1");
 
     fs::write(file_adapter.meta_path(), b"garbage_corrupted_meta").expect("corrupt meta");
-    let file_unreadable_err = file_writer.append_raw_frame(b"frame-2").unwrap_err();
+    let env_cf2 = EventEnvelope::genesis([2; 16], [3; 16], b"frame-2").unwrap();
+    let file_unreadable_err = file_writer.append_envelope_verdict(&env_cf2).unwrap_err();
     assert_eq!(
         file_unreadable_err.condition(),
         &FailureCondition::OwnershipRecordUnreadable
@@ -618,8 +670,12 @@ fn test_m7_dimension_4_migration_cutover_and_permanent_source_retirement() {
     let file_target = FileStorageAdapter::new(&target_path);
 
     let claim = sample_claim(1);
-    file_source.create(&claim).expect("create source");
-    file_target.create(&claim).expect("create target");
+    file_source
+        .create(&claim, &sample_descriptor())
+        .expect("create source");
+    file_target
+        .create(&claim, &sample_descriptor())
+        .expect("create target");
 
     let mut file_writer = file_source.open_write(1).expect("open write source");
     let env1 = sample_genesis_envelope(1, 0x11, b"data1");
@@ -661,8 +717,12 @@ fn test_m7_dimension_4_migration_cutover_and_permanent_source_retirement() {
     let nats_target =
         NatsStorageAdapter::new(server.url(), &nats_dst_stem).expect("connect nats dst");
 
-    nats_source.create(&claim).expect("create nats source");
-    nats_target.create(&claim).expect("create nats target");
+    nats_source
+        .create(&claim, &sample_descriptor())
+        .expect("create nats source");
+    nats_target
+        .create(&claim, &sample_descriptor())
+        .expect("create nats target");
 
     let mut nats_writer = nats_source.open_write(1).expect("open write nats source");
     nats_writer
@@ -701,7 +761,9 @@ fn test_m7_dimension_4_migration_cutover_and_permanent_source_retirement() {
     );
 
     let cross_fn_file_src = FileStorageAdapter::new(dir.path().join("cross_fn_src"));
-    cross_fn_file_src.create(&claim).expect("create cross src");
+    cross_fn_file_src
+        .create(&claim, &sample_descriptor())
+        .expect("create cross src");
     let mut cross_fn_writer = cross_fn_file_src
         .open_write(1)
         .expect("open cross src writer");
@@ -712,7 +774,9 @@ fn test_m7_dimension_4_migration_cutover_and_permanent_source_retirement() {
     let cross_fn_nats_dst_stem = unique_nats_stem("dim4_cross_fn_dst");
     let cross_fn_nats_dst =
         NatsStorageAdapter::new(server.url(), &cross_fn_nats_dst_stem).expect("connect cross dst");
-    cross_fn_nats_dst.create(&claim).expect("create cross dst");
+    cross_fn_nats_dst
+        .create(&claim, &sample_descriptor())
+        .expect("create cross dst");
 
     let cross_fn_err =
         MigrationManager::new(cross_fn_file_src.clone(), cross_fn_nats_dst.clone()).unwrap_err();
@@ -733,14 +797,18 @@ fn test_m7_dimension_4_migration_cutover_and_permanent_source_retirement() {
     let cross_nf_nats_src_stem = unique_nats_stem("dim4_cross_nf_src");
     let cross_nf_nats_src =
         NatsStorageAdapter::new(server.url(), &cross_nf_nats_src_stem).expect("connect nf src");
-    cross_nf_nats_src.create(&claim).expect("create nf src");
+    cross_nf_nats_src
+        .create(&claim, &sample_descriptor())
+        .expect("create nf src");
     let mut cross_nf_writer = cross_nf_nats_src.open_write(1).expect("open nf src writer");
     cross_nf_writer
         .append_envelope_verdict(&env1)
         .expect("append nf src");
 
     let cross_nf_file_dst = FileStorageAdapter::new(dir.path().join("cross_nf_dst"));
-    cross_nf_file_dst.create(&claim).expect("create nf dst");
+    cross_nf_file_dst
+        .create(&claim, &sample_descriptor())
+        .expect("create nf dst");
 
     let cross_nf_err =
         MigrationManager::new(cross_nf_nats_src.clone(), cross_nf_file_dst.clone()).unwrap_err();
@@ -770,8 +838,12 @@ fn test_m7_dimension_5_partial_target_reads_and_superseded_generation() {
     let dir = TestDir::new("dim5_partial_file");
     let file_src = FileStorageAdapter::new(dir.path().join("partial_src_file"));
     let file_target = FileStorageAdapter::new(dir.path().join("partial_target_file"));
-    file_src.create(&claim).expect("create src file");
-    file_target.create(&claim).expect("create target file");
+    file_src
+        .create(&claim, &sample_descriptor())
+        .expect("create src file");
+    file_target
+        .create(&claim, &sample_descriptor())
+        .expect("create target file");
 
     let mut file_writer = file_src.open_write(1).expect("open src writer");
     let env1 = sample_genesis_envelope(1, 0xaa, b"partial_1");
@@ -813,8 +885,12 @@ fn test_m7_dimension_5_partial_target_reads_and_superseded_generation() {
     let nats_src = NatsStorageAdapter::new(server.url(), &nats_src_stem).expect("connect nats src");
     let nats_target =
         NatsStorageAdapter::new(server.url(), &nats_target_stem).expect("connect nats target");
-    nats_src.create(&claim).expect("create nats src");
-    nats_target.create(&claim).expect("create nats target");
+    nats_src
+        .create(&claim, &sample_descriptor())
+        .expect("create nats src");
+    nats_target
+        .create(&claim, &sample_descriptor())
+        .expect("create nats target");
 
     let mut nats_writer = nats_src.open_write(1).expect("open nats writer");
     nats_writer
@@ -856,9 +932,11 @@ fn test_m7_dimension_6_transformation_refusal_and_fiber_policies() {
 
     let file_src_fail = FileStorageAdapter::new(dir.path().join("tx_fail_src_file"));
     let file_target_fail = FileStorageAdapter::new(dir.path().join("tx_fail_target_file"));
-    file_src_fail.create(&claim).expect("create file src fail");
+    file_src_fail
+        .create(&claim, &sample_descriptor())
+        .expect("create file src fail");
     file_target_fail
-        .create(&claim)
+        .create(&claim, &sample_descriptor())
         .expect("create file target fail");
 
     let mut file_writer_fail = file_src_fail.open_write(1).expect("open writer");
@@ -882,8 +960,12 @@ fn test_m7_dimension_6_transformation_refusal_and_fiber_policies() {
         NatsStorageAdapter::new(server.url(), &nats_src_fail_stem).expect("connect nats src");
     let nats_target_fail =
         NatsStorageAdapter::new(server.url(), &nats_target_fail_stem).expect("connect nats target");
-    nats_src_fail.create(&claim).expect("create nats src");
-    nats_target_fail.create(&claim).expect("create nats target");
+    nats_src_fail
+        .create(&claim, &sample_descriptor())
+        .expect("create nats src");
+    nats_target_fail
+        .create(&claim, &sample_descriptor())
+        .expect("create nats target");
 
     let mut nats_writer_fail = nats_src_fail.open_write(1).expect("open nats writer");
     nats_writer_fail
@@ -910,8 +992,12 @@ fn test_m7_dimension_6_transformation_refusal_and_fiber_policies() {
         NatsStorageAdapter::new(server.url(), &nats_src_pol_stem).expect("connect nats pol src");
     let nats_target_pol = NatsStorageAdapter::new(server.url(), &nats_target_pol_stem)
         .expect("connect nats pol target");
-    nats_src_pol.create(&claim).expect("create pol src");
-    nats_target_pol.create(&claim).expect("create pol target");
+    nats_src_pol
+        .create(&claim, &sample_descriptor())
+        .expect("create pol src");
+    nats_target_pol
+        .create(&claim, &sample_descriptor())
+        .expect("create pol target");
 
     let mut nats_pol_writer = nats_src_pol.open_write(1).expect("open pol writer");
     nats_pol_writer
@@ -943,8 +1029,12 @@ fn test_m7_dimension_7_chain_breaks_and_mismatch_refusal() {
 
     let file_src = FileStorageAdapter::new(dir.path().join("chain_break_file_src"));
     let file_target = FileStorageAdapter::new(dir.path().join("chain_break_file_target"));
-    file_src.create(&claim).expect("create file src");
-    file_target.create(&claim).expect("create file target");
+    file_src
+        .create(&claim, &sample_descriptor())
+        .expect("create file src");
+    file_target
+        .create(&claim, &sample_descriptor())
+        .expect("create file target");
 
     let mut file_writer = file_src.open_write(1).expect("open file writer");
     let env1 = sample_genesis_envelope(1, 0xaa, b"valid1");
@@ -963,8 +1053,9 @@ fn test_m7_dimension_7_chain_breaks_and_mismatch_refusal() {
         .expect("append env1");
     let mut broken_buf = Vec::new();
     broken_env.encode(&mut broken_buf);
-    file_writer
-        .append_unvalidated_frame(&broken_buf)
+    drop(file_writer);
+    file_src
+        .append_unvalidated_frame_for_test(&broken_buf)
         .expect("append broken");
 
     let file_break_err = MigrationManager::new(file_src.clone(), file_target.clone()).unwrap_err();
@@ -979,15 +1070,20 @@ fn test_m7_dimension_7_chain_breaks_and_mismatch_refusal() {
     let nats_src = NatsStorageAdapter::new(server.url(), &nats_src_stem).expect("connect nats src");
     let nats_target =
         NatsStorageAdapter::new(server.url(), &nats_target_stem).expect("connect nats target");
-    nats_src.create(&claim).expect("create nats src");
-    nats_target.create(&claim).expect("create nats target");
+    nats_src
+        .create(&claim, &sample_descriptor())
+        .expect("create nats src");
+    nats_target
+        .create(&claim, &sample_descriptor())
+        .expect("create nats target");
 
     let mut nats_writer = nats_src.open_write(1).expect("open nats writer");
     nats_writer
         .append_envelope_verdict(&env1)
         .expect("append env1");
-    nats_writer
-        .append_unvalidated_frame(&broken_buf)
+    drop(nats_writer);
+    nats_src
+        .append_unvalidated_frame_for_test(&broken_buf)
         .expect("append broken");
 
     let nats_break_err = MigrationManager::new(nats_src.clone(), nats_target.clone()).unwrap_err();
@@ -1003,7 +1099,7 @@ fn test_m7_dimension_7_chain_breaks_and_mismatch_refusal() {
 
     let file_target_permit = FileStorageAdapter::new(dir.path().join("chain_permit_file_target"));
     file_target_permit
-        .create(&claim)
+        .create(&claim, &sample_descriptor())
         .expect("create permit target");
     let file_permit_err =
         MigrationManager::new(file_src.clone(), file_target_permit.clone()).unwrap_err();
@@ -1016,7 +1112,7 @@ fn test_m7_dimension_7_chain_breaks_and_mismatch_refusal() {
     let nats_target_permit = NatsStorageAdapter::new(server.url(), &nats_target_permit_stem)
         .expect("connect nats permit target");
     nats_target_permit
-        .create(&claim)
+        .create(&claim, &sample_descriptor())
         .expect("create permit nats target");
     let nats_permit_err =
         MigrationManager::new(nats_src.clone(), nats_target_permit.clone()).unwrap_err();
@@ -1036,16 +1132,20 @@ fn test_m7_dimension_8_unanchored_history_and_rolling_commitment() {
     let dir = TestDir::new("dim8_rolling_file");
 
     let file_adapter = FileStorageAdapter::new(dir.path().join("rolling_file_store"));
-    let mut file_writer = file_adapter.create(&claim).expect("create file writer");
+    let mut file_writer = file_adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create file writer");
 
     let mut expected_commitment = RollingCommitment::new();
     for i in 1..=5 {
-        let payload = format!("rolling_frame_{i}").into_bytes();
+        let env = sample_envelope(i);
+        let mut env_buf = Vec::new();
+        env.encode(&mut env_buf);
         let mut frame_buf = Vec::new();
-        ContainerFrame::encode_payload(&payload, &mut frame_buf);
+        ContainerFrame::encode_payload(&env_buf, &mut frame_buf);
         expected_commitment.update_frame(&frame_buf);
         file_writer
-            .append_raw_frame(&payload)
+            .append_envelope_verdict(&env)
             .expect("append frame");
     }
 
@@ -1067,12 +1167,14 @@ fn test_m7_dimension_8_unanchored_history_and_rolling_commitment() {
     let server = LiveNatsServer::acquire();
     let nats_stem = unique_nats_stem("dim8_rolling_nats");
     let nats_adapter = NatsStorageAdapter::new(server.url(), &nats_stem).expect("connect nats");
-    let mut nats_writer = nats_adapter.create(&claim).expect("create nats writer");
+    let mut nats_writer = nats_adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create nats writer");
 
     for i in 1..=5 {
-        let payload = format!("rolling_frame_{i}").into_bytes();
+        let env = sample_envelope(i);
         nats_writer
-            .append_raw_frame(&payload)
+            .append_envelope_verdict(&env)
             .expect("append frame");
     }
 
@@ -1123,11 +1225,19 @@ fn test_m7_strict_cross_adapter_error_condition_parity() {
     );
     assert_eq!(file_err_no_art.condition(), nats_err_no_art.condition());
 
-    let mut file_writer = file_adapter.create(&claim1).expect("create file");
-    let mut nats_writer = nats_adapter.create(&claim1).expect("create nats");
+    let mut file_writer = file_adapter
+        .create(&claim1, &sample_descriptor())
+        .expect("create file");
+    let mut nats_writer = nats_adapter
+        .create(&claim1, &sample_descriptor())
+        .expect("create nats");
 
-    let file_err_exists = file_adapter.create(&claim1).unwrap_err();
-    let nats_err_exists = nats_adapter.create(&claim1).unwrap_err();
+    let file_err_exists = file_adapter
+        .create(&claim1, &sample_descriptor())
+        .unwrap_err();
+    let nats_err_exists = nats_adapter
+        .create(&claim1, &sample_descriptor())
+        .unwrap_err();
     assert_eq!(
         file_err_exists.condition(),
         &FailureCondition::StoreAlreadyExists
@@ -1184,11 +1294,15 @@ fn test_m7_strict_cross_adapter_error_condition_parity() {
     drop(nats_writer2);
 
     let target_file = FileStorageAdapter::new(dir.path().join("parity_target_file"));
-    target_file.create(&claim2).expect("create target file");
+    target_file
+        .create(&claim2, &sample_descriptor())
+        .expect("create target file");
     let target_nats_stem = unique_nats_stem("parity_target_nats");
     let target_nats =
         NatsStorageAdapter::new(server.url(), &target_nats_stem).expect("connect target nats");
-    target_nats.create(&claim2).expect("create target nats");
+    target_nats
+        .create(&claim2, &sample_descriptor())
+        .expect("create target nats");
 
     let broken_env = EventEnvelope {
         header: EnvelopeHeader {
@@ -1200,18 +1314,14 @@ fn test_m7_strict_cross_adapter_error_condition_parity() {
         },
         payload: b"broken".to_vec(),
     };
-    let mut file_w_broken = file_adapter.open_write(2).expect("open w2 file");
     let mut broken_buf = Vec::new();
     broken_env.encode(&mut broken_buf);
-    file_w_broken
-        .append_unvalidated_frame(&broken_buf)
+    file_adapter
+        .append_unvalidated_frame_for_test(&broken_buf)
         .expect("append broken file");
-    let mut nats_w_broken = nats_adapter.open_write(2).expect("open w2 nats");
-    nats_w_broken
-        .append_unvalidated_frame(&broken_buf)
+    nats_adapter
+        .append_unvalidated_frame_for_test(&broken_buf)
         .expect("append broken nats");
-    drop(file_w_broken);
-    drop(nats_w_broken);
 
     let err_file_mgr = MigrationManager::new(file_adapter.clone(), target_file).unwrap_err();
     assert_eq!(
@@ -1233,13 +1343,13 @@ fn test_m7_strict_cross_adapter_error_condition_parity() {
 
     let clean_target_file = FileStorageAdapter::new(dir.path().join("parity_clean_target_file"));
     clean_target_file
-        .create(&claim2)
+        .create(&claim2, &sample_descriptor())
         .expect("create clean file");
     let clean_target_nats_stem = unique_nats_stem("parity_clean_nats_target");
     let clean_target_nats = NatsStorageAdapter::new(server.url(), &clean_target_nats_stem)
         .expect("connect clean target");
     clean_target_nats
-        .create(&claim2)
+        .create(&claim2, &sample_descriptor())
         .expect("create clean nats");
 
     file_adapter
@@ -1279,23 +1389,27 @@ fn test_m7_resource_contracts_under_saturation() {
     let server = LiveNatsServer::acquire();
 
     let file_adapter = FileStorageAdapter::new(dir.path().join("saturation_file"));
-    let mut file_writer = file_adapter.create(&claim).expect("create file");
+    let mut file_writer = file_adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create file");
 
     let nats_stem = unique_nats_stem("saturation_nats");
     let nats_adapter = NatsStorageAdapter::new(server.url(), &nats_stem).expect("connect nats");
-    let mut nats_writer = nats_adapter.create(&claim).expect("create nats");
+    let mut nats_writer = nats_adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create nats");
 
     let saturation_batch_count = 100u64;
     for seq in 1..=saturation_batch_count {
-        let payload = format!("saturation_payload_data_item_{seq}").into_bytes();
+        let env = sample_envelope(seq);
         let file_seq = file_writer
-            .append_raw_frame(&payload)
+            .append_envelope_verdict(&env)
             .expect("append frame file");
         let nats_seq = nats_writer
-            .append_raw_frame(&payload)
+            .append_envelope_verdict(&env)
             .expect("append frame nats");
-        assert_eq!(file_seq, seq);
-        assert_eq!(nats_seq, seq);
+        assert_eq!(file_seq, WriteLandingVerdict::Landed(seq));
+        assert_eq!(nats_seq, WriteLandingVerdict::Landed(seq));
     }
 
     assert_eq!(
@@ -1368,7 +1482,9 @@ fn test_m7_clean_cancellation_and_shutdown_lock_release() {
     env2.encode(&mut buf2);
 
     let file_adapter = FileStorageAdapter::new(dir.path().join("shutdown_file"));
-    let mut file_writer_1 = file_adapter.create(&claim).expect("create file writer 1");
+    let mut file_writer_1 = file_adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create file writer 1");
     file_writer_1
         .append_frame_verdict(&buf1)
         .expect("append frame 1");
@@ -1391,7 +1507,9 @@ fn test_m7_clean_cancellation_and_shutdown_lock_release() {
 
     let nats_stem = unique_nats_stem("shutdown_nats");
     let nats_adapter = NatsStorageAdapter::new(server.url(), &nats_stem).expect("connect nats");
-    let mut nats_writer_1 = nats_adapter.create(&claim).expect("create nats writer 1");
+    let mut nats_writer_1 = nats_adapter
+        .create(&claim, &sample_descriptor())
+        .expect("create nats writer 1");
     nats_writer_1
         .append_frame_verdict(&buf1)
         .expect("append frame 1");

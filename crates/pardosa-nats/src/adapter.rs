@@ -771,7 +771,7 @@ impl NatsStorageAdapter {
         })
     }
 
-    /// Creates the artefact streams exclusively with initial ownership claim per C5.10, C5.64, and C12.3.
+    /// Creates the artefact streams exclusively with initial ownership claim and schema descriptor per C5.10, C5.64, C8.2, and C12.3.
     ///
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::StoreAlreadyExists`] if artefact already exists.
@@ -779,6 +779,7 @@ impl NatsStorageAdapter {
     pub fn create(
         &self,
         initial_claim: &OwnershipClaimRecord,
+        descriptor: &AdmittedDescriptor,
     ) -> Result<NatsWriterSession, OperationFailure> {
         admit_create(self.try_presence()?)?;
 
@@ -790,6 +791,7 @@ impl NatsStorageAdapter {
         let meta_subject = self.meta_subject.clone();
         let data_subject = self.data_subject.clone();
         let claim = initial_claim.clone();
+        let descriptor_clone = descriptor.clone();
         let handle = self.runtime.handle().clone();
         let runtime = self.runtime.clone();
 
@@ -916,6 +918,78 @@ impl NatsStorageAdapter {
                 ));
             }
 
+            let mut desc_bytes = Vec::new();
+            descriptor_clone
+                .root()
+                .encode(&mut desc_bytes)
+                .map_err(|err| {
+                    OperationFailure::new(
+                        FailureCondition::ValueConstraintViolated {
+                            constraint: ValueConstraint::TooLong,
+                        },
+                        format!("failed to encode schema descriptor: {err}"),
+                    )
+                })?;
+            let desc_record = OwnershipRecord::SchemaDescriptor {
+                schema_version: descriptor_clone.version(),
+                descriptor_bytes: desc_bytes,
+            };
+            let mut desc_record_bytes = Vec::new();
+            desc_record.encode(&mut desc_record_bytes);
+            let mut desc_frame = Vec::new();
+            ContainerFrame::encode_payload(&desc_record_bytes, &mut desc_frame);
+
+            let mut desc_meta_headers = async_nats::HeaderMap::new();
+            desc_meta_headers.insert(
+                async_nats::header::NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
+                async_nats::HeaderValue::from(2),
+            );
+            desc_meta_headers.insert(
+                async_nats::header::NATS_EXPECTED_STREAM,
+                async_nats::HeaderValue::from(meta_name.as_str()),
+            );
+            let desc_ack = js
+                .publish_with_headers(meta_subject.clone(), desc_meta_headers, desc_frame.into())
+                .await
+                .map_err(|err| {
+                    if is_wrong_last_sequence(&err) {
+                        OperationFailure::new(
+                            FailureCondition::StoreAlreadyExists,
+                            "artefact already created by concurrent writer per C12.3",
+                        )
+                    } else {
+                        OperationFailure::new(
+                            FailureCondition::OwnershipRecordUnreadable,
+                            format!(
+                                "failed to publish schema descriptor frame to meta stream: {err}"
+                            ),
+                        )
+                    }
+                })?
+                .await
+                .map_err(|err| {
+                    if is_wrong_last_sequence(&err) {
+                        OperationFailure::new(
+                            FailureCondition::StoreAlreadyExists,
+                            "artefact already created by concurrent writer per C12.3",
+                        )
+                    } else {
+                        OperationFailure::new(
+                            FailureCondition::OwnershipRecordUnreadable,
+                            format!("failed to ack schema descriptor frame on meta stream: {err}"),
+                        )
+                    }
+                })?;
+            if desc_ack.stream != meta_name {
+                return Err(OperationFailure::new(
+                    FailureCondition::OwnershipRecordUnreadable,
+                    format!(
+                        "publish ack stream mismatch: expected {meta_name}, got {}",
+                        desc_ack.stream
+                    ),
+                ));
+            }
+
             js.create_stream(async_nats::jetstream::stream::Config {
                 name: data_name.clone(),
                 subjects: vec![data_subject.clone()],
@@ -985,6 +1059,7 @@ impl NatsStorageAdapter {
 
             let meta_records = NatsMetaRecords {
                 latest_claim: Some(claim.clone()),
+                schema_descriptor: Some(descriptor_clone.descriptor().clone()),
                 ..Default::default()
             };
             let engine = NatsEngine {
@@ -1159,6 +1234,51 @@ impl NatsStorageAdapter {
             }
 
             Ok(())
+        })
+    }
+
+    /// Appends an unvalidated raw frame directly to the data stream for test support.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if publish fails.
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    pub fn append_unvalidated_frame_for_test(
+        &self,
+        payload: &[u8],
+    ) -> Result<u64, OperationFailure> {
+        let js = self.js.clone();
+        let data_subject = self.data_subject.clone();
+        let data_stream_name = self.data_stream_name.clone();
+        let handle = self.runtime.handle().clone();
+        let payload_vec = payload.to_vec();
+
+        run_future(&handle, async move {
+            let mut frame_buf = Vec::new();
+            ContainerFrame::encode_payload(&payload_vec, &mut frame_buf);
+
+            let mut headers = async_nats::HeaderMap::new();
+            headers.insert(
+                async_nats::header::NATS_EXPECTED_STREAM,
+                async_nats::HeaderValue::from(data_stream_name.as_str()),
+            );
+
+            let ack = js
+                .publish_with_headers(data_subject, headers, frame_buf.into())
+                .await
+                .map_err(|err| {
+                    OperationFailure::new(
+                        FailureCondition::TransportUnavailable,
+                        format!("failed to publish raw frame: {err}"),
+                    )
+                })?
+                .await
+                .map_err(|err| {
+                    OperationFailure::new(
+                        FailureCondition::TransportUnavailable,
+                        format!("failed to ack raw frame: {err}"),
+                    )
+                })?;
+            Ok(ack.sequence)
         })
     }
 
@@ -2141,174 +2261,6 @@ impl StorageEngine for NatsEngine {
         self.meta_records.schema_descriptor.as_ref()
     }
 
-    fn set_schema_descriptor(
-        &mut self,
-        descriptor: &AdmittedDescriptor,
-    ) -> Result<(), OperationFailure> {
-        self.check_authority()?;
-        if let Some(existing) = self.meta_records.schema_descriptor.as_ref() {
-            if existing == descriptor.descriptor() {
-                return Ok(());
-            }
-            return Err(OperationFailure::new(
-                FailureCondition::SchemaMismatch,
-                "conflicting schema descriptor already recorded in meta stream",
-            ));
-        }
-        if self.data_events_landed {
-            return Err(OperationFailure::new(
-                FailureCondition::SchemaMismatch,
-                "cannot set schema descriptor after data events have already landed",
-            ));
-        }
-        let mut descriptor_bytes = Vec::new();
-        descriptor
-            .root()
-            .encode(&mut descriptor_bytes)
-            .map_err(|err| {
-                OperationFailure::new(
-                    FailureCondition::ValueConstraintViolated {
-                        constraint: ValueConstraint::TooLong,
-                    },
-                    format!("failed to encode schema descriptor: {err}"),
-                )
-            })?;
-        let record = OwnershipRecord::SchemaDescriptor {
-            schema_version: descriptor.version(),
-            descriptor_bytes,
-        };
-        self.record_meta_record(&record)
-    }
-
-    fn record_meta_record(&mut self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
-        self.check_authority()?;
-        if self.uncertain {
-            return Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                format!(
-                    "writer session is uncertain: {}",
-                    self.uncertain_diagnostic.as_deref().unwrap_or("unknown")
-                ),
-            ));
-        }
-        let js = self.js.clone();
-        let meta_subject = self.meta_subject.clone();
-        let meta_name = self.meta_stream_name.clone();
-        let handle = self.runtime.handle().clone();
-        let timeout = self.publish_timeout;
-        let record_clone = record.clone();
-        let (ack, diagnostic) = run_future(&handle, async move {
-            let mut record_bytes = Vec::new();
-            record_clone.encode(&mut record_bytes);
-            let mut record_frame = Vec::new();
-            ContainerFrame::encode_payload(&record_bytes, &mut record_frame);
-
-            let mut headers = async_nats::HeaderMap::new();
-            headers.insert(
-                async_nats::header::NATS_EXPECTED_STREAM,
-                async_nats::HeaderValue::from(meta_name.as_str()),
-            );
-
-            let pub_future = js
-                .publish_with_headers(meta_subject, headers, record_frame.into())
-                .await
-                .map_err(|err| {
-                    OperationFailure::new(
-                        FailureCondition::OwnershipRecordUnreadable,
-                        format!("failed to initiate publish to meta stream: {err}"),
-                    )
-                })?;
-
-            match tokio::time::timeout(timeout, pub_future).await {
-                Ok(Ok(ack)) => Ok((WriteLandingVerdict::Landed(ack), None)),
-                Ok(Err(err)) => Ok((
-                    WriteLandingVerdict::Undetermined { carried_epoch: 0 },
-                    Some(format!(
-                        "metadata publish ack failed; write landing undetermined: {err}"
-                    )),
-                )),
-                Err(_) => Ok((
-                    WriteLandingVerdict::Undetermined { carried_epoch: 0 },
-                    Some(format!(
-                        "metadata publish ack timed out after {timeout:?}; write landing undetermined"
-                    )),
-                )),
-            }
-        })?;
-
-        match ack {
-            WriteLandingVerdict::Landed(pub_ack) => {
-                if pub_ack.stream != self.meta_stream_name {
-                    self.uncertain = true;
-                    let detail = format!(
-                        "publish ack stream mismatch on meta record: expected {}, got {}",
-                        self.meta_stream_name, pub_ack.stream
-                    );
-                    self.uncertain_diagnostic = Some(detail.clone());
-                    return Err(OperationFailure::new(
-                        FailureCondition::OwnershipRecordUnreadable,
-                        detail,
-                    ));
-                }
-            }
-            WriteLandingVerdict::Undetermined { .. } => {
-                self.uncertain = true;
-                let detail = diagnostic
-                    .unwrap_or_else(|| "metadata write landing undetermined per C5.16".to_string());
-                self.uncertain_diagnostic = Some(detail.clone());
-                return Err(OperationFailure::new(
-                    FailureCondition::OwnershipRecordUnreadable,
-                    detail,
-                ));
-            }
-        }
-
-        match record {
-            OwnershipRecord::OwnershipClaim(claim) => {
-                self.meta_records.latest_claim = Some(claim.clone());
-            }
-            OwnershipRecord::SchemaDescriptor {
-                schema_version,
-                descriptor_bytes,
-            } => {
-                let (root, _) = DescriptorNode::decode(descriptor_bytes).map_err(|err| {
-                    OperationFailure::new(
-                        FailureCondition::OwnershipRecordUnreadable,
-                        format!("failed to decode schema descriptor in meta stream: {err}"),
-                    )
-                })?;
-                let new_desc = SchemaDescriptor::new(*schema_version, root);
-                if let Some(existing) = &self.meta_records.schema_descriptor {
-                    if existing != &new_desc {
-                        return Err(OperationFailure::new(
-                            FailureCondition::SchemaMismatch,
-                            "conflicting schema descriptor in meta stream",
-                        ));
-                    }
-                } else {
-                    self.meta_records.schema_descriptor = Some(new_desc);
-                }
-            }
-            OwnershipRecord::OutboundPointer(pointer) => {
-                self.meta_records.outbound_pointer = Some(pointer.clone());
-            }
-            OwnershipRecord::InboundPointer(pointer) => {
-                self.meta_records.inbound_pointer = Some(pointer.clone());
-            }
-            OwnershipRecord::MigrationStart(start) => {
-                self.meta_records.migration_start = Some(start.clone());
-            }
-            OwnershipRecord::MigrationEnd(end) => {
-                self.meta_records.migration_end = Some(end.clone());
-            }
-            OwnershipRecord::RescuePolicyChoice(choice) => {
-                self.meta_records.rescue_policy_choice = Some(choice.clone());
-            }
-            OwnershipRecord::IdentityStructure(_) | OwnershipRecord::CleanRelease(_) => {}
-        }
-        Ok(())
-    }
-
     fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
         self.meta_records.outbound_pointer.as_ref()
     }
@@ -2406,30 +2358,6 @@ impl NatsWriterSession {
     pub fn with_simulate_indeterminate(mut self, simulate: bool) -> Self {
         self.store.set_simulate_indeterminate(simulate);
         self
-    }
-
-    /// Records an arbitrary ownership record into metadata for test support.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if authority verification or recording fails.
-    #[cfg(any(test, feature = "unstable-test-support"))]
-    pub fn record_meta_record_for_test(
-        &mut self,
-        record: &OwnershipRecord,
-    ) -> Result<(), OperationFailure> {
-        self.store.record_meta_record_for_test(record)
-    }
-
-    /// Records an arbitrary ownership record into metadata for test support.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if authority verification or recording fails.
-    #[cfg(any(test, feature = "unstable-test-support"))]
-    pub fn record_ownership_record(
-        &mut self,
-        record: &OwnershipRecord,
-    ) -> Result<(), OperationFailure> {
-        self.store.record_meta_record_for_test(record)
     }
 
     /// Reads a single raw block at the specified sequence or index from the data stream.
@@ -2551,17 +2479,6 @@ impl MigrationSource for NatsStorageAdapter {
         reader.read_all_envelopes_for_migration()
     }
 
-    fn record_outbound_pointer(
-        &self,
-        pointer: &OutboundPointerRecord,
-    ) -> Result<(), OperationFailure> {
-        self.record_ownership_record_internal(&OwnershipRecord::OutboundPointer(pointer.clone()))
-    }
-
-    fn record_meta(&self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
-        self.record_ownership_record_internal(record)
-    }
-
     fn read_meta(&self) -> Result<MetaRecords, OperationFailure> {
         self.read_meta_records()
     }
@@ -2577,36 +2494,11 @@ impl MigrationTarget for NatsStorageAdapter {
         Ok(meta.latest_claim.map_or(0, |c| c.epoch))
     }
 
-    fn append_envelopes(&mut self, envelopes: &[EventEnvelope]) -> Result<(), OperationFailure> {
-        let epoch = self.current_epoch()?;
-        let mut writer = self.open_write(epoch)?;
-        for env in envelopes {
-            let mut env_buf = Vec::new();
-            env.encode(&mut env_buf);
-            writer.append_unvalidated_frame(&env_buf)?;
-        }
-        writer.sync()
-    }
-
     fn record_inbound_pointer(
         &self,
         pointer: &InboundPointerRecord,
     ) -> Result<(), OperationFailure> {
         self.record_inbound_pointer(pointer)
-    }
-
-    fn record_meta(&self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
-        self.record_ownership_record_internal(record)
-    }
-
-    fn set_schema_descriptor(
-        &mut self,
-        descriptor: &SchemaDescriptor,
-    ) -> Result<(), OperationFailure> {
-        let epoch = self.current_epoch()?;
-        let mut writer = self.open_write(epoch)?;
-        let admitted = AdmittedDescriptor::try_from_descriptor(descriptor.clone())?;
-        writer.set_schema_descriptor(&admitted)
     }
 }
 

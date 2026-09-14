@@ -1,12 +1,12 @@
 //! Migration lifecycle, recovery, cutover, and dense re-chaining per C5.63, C6.16-20, and C12.2.
 
-use crate::encoding::{EventEnvelope, OwnershipRecord};
+use crate::encoding::EventEnvelope;
 pub use crate::encoding::{
     InboundPointerRecord, MigrationEndRecord, MigrationStartRecord, MigrationStatus,
     OutboundPointerRecord, RescuePolicy, RescuePolicyChoiceRecord,
 };
 use crate::file::{FileStorageAdapter, MetaRecords};
-use crate::schema::{AdmittedDescriptor, PardosaSchema, SchemaDescriptor};
+use crate::schema::PardosaSchema;
 use crate::store::{FailureCondition, FiberMigrationPolicy, OperationFailure};
 use std::collections::HashMap;
 use std::fmt;
@@ -202,19 +202,6 @@ pub trait MigrationSource {
     /// # Errors
     /// Returns [`OperationFailure`] if reading fails.
     fn read_envelopes(&self) -> Result<Vec<EventEnvelope>, OperationFailure>;
-    /// Appends an outbound pointer record to this source metadata per C6.17 and C5.63.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if recording fails.
-    fn record_outbound_pointer(
-        &self,
-        pointer: &OutboundPointerRecord,
-    ) -> Result<(), OperationFailure>;
-    /// Appends an arbitrary ownership record to this source metadata.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if recording fails.
-    fn record_meta(&self, record: &OwnershipRecord) -> Result<(), OperationFailure>;
     /// Reads all meta records from this source artefact.
     ///
     /// # Errors
@@ -231,11 +218,6 @@ pub trait MigrationTarget {
     /// # Errors
     /// Returns [`OperationFailure`] if epoch metadata cannot be read.
     fn current_epoch(&self) -> Result<u64, OperationFailure>;
-    /// Appends event envelopes to the target artefact in dragline order.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if appending fails.
-    fn append_envelopes(&mut self, envelopes: &[EventEnvelope]) -> Result<(), OperationFailure>;
     /// Appends an inbound pointer record to this target metadata per C6.16.
     ///
     /// # Errors
@@ -243,19 +225,6 @@ pub trait MigrationTarget {
     fn record_inbound_pointer(
         &self,
         pointer: &InboundPointerRecord,
-    ) -> Result<(), OperationFailure>;
-    /// Appends an arbitrary ownership record to this target metadata.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if recording fails.
-    fn record_meta(&self, record: &OwnershipRecord) -> Result<(), OperationFailure>;
-    /// Attaches a schema descriptor to this target artefact per C8.2.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if attaching fails.
-    fn set_schema_descriptor(
-        &mut self,
-        descriptor: &SchemaDescriptor,
     ) -> Result<(), OperationFailure>;
 }
 
@@ -273,17 +242,6 @@ impl MigrationSource for FileStorageAdapter {
         reader.read_all_envelopes_for_migration()
     }
 
-    fn record_outbound_pointer(
-        &self,
-        pointer: &OutboundPointerRecord,
-    ) -> Result<(), OperationFailure> {
-        self.record_meta_record_internal(&OwnershipRecord::OutboundPointer(pointer.clone()))
-    }
-
-    fn record_meta(&self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
-        self.record_meta_record_internal(record)
-    }
-
     fn read_meta(&self) -> Result<MetaRecords, OperationFailure> {
         self.read_meta_records()
     }
@@ -298,36 +256,11 @@ impl MigrationTarget for FileStorageAdapter {
         self.current_epoch()
     }
 
-    fn append_envelopes(&mut self, envelopes: &[EventEnvelope]) -> Result<(), OperationFailure> {
-        let epoch = self.current_epoch()?;
-        let mut writer = self.open_write(epoch)?;
-        for env in envelopes {
-            let mut env_buf = Vec::new();
-            env.encode(&mut env_buf);
-            writer.append_unvalidated_frame(&env_buf)?;
-        }
-        writer.sync()
-    }
-
     fn record_inbound_pointer(
         &self,
         pointer: &InboundPointerRecord,
     ) -> Result<(), OperationFailure> {
         self.record_inbound_pointer(pointer)
-    }
-
-    fn record_meta(&self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
-        self.record_meta_record_internal(record)
-    }
-
-    fn set_schema_descriptor(
-        &mut self,
-        descriptor: &SchemaDescriptor,
-    ) -> Result<(), OperationFailure> {
-        let epoch = self.current_epoch()?;
-        let mut writer = self.open_write(epoch)?;
-        let admitted = AdmittedDescriptor::try_from_descriptor(descriptor.clone())?;
-        writer.set_schema_descriptor(&admitted)
     }
 }
 

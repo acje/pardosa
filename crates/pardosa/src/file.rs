@@ -629,6 +629,7 @@ impl FileStorageAdapter {
     pub fn create(
         &self,
         initial_claim: &OwnershipClaimRecord,
+        descriptor: &AdmittedDescriptor,
     ) -> Result<FileWriterSession, OperationFailure> {
         admit_create(self.try_presence()?)?;
         let mut meta_file = OpenOptions::new()
@@ -666,6 +667,31 @@ impl FileStorageAdapter {
                 format!("failed to write claim frame to .meta: {err}"),
             )
         })?;
+
+        let mut desc_bytes = Vec::new();
+        descriptor.root().encode(&mut desc_bytes).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                },
+                format!("failed to encode schema descriptor: {err}"),
+            )
+        })?;
+        let desc_record = OwnershipRecord::SchemaDescriptor {
+            schema_version: descriptor.version(),
+            descriptor_bytes: desc_bytes,
+        };
+        let mut desc_record_bytes = Vec::new();
+        desc_record.encode(&mut desc_record_bytes);
+        let mut desc_frame = Vec::new();
+        ContainerFrame::encode_payload(&desc_record_bytes, &mut desc_frame);
+        meta_file.write_all(&desc_frame).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                format!("failed to write schema descriptor frame to .meta: {err}"),
+            )
+        })?;
+
         meta_file.sync_data().map_err(|err| {
             OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
@@ -715,6 +741,7 @@ impl FileStorageAdapter {
             admission: OpenAdmission::Ready,
             meta_records: MetaRecords {
                 latest_claim: Some(initial_claim.clone()),
+                schema_descriptor: Some(descriptor.descriptor().clone()),
                 ..Default::default()
             },
             exclusion_policy: self.exclusion_policy,
@@ -732,6 +759,49 @@ impl FileStorageAdapter {
 
         let store = Store::open_writer(engine)?;
         Ok(FileWriterSession { store })
+    }
+
+    /// Appends an unvalidated frame directly to the container file for testing.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if opening or writing to the file fails.
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    pub fn append_unvalidated_frame_for_test(
+        &self,
+        payload: &[u8],
+    ) -> Result<u64, OperationFailure> {
+        let mut frame_buf = Vec::new();
+        ContainerFrame::encode_payload(payload, &mut frame_buf);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.pgno_path)
+            .map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::NoArtefactExists,
+                    format!("failed to open .pgno: {err}"),
+                )
+            })?;
+        file.seek(SeekFrom::End(0)).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::TransportUnavailable,
+                format!("failed to seek to end of container: {err}"),
+            )
+        })?;
+        file.write_all(&frame_buf).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::TransportUnavailable,
+                format!("failed to write frame: {err}"),
+            )
+        })?;
+        file.sync_data().map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::TransportUnavailable,
+                format!("failed to sync frame: {err}"),
+            )
+        })?;
+        let (_, frames, _) = read_container_frames(&mut file)?;
+        Ok(frames.len() as u64)
     }
 
     /// Creates only the .meta component of an artefact for testing incomplete creation per C5.10.
@@ -1476,120 +1546,6 @@ impl StorageEngine for FileEngine {
         self.meta_records.schema_descriptor.as_ref()
     }
 
-    fn set_schema_descriptor(
-        &mut self,
-        descriptor: &AdmittedDescriptor,
-    ) -> Result<(), OperationFailure> {
-        self.check_authority()?;
-        if let Some(existing) = self.meta_records.schema_descriptor.as_ref() {
-            if existing == descriptor.descriptor() {
-                return Ok(());
-            }
-            return Err(OperationFailure::new(
-                FailureCondition::SchemaMismatch,
-                "conflicting schema descriptor already recorded in .meta",
-            ));
-        }
-        if self.frame_count > 0 {
-            return Err(OperationFailure::new(
-                FailureCondition::SchemaMismatch,
-                "cannot set schema descriptor after data events have already landed",
-            ));
-        }
-        let mut descriptor_bytes = Vec::new();
-        descriptor
-            .root()
-            .encode(&mut descriptor_bytes)
-            .map_err(|err| {
-                OperationFailure::new(
-                    FailureCondition::ValueConstraintViolated {
-                        constraint: ValueConstraint::TooLong,
-                    },
-                    format!("failed to encode schema descriptor: {err}"),
-                )
-            })?;
-        let record = OwnershipRecord::SchemaDescriptor {
-            schema_version: descriptor.version(),
-            descriptor_bytes,
-        };
-        self.record_meta_record(&record)
-    }
-
-    fn record_meta_record(&mut self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
-        self.check_authority()?;
-        if self.uncertain {
-            return Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                format!(
-                    "writer session is uncertain: {}",
-                    self.uncertain_diagnostic.as_deref().unwrap_or("unknown")
-                ),
-            ));
-        }
-        match append_meta_record_impl(
-            &self.meta_path,
-            record,
-            self.simulate_write_error,
-            self.simulate_sync_error,
-        ) {
-            Ok(()) => {}
-            Err(MetaWriteError::Open(err)) => {
-                return Err(err);
-            }
-            Err(MetaWriteError::WriteOrSync(err)) => {
-                self.uncertain = true;
-                self.uncertain_diagnostic = Some(format!(
-                    "metadata write failed; write landing undetermined: {err}"
-                ));
-                return Err(err);
-            }
-        }
-        match record {
-            OwnershipRecord::OwnershipClaim(claim) => {
-                self.meta_records.latest_claim = Some(claim.clone());
-            }
-            OwnershipRecord::SchemaDescriptor {
-                schema_version,
-                descriptor_bytes,
-            } => {
-                let (root, _) = DescriptorNode::decode(descriptor_bytes).map_err(|err| {
-                    OperationFailure::new(
-                        FailureCondition::OwnershipRecordUnreadable,
-                        format!("failed to decode schema descriptor in .meta: {err}"),
-                    )
-                })?;
-                let new_desc = SchemaDescriptor::new(*schema_version, root);
-                if let Some(existing) = &self.meta_records.schema_descriptor {
-                    if existing != &new_desc {
-                        return Err(OperationFailure::new(
-                            FailureCondition::SchemaMismatch,
-                            "conflicting schema descriptor in .meta metadata",
-                        ));
-                    }
-                } else {
-                    self.meta_records.schema_descriptor = Some(new_desc);
-                }
-            }
-            OwnershipRecord::OutboundPointer(pointer) => {
-                self.meta_records.outbound_pointer = Some(pointer.clone());
-            }
-            OwnershipRecord::InboundPointer(pointer) => {
-                self.meta_records.inbound_pointer = Some(pointer.clone());
-            }
-            OwnershipRecord::MigrationStart(start) => {
-                self.meta_records.migration_start = Some(start.clone());
-            }
-            OwnershipRecord::MigrationEnd(end) => {
-                self.meta_records.migration_end = Some(end.clone());
-            }
-            OwnershipRecord::RescuePolicyChoice(choice) => {
-                self.meta_records.rescue_policy_choice = Some(choice.clone());
-            }
-            OwnershipRecord::IdentityStructure(_) | OwnershipRecord::CleanRelease(_) => {}
-        }
-        Ok(())
-    }
-
     fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
         self.meta_records.outbound_pointer.as_ref()
     }
@@ -1911,7 +1867,9 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let fiber_id = [0x42; 16];
         let domain_key = "user:42";
         let derived_id = derive_fiber_id(domain_key);
@@ -2026,7 +1984,9 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let fiber_id = [0x99; 16];
         let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"initial").unwrap();
         writer
@@ -2049,7 +2009,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append_raw_frame_envelope_pre_landing_admission_and_refusal() {
+    fn test_append_frame_verdict_envelope_pre_landing_admission_and_refusal() {
         let temp_dir = tempfile::tempdir().unwrap();
         let stem = temp_dir.path().join("h3_raw_admission");
         let adapter = FileStorageAdapter::new(&stem);
@@ -2062,14 +2022,16 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let fiber_id = [0x77; 16];
         let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"initial").unwrap();
         let mut gen_bytes = Vec::new();
         genesis.encode(&mut gen_bytes);
 
         writer
-            .append_raw_frame(&gen_bytes)
+            .append_frame_verdict(&gen_bytes)
             .expect("append valid raw envelope");
         assert_eq!(
             writer
@@ -2086,7 +2048,7 @@ mod tests {
         let mut dup_bytes = Vec::new();
         dup_genesis.encode(&mut dup_bytes);
 
-        let err = writer.append_raw_frame(&dup_bytes).unwrap_err();
+        let err = writer.append_frame_verdict(&dup_bytes).unwrap_err();
         assert_eq!(
             *err.condition(),
             FailureCondition::PrecursorChainBroken(None)
@@ -2109,7 +2071,7 @@ mod tests {
         child.encode(&mut child_bytes);
 
         writer
-            .append_raw_frame(&child_bytes)
+            .append_frame_verdict(&child_bytes)
             .expect("append valid raw child");
         assert_eq!(
             writer
@@ -2138,7 +2100,9 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let fiber_id = [0x55; 16];
         let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"initial").unwrap();
         let mut bytes = Vec::new();
@@ -2165,7 +2129,9 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let fiber_id = [0x77; 16];
         let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"initial").unwrap();
         writer
@@ -2188,8 +2154,9 @@ mod tests {
         };
         let mut broken_bytes = Vec::new();
         broken_env.encode(&mut broken_bytes);
-        writer
-            .append_unvalidated_frame(&broken_bytes)
+        drop(writer);
+        adapter
+            .append_unvalidated_frame_for_test(&broken_bytes)
             .expect("append raw frame");
 
         let read_err = reader.read_all_envelopes().unwrap_err();
@@ -2221,7 +2188,9 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let short_payload = [0u8; 84];
         let err = writer
             .append_frame_verdict(&short_payload)
@@ -2230,48 +2199,6 @@ mod tests {
         assert!(err
             .to_string()
             .contains("payload too short for event envelope: 84"));
-    }
-
-    #[test]
-    fn test_writer_rejects_set_schema_descriptor_while_uncertain() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let stem = temp_dir.path().join("uncertain_schema");
-        let adapter = FileStorageAdapter::new(&stem);
-        let claim = OwnershipClaimRecord {
-            epoch: 1,
-            machine_id: [1u8; 16],
-            boot_id: [2u8; 16],
-            process_id: 12345,
-            process_start_time_ns: 1_000_000,
-            claim_time_ns: 2_000_000,
-            operator_label: "test-operator".to_string(),
-        };
-        let mut writer = adapter.create(&claim).expect("create writer");
-        writer.store.engine.uncertain = true;
-        writer.store.engine.uncertain_diagnostic =
-            Some("writer session in uncertain state; reconciliation required".to_string());
-        let descriptor =
-            AdmittedDescriptor::try_from_descriptor(crate::schema::SchemaDescriptor::new(
-                1,
-                crate::schema::DescriptorNode::Struct {
-                    name: "OrderPayload".to_string(),
-                    fields: vec![crate::schema::FieldDescriptor {
-                        name: "id".to_string(),
-                        node: crate::schema::DescriptorNode::Uuid,
-                    }],
-                },
-            ))
-            .unwrap();
-        let err = writer
-            .set_schema_descriptor(&descriptor)
-            .expect_err("set_schema_descriptor must be rejected while uncertain per M3");
-        assert_eq!(
-            *err.condition(),
-            FailureCondition::OwnershipRecordUnreadable
-        );
-        assert!(err
-            .to_string()
-            .contains("writer session in uncertain state; reconciliation required"));
     }
 
     #[test]
@@ -2288,9 +2215,12 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
-        writer
-            .append_raw_frame(b"raw-non-envelope")
+        let writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
+        drop(writer);
+        adapter
+            .append_unvalidated_frame_for_test(b"raw-non-envelope")
             .expect("append raw frame");
 
         let reader = adapter.open_read().expect("open reader with raw frames");
@@ -2322,24 +2252,24 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let fiber_id = [0x22; 16];
+        drop(writer);
 
-        writer
-            .append_raw_frame(b"unindexed-raw-frame")
+        adapter
+            .append_unvalidated_frame_for_test(b"unindexed-raw-frame")
             .expect("append raw frame");
 
-        let err_latest = writer.get_latest(fiber_id).unwrap_err();
-        assert_eq!(*err_latest.condition(), FailureCondition::EnvelopeMismatch);
-        assert!(err_latest
-            .to_string()
-            .contains("session contains unindexed raw frames; point lookup unavailable"));
+        let err_open = adapter.open_write(1).unwrap_err();
+        assert_eq!(*err_open.condition(), FailureCondition::EnvelopeMismatch);
 
-        let err_fiber = writer.fiber(fiber_id).unwrap_err();
+        let reader = adapter.open_read().expect("open read");
+        let err_latest = reader.get_latest(fiber_id).unwrap_err();
+        assert_eq!(*err_latest.condition(), FailureCondition::EnvelopeMismatch);
+        let err_fiber = reader.fiber(fiber_id).unwrap_err();
         assert_eq!(*err_fiber.condition(), FailureCondition::EnvelopeMismatch);
-        assert!(err_fiber
-            .to_string()
-            .contains("session contains unindexed raw frames; point lookup unavailable"));
     }
 
     #[test]
@@ -2356,42 +2286,22 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let fiber_id = [0x22; 16];
+        drop(writer);
 
-        writer
-            .append_unvalidated_frame(b"unvalidated-frame-bytes")
+        adapter
+            .append_unvalidated_frame_for_test(b"unvalidated-frame-bytes")
             .expect("append unvalidated frame");
 
-        let err_latest = writer.get_latest(fiber_id).unwrap_err();
-        assert_eq!(*err_latest.condition(), FailureCondition::EnvelopeMismatch);
-        assert!(err_latest
-            .to_string()
-            .contains("session contains unindexed raw frames; point lookup unavailable"));
+        let err_open = adapter.open_write(1).unwrap_err();
+        assert_eq!(*err_open.condition(), FailureCondition::EnvelopeMismatch);
 
-        let err_fiber = writer.fiber(fiber_id).unwrap_err();
+        let reader = adapter.open_read().expect("open reader");
+        let err_fiber = reader.fiber(fiber_id).unwrap_err();
         assert_eq!(*err_fiber.condition(), FailureCondition::EnvelopeMismatch);
-        assert!(err_fiber
-            .to_string()
-            .contains("session contains unindexed raw frames; point lookup unavailable"));
-
-        let err_append_fiber = writer
-            .append_to_fiber(fiber_id, [0x01; 16], b"payload")
-            .unwrap_err();
-        assert_eq!(
-            *err_append_fiber.condition(),
-            FailureCondition::EnvelopeMismatch
-        );
-
-        let env = EventEnvelope::genesis([0x02; 16], fiber_id, b"envelope").unwrap();
-        let err_append_env = writer.append_envelope_verdict(&env).unwrap_err();
-        assert_eq!(
-            *err_append_env.condition(),
-            FailureCondition::EnvelopeMismatch
-        );
-        assert!(err_append_env
-            .to_string()
-            .contains("session contains unindexed raw frames; append unavailable"));
     }
 
     #[test]
@@ -2408,7 +2318,9 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let writer = adapter.create(&claim).expect("create writer");
+        let writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let fiber_id = [0x55; 16];
         let event_id = [0x77; 16];
 
@@ -2463,7 +2375,9 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let env1 = EventEnvelope::genesis([0x01; 16], [0x55; 16], b"payload-1").unwrap();
 
         let verdict = writer
@@ -2519,7 +2433,9 @@ mod tests {
             operator_label: "test-operator".to_string(),
         };
 
-        let writer = adapter.create(&claim).expect("create writer");
+        let writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let mut write_err_writer = writer.with_simulate_write_error(true);
         let fiber_id = [0x55; 16];
         let event_id = [0x77; 16];
@@ -2540,7 +2456,9 @@ mod tests {
 
         let stem_sync = temp_dir.path().join("test_file_sync_phase");
         let adapter_sync = FileStorageAdapter::new(&stem_sync);
-        let sync_writer = adapter_sync.create(&claim).expect("create writer");
+        let sync_writer = adapter_sync
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let mut sync_err_writer = sync_writer.with_simulate_sync_error(true);
         let verdict_sync = sync_err_writer
             .append_to_fiber(fiber_id, event_id, b"payload-sync-err")
@@ -2561,7 +2479,9 @@ mod tests {
 
         let stem_meta = temp_dir.path().join("test_file_meta_phase");
         let adapter_meta = FileStorageAdapter::new(&stem_meta);
-        let mut meta_writer = adapter_meta.create(&claim).expect("create writer");
+        let meta_writer = adapter_meta
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let mut perms = std::fs::metadata(meta_writer.meta_path())
             .unwrap()
             .permissions();
@@ -2569,7 +2489,7 @@ mod tests {
         std::fs::set_permissions(meta_writer.meta_path(), perms.clone()).unwrap();
 
         let dummy_record = OwnershipRecord::OwnershipClaim(claim.clone());
-        let meta_err = meta_writer
+        let meta_err = adapter_meta
             .record_meta_record_for_test(&dummy_record)
             .expect_err("read-only meta should fail append");
         assert_eq!(
@@ -2594,7 +2514,7 @@ mod tests {
             std::fs::set_permissions(meta_writer.meta_path(), perms).expect("restore permissions");
         }
 
-        meta_writer
+        adapter_meta
             .record_meta_record_for_test(&dummy_record)
             .expect("recording succeeds after restoring permissions");
         assert!(meta_writer.uncertain_diagnostic().is_none());
@@ -2614,7 +2534,9 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
 
         let borrowed_claim: &OwnershipClaimRecord = writer.claim();
         assert_eq!(borrowed_claim.epoch, 1);
@@ -2624,24 +2546,15 @@ mod tests {
         append_meta_record(writer.meta_path(), &OwnershipRecord::OwnershipClaim(claim2))
             .expect("append higher epoch");
 
-        let choice = RescuePolicyChoiceRecord {
-            policy_tag: 0,
-            parameter_payload: vec![],
-        };
-        let err_meta = writer
-            .record_rescue_policy_choice_for_test(&choice)
-            .unwrap_err();
-        assert_eq!(*err_meta.condition(), FailureCondition::StaleEpoch);
+        let genesis = EventEnvelope::genesis([0x01; 16], [0x11; 16], b"payload").unwrap();
+        let err_append = writer.append_envelope_verdict(&genesis).unwrap_err();
+        assert_eq!(*err_append.condition(), FailureCondition::StaleEpoch);
 
-        let descriptor =
-            AdmittedDescriptor::try_from_descriptor(SchemaDescriptor::new(1, DescriptorNode::U64))
-                .unwrap();
-        let err_schema = writer.set_schema_descriptor(&descriptor).unwrap_err();
-        assert_eq!(*err_schema.condition(), FailureCondition::StaleEpoch);
+        let err_sync = writer.sync().unwrap_err();
+        assert_eq!(*err_sync.condition(), FailureCondition::StaleEpoch);
 
         let meta_records = adapter.read_meta_records().expect("read meta");
-        assert!(meta_records.rescue_policy_choice.is_none());
-        assert!(meta_records.schema_descriptor.is_none());
+        assert_eq!(meta_records.latest_claim.unwrap().epoch, 2);
     }
 
     #[test]
@@ -2658,7 +2571,9 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let writer = adapter.create(&claim).expect("create writer");
+        let writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         writer
             .release_exclusion()
             .expect("release exclusion succeeds");
@@ -2716,7 +2631,9 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
 
         let mut claim2 = claim.clone();
         claim2.epoch = 2;
@@ -2741,7 +2658,9 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let fiber_id = [0x42; 16];
         writer
             .append_to_fiber(fiber_id, [0x01; 16], b"payload")
@@ -2792,9 +2711,12 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
-        writer
-            .append_unvalidated_frame(b"short-payload")
+        let writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
+        drop(writer);
+        adapter
+            .append_unvalidated_frame_for_test(b"short-payload")
             .expect("append short frame");
 
         let mut reader = adapter.open_read().expect("open read");
@@ -2803,9 +2725,9 @@ mod tests {
     }
 
     #[test]
-    fn test_file_record_meta_record_prewrite_failure_preserves_certainty_and_recovers() {
+    fn test_create_persists_schema_descriptor_and_enforces_immutability() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let stem = temp_dir.path().join("test_meta_prewrite_recovery");
+        let stem = temp_dir.path().join("schema_creation");
         let adapter = FileStorageAdapter::new(&stem);
         let claim = OwnershipClaimRecord {
             epoch: 1,
@@ -2816,226 +2738,15 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
-        let meta_path = stem.with_extension("meta");
-
-        let mut perms = std::fs::metadata(&meta_path).unwrap().permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(&meta_path, perms).unwrap();
-
-        let inbound_record = OwnershipRecord::InboundPointer(InboundPointerRecord {
-            prior_generation_locator_id: [0x88; 16],
-            prior_generation_epoch: 2,
-        });
-
-        let err = writer
-            .record_meta_record_for_test(&inbound_record)
-            .unwrap_err();
-        assert_eq!(
-            *err.condition(),
-            FailureCondition::OwnershipRecordUnreadable
-        );
-        assert!(err.to_string().contains("failed to open .meta for append"));
-        assert!(writer.uncertain_diagnostic().is_none());
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&meta_path, std::fs::Permissions::from_mode(0o644))
-                .expect("restore permissions");
-        }
-        #[cfg(not(unix))]
-        #[allow(clippy::permissions_set_readonly_false)]
-        {
-            let mut restore_perms = std::fs::metadata(&meta_path).unwrap().permissions();
-            restore_perms.set_readonly(false);
-            std::fs::set_permissions(&meta_path, restore_perms).unwrap();
-        }
-
-        writer
-            .record_meta_record_for_test(&inbound_record)
-            .expect("recording meta record succeeds after permissions restored");
-        assert!(writer.uncertain_diagnostic().is_none());
-        assert!(writer.inbound_pointer().is_some());
-
-        let fiber_id = [0x55; 16];
-        let event_id = [0x77; 16];
-        let verdict = writer
-            .append_to_fiber(fiber_id, event_id, b"payload-after-meta-recovery")
-            .expect("append succeeds after meta recovery");
-        assert!(matches!(verdict, WriteLandingVerdict::Landed(_)));
-        assert!(writer.uncertain_diagnostic().is_none());
-    }
-
-    #[test]
-    fn test_file_record_meta_record_write_or_sync_failure_marks_uncertain() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let stem = temp_dir.path().join("test_meta_write_or_sync_failure");
-        let adapter = FileStorageAdapter::new(&stem);
-        let claim = OwnershipClaimRecord {
-            epoch: 1,
-            machine_id: [1u8; 16],
-            boot_id: [2u8; 16],
-            process_id: 12345,
-            process_start_time_ns: 1_000_000,
-            claim_time_ns: 2_000_000,
-            operator_label: "test-operator".to_string(),
-        };
-        let writer = adapter.create(&claim).expect("create writer");
-        let mut sync_err_writer = writer.with_simulate_sync_error(true);
-
-        let inbound_record = OwnershipRecord::InboundPointer(InboundPointerRecord {
-            prior_generation_locator_id: [0x88; 16],
-            prior_generation_epoch: 2,
-        });
-
-        let err = sync_err_writer
-            .record_meta_record_for_test(&inbound_record)
-            .unwrap_err();
-        assert_eq!(
-            *err.condition(),
-            FailureCondition::OwnershipRecordUnreadable
-        );
-        assert!(err.to_string().contains("simulated sync_data failure"));
-        assert!(sync_err_writer.uncertain_diagnostic().is_some());
-        let diag = sync_err_writer.uncertain_diagnostic().unwrap();
-        assert!(diag.contains("metadata write failed; write landing undetermined"));
-        assert!(diag.contains("failed to sync .meta: simulated sync_data failure"));
-
-        let subsequent_err = sync_err_writer
-            .record_meta_record_for_test(&inbound_record)
-            .unwrap_err();
-        assert_eq!(
-            *subsequent_err.condition(),
-            FailureCondition::OwnershipRecordUnreadable
-        );
-        assert!(subsequent_err
-            .to_string()
-            .contains("writer session in uncertain state"));
-
-        let fiber_id = [0x55; 16];
-        let event_id = [0x77; 16];
-        let append_err = sync_err_writer
-            .append_to_fiber(fiber_id, event_id, b"payload-during-uncertainty")
-            .unwrap_err();
-        assert_eq!(
-            *append_err.condition(),
-            FailureCondition::OwnershipRecordUnreadable
-        );
-        assert!(append_err
-            .to_string()
-            .contains("writer session in uncertain state"));
-
-        let stem_write = temp_dir.path().join("test_meta_write_failure");
-        let adapter_write = FileStorageAdapter::new(&stem_write);
-        let writer_write = adapter_write.create(&claim).expect("create writer 2");
-        let mut write_err_writer = writer_write.with_simulate_write_error(true);
-
-        let err_write = write_err_writer
-            .record_meta_record_for_test(&inbound_record)
-            .unwrap_err();
-        assert_eq!(
-            *err_write.condition(),
-            FailureCondition::OwnershipRecordUnreadable
-        );
-        assert!(err_write
-            .to_string()
-            .contains("simulated write_all failure"));
-        assert!(write_err_writer.uncertain_diagnostic().is_some());
-        let diag_write = write_err_writer.uncertain_diagnostic().unwrap();
-        assert!(diag_write.contains("metadata write failed; write landing undetermined"));
-        assert!(diag_write.contains("failed to write record to .meta: simulated write_all failure"));
-
-        let subsequent_write_err = write_err_writer
-            .record_meta_record_for_test(&inbound_record)
-            .unwrap_err();
-        assert!(subsequent_write_err
-            .to_string()
-            .contains("writer session in uncertain state"));
-    }
-
-    #[test]
-    fn test_set_schema_descriptor_idempotent_and_conflicting_rejection() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let stem = temp_dir.path().join("schema_idempotency");
-        let adapter = FileStorageAdapter::new(&stem);
-        let claim = OwnershipClaimRecord {
-            epoch: 1,
-            machine_id: [1u8; 16],
-            boot_id: [2u8; 16],
-            process_id: 12345,
-            process_start_time_ns: 1_000_000,
-            claim_time_ns: 2_000_000,
-            operator_label: "test-operator".to_string(),
-        };
-        let mut writer = adapter.create(&claim).expect("create writer");
-        let desc1 =
-            AdmittedDescriptor::try_from_descriptor(SchemaDescriptor::new(1, DescriptorNode::U64))
-                .unwrap();
-        writer
-            .set_schema_descriptor(&desc1)
-            .expect("first set_schema_descriptor");
-
-        let mut meta_file = File::open(&writer.store.engine.meta_path).unwrap();
-        let (_, frames_first, _) = read_container_frames(&mut meta_file).unwrap();
-        let first_count = frames_first.len();
-        let meta_len_first = meta_file.metadata().unwrap().len();
-
-        writer
-            .set_schema_descriptor(&desc1)
-            .expect("idempotent second set_schema_descriptor");
-        let mut meta_file = File::open(&writer.store.engine.meta_path).unwrap();
-        let (_, frames_second, _) = read_container_frames(&mut meta_file).unwrap();
-        assert_eq!(first_count, frames_second.len());
-        assert_eq!(meta_len_first, meta_file.metadata().unwrap().len());
-
-        let desc_conflicting_version =
-            AdmittedDescriptor::try_from_descriptor(SchemaDescriptor::new(2, DescriptorNode::U64))
-                .unwrap();
-        let err_version = writer
-            .set_schema_descriptor(&desc_conflicting_version)
-            .unwrap_err();
-        assert_eq!(*err_version.condition(), FailureCondition::SchemaMismatch);
-        let meta_file = File::open(&writer.store.engine.meta_path).unwrap();
-        assert_eq!(meta_len_first, meta_file.metadata().unwrap().len());
-
-        let desc_conflicting_root =
-            AdmittedDescriptor::try_from_descriptor(SchemaDescriptor::new(1, DescriptorNode::U32))
-                .unwrap();
-        let err_root = writer
-            .set_schema_descriptor(&desc_conflicting_root)
-            .unwrap_err();
-        assert_eq!(*err_root.condition(), FailureCondition::SchemaMismatch);
-        let meta_file = File::open(&writer.store.engine.meta_path).unwrap();
-        assert_eq!(meta_len_first, meta_file.metadata().unwrap().len());
-    }
-
-    #[test]
-    fn test_set_schema_descriptor_rejects_after_data_events_landed() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let stem = temp_dir.path().join("schema_after_data");
-        let adapter = FileStorageAdapter::new(&stem);
-        let claim = OwnershipClaimRecord {
-            epoch: 1,
-            machine_id: [1u8; 16],
-            boot_id: [2u8; 16],
-            process_id: 12345,
-            process_start_time_ns: 1_000_000,
-            claim_time_ns: 2_000_000,
-            operator_label: "test-operator".to_string(),
-        };
-        let mut writer = adapter.create(&claim).expect("create writer");
-        let fiber_id = [0xAA; 16];
-        let event_id = [0x01; 16];
-        writer
-            .append_to_fiber(fiber_id, event_id, b"first-event")
-            .expect("append event");
-
         let desc =
             AdmittedDescriptor::try_from_descriptor(SchemaDescriptor::new(1, DescriptorNode::U64))
                 .unwrap();
-        let err = writer.set_schema_descriptor(&desc).unwrap_err();
-        assert_eq!(*err.condition(), FailureCondition::SchemaMismatch);
+        let writer = adapter.create(&claim, &desc).expect("create writer");
+        assert_eq!(writer.schema_descriptor(), Some(desc.descriptor()));
+        drop(writer);
+
+        let reader = adapter.open_read().expect("open reader");
+        assert_eq!(reader.schema_descriptor(), Some(desc.descriptor()));
     }
 
     #[test]

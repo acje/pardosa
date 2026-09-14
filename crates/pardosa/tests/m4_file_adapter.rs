@@ -54,7 +54,9 @@ fn test_readme_file_storage_adapter_example_compiles() {
     let dir = TestDir::new("readme_example");
     let adapter = FileStorageAdapter::new(dir.path().join("orders"));
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create writer");
 
     let fiber_id = derive_fiber_id("ord-12345");
     let event_id = [1u8; 16];
@@ -81,15 +83,20 @@ fn test_m4_strict_create_and_refuse_existing() {
     assert_eq!(adapter.try_presence().unwrap(), ArtefactPresence::None);
 
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create should succeed");
+    let mut writer = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create should succeed");
     assert_eq!(adapter.try_presence().unwrap(), ArtefactPresence::Both);
     assert_eq!(writer.carried_epoch(), 1);
     assert_eq!(writer.rolling_commitment().frame_count(), 0);
 
-    let err = adapter.create(&claim).unwrap_err();
+    let err = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .unwrap_err();
     assert_eq!(err.condition(), &FailureCondition::StoreAlreadyExists);
 
-    let _ = writer.append_raw_frame(b"first-event");
+    let genesis = EventEnvelope::genesis([1; 16], [2; 16], b"first-event").unwrap();
+    let _ = writer.append_envelope_verdict(&genesis);
 }
 
 #[test]
@@ -121,7 +128,7 @@ fn test_m4_concurrent_create_exactly_one_winner() {
         handles.push(thread::spawn(move || {
             let adapter = FileStorageAdapter::new(&store_path_clone);
             let claim = sample_claim(thread_idx as u64 + 1);
-            match adapter.create(&claim) {
+            match adapter.create(&claim, &AdmittedDescriptor::default_for_test()) {
                 Ok(_writer) => {
                     winners_clone.fetch_add(1, Ordering::SeqCst);
                 }
@@ -150,7 +157,7 @@ fn test_m4_writer_exclusion_and_policy() {
     let claim = sample_claim(1);
 
     let writer1 = adapter
-        .create(&claim)
+        .create(&claim, &AdmittedDescriptor::default_for_test())
         .expect("first writer creates and locks");
 
     let adapter2 = FileStorageAdapter::new(&store_path);
@@ -191,9 +198,26 @@ fn test_m4_readonly_open_concurrent_with_writer() {
     let adapter = FileStorageAdapter::new(&store_path);
     let claim = sample_claim(1);
 
-    let mut writer = adapter.create(&claim).expect("create writer");
-    writer.append_raw_frame(b"frame-1").expect("append frame 1");
-    writer.append_raw_frame(b"frame-2").expect("append frame 2");
+    let mut writer = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create writer");
+    let env1 = EventEnvelope::genesis([1; 16], [2; 16], b"frame-1").unwrap();
+    let env2 = EventEnvelope {
+        header: EnvelopeHeader {
+            event_id: [2; 16],
+            fiber_id: [2; 16],
+            detached: false,
+            precursor: env1.header.event_id,
+            precursor_hash: env1.commitment(),
+        },
+        payload: b"frame-2".to_vec(),
+    };
+    writer
+        .append_envelope_verdict(&env1)
+        .expect("append frame 1");
+    writer
+        .append_envelope_verdict(&env2)
+        .expect("append frame 2");
 
     let mut reader1 = adapter
         .open_read()
@@ -205,9 +229,14 @@ fn test_m4_readonly_open_concurrent_with_writer() {
     let frames1 = reader1.read_all_frames().expect("reader1 read all");
     let frames2 = reader2.read_all_frames().expect("reader2 read all");
 
+    let mut env1_buf = Vec::new();
+    env1.encode(&mut env1_buf);
+    let mut env2_buf = Vec::new();
+    env2.encode(&mut env2_buf);
+
     assert_eq!(frames1.len(), 2);
-    assert_eq!(frames1[0], b"frame-1");
-    assert_eq!(frames1[1], b"frame-2");
+    assert_eq!(frames1[0], env1_buf);
+    assert_eq!(frames1[1], env2_buf);
     assert_eq!(frames2, frames1);
 
     assert_eq!(reader1.rolling_commitment().frame_count(), 2);
@@ -244,16 +273,22 @@ fn test_m4_incomplete_creation_and_orphan() {
         .complete_creation(&claim)
         .expect("complete creation");
     assert_eq!(adapter.try_presence().unwrap(), ArtefactPresence::Both);
+    let env_after = EventEnvelope::genesis([1; 16], [2; 16], b"after-completion").unwrap();
     writer
-        .append_raw_frame(b"after-completion")
+        .append_envelope_verdict(&env_after)
         .expect("append after completion");
     drop(writer);
 
     let orphan_path = dir.path().join("orphan_store");
     let orphan_adapter = FileStorageAdapter::new(&orphan_path);
-    let mut orphan_writer = orphan_adapter.create(&claim).expect("create normal");
+    let mut orphan_writer = orphan_adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create normal");
+    let env_orphan = EventEnvelope::genesis([2; 16], [3; 16], b"orphan-data").unwrap();
+    let mut env_orphan_buf = Vec::new();
+    env_orphan.encode(&mut env_orphan_buf);
     orphan_writer
-        .append_raw_frame(b"orphan-data")
+        .append_envelope_verdict(&env_orphan)
         .expect("append");
     drop(orphan_writer);
 
@@ -275,7 +310,7 @@ fn test_m4_incomplete_creation_and_orphan() {
         .read_all_frames()
         .expect("read frames from orphan");
     assert_eq!(orphan_frames.len(), 1);
-    assert_eq!(orphan_frames[0], b"orphan-data");
+    assert_eq!(orphan_frames[0], env_orphan_buf);
 }
 
 #[test]
@@ -285,9 +320,14 @@ fn test_m4_per_landing_epoch_verification() {
     let adapter = FileStorageAdapter::new(&store_path);
     let claim1 = sample_claim(1);
 
-    let mut writer = adapter.create(&claim1).expect("create writer epoch 1");
+    let mut writer = adapter
+        .create(&claim1, &AdmittedDescriptor::default_for_test())
+        .expect("create writer epoch 1");
+    let env1 = EventEnvelope::genesis([1; 16], [2; 16], b"frame-at-epoch-1").unwrap();
+    let mut env1_buf = Vec::new();
+    env1.encode(&mut env1_buf);
     writer
-        .append_raw_frame(b"frame-at-epoch-1")
+        .append_envelope_verdict(&env1)
         .expect("first append at epoch 1");
 
     let claim2 = sample_claim(2);
@@ -295,20 +335,18 @@ fn test_m4_per_landing_epoch_verification() {
         .record_ownership_claim_for_test(&claim2)
         .expect("superseding claim in meta");
 
-    let stale_err = writer
-        .append_raw_frame(b"frame-with-stale-epoch")
-        .unwrap_err();
+    let env2 = EventEnvelope::genesis([2; 16], [3; 16], b"frame-with-stale-epoch").unwrap();
+    let stale_err = writer.append_envelope_verdict(&env2).unwrap_err();
     assert_eq!(stale_err.condition(), &FailureCondition::StaleEpoch);
 
     let mut reader = adapter.open_read().expect("reader opens");
     let frames = reader.read_all_frames().expect("read frames");
     assert_eq!(frames.len(), 1);
-    assert_eq!(frames[0], b"frame-at-epoch-1");
+    assert_eq!(frames[0], env1_buf);
 
     fs::write(adapter.meta_path(), b"truncated").expect("corrupt meta");
-    let unreadable_err = writer
-        .append_raw_frame(b"frame-with-corrupt-meta")
-        .unwrap_err();
+    let env3 = EventEnvelope::genesis([3; 16], [4; 16], b"frame-with-corrupt-meta").unwrap();
+    let unreadable_err = writer.append_envelope_verdict(&env3).unwrap_err();
     assert_eq!(
         unreadable_err.condition(),
         &FailureCondition::OwnershipRecordUnreadable
@@ -322,17 +360,21 @@ fn test_m4_continuous_rolling_commitment_and_crc32c() {
     let adapter = FileStorageAdapter::new(&store_path);
     let claim = sample_claim(1);
 
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create writer");
     assert_eq!(writer.rolling_commitment().frame_count(), 0);
 
+    let env_alpha = EventEnvelope::genesis([1; 16], [2; 16], b"payload-alpha").unwrap();
     writer
-        .append_raw_frame(b"payload-alpha")
+        .append_envelope_verdict(&env_alpha)
         .expect("append alpha");
     assert_eq!(writer.rolling_commitment().frame_count(), 1);
     let digest1 = writer.rolling_commitment().current_commitment();
 
+    let env_beta = EventEnvelope::genesis([2; 16], [3; 16], b"payload-beta").unwrap();
     writer
-        .append_raw_frame(b"payload-beta")
+        .append_envelope_verdict(&env_beta)
         .expect("append beta");
     assert_eq!(writer.rolling_commitment().frame_count(), 2);
     let digest2 = writer.rolling_commitment().current_commitment();
@@ -443,11 +485,8 @@ fn test_m4_c8_2_schema_structural_completeness() {
     let adapter = FileStorageAdapter::new(&store_path);
     let claim = sample_claim(1);
 
-    let mut writer = adapter.create(&claim).expect("create writer");
     let admitted = AdmittedDescriptor::try_from_descriptor(valid_schema.clone()).unwrap();
-    writer
-        .set_schema_descriptor(&admitted)
-        .expect("set schema descriptor");
+    let writer = adapter.create(&claim, &admitted).expect("create writer");
     drop(writer);
 
     let reader = adapter.open_read().expect("open read");
@@ -475,13 +514,15 @@ fn test_m4_format_vectors_roundtrip_on_filesystem_adapter() {
             let (env, _) = EventEnvelope::decode(&bytes).unwrap();
             let store_path = dir.path().join(format!("vector_store_{idx}"));
             let adapter = FileStorageAdapter::new(&store_path);
-            let mut writer = adapter.create(&claim).expect("create writer");
+            let writer = adapter
+                .create(&claim, &AdmittedDescriptor::default_for_test())
+                .expect("create writer");
+            drop(writer);
             let mut env_buf = Vec::new();
             env.encode(&mut env_buf);
-            writer
-                .append_unvalidated_frame(&env_buf)
+            adapter
+                .append_unvalidated_frame_for_test(&env_buf)
                 .expect("append raw frame");
-            drop(writer);
 
             let mut reader = adapter.open_read().expect("open reader");
             let read_envelopes = reader
@@ -500,7 +541,9 @@ fn test_m4_adapter_retirement_and_generation_records() {
     let base_path = dir.path().join("retired_source");
     let adapter = FileStorageAdapter::new(&base_path);
     let claim = sample_claim(1);
-    adapter.create(&claim).expect("create");
+    adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create");
 
     let mut writer = adapter.open_write(1).expect("open write");
     let env = EventEnvelope {
@@ -556,7 +599,9 @@ fn test_m4_incremental_recovery_open_writer_and_reader_identical_state() {
     let stem = dir.path().join("store");
     let adapter = FileStorageAdapter::new(&stem);
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create writer");
 
     let fiber1 = [0x11; 16];
     let fiber2 = [0x22; 16];
@@ -676,7 +721,9 @@ fn test_m4_fold_and_for_each_envelopes_borrowed_views() {
     let base_path = dir.path().join("fold_views");
     let adapter = FileStorageAdapter::new(&base_path);
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create writer");
 
     let fiber = [0x77; 16];
     let mut expected_envelopes = Vec::new();
@@ -785,7 +832,9 @@ fn test_file_reopen_same_stream_append_continuation_matches_batch() {
     }
     assert_eq!(events_m.len(), 9);
 
-    let mut writer_a = adapter_a.create(&claim).expect("create writer a");
+    let mut writer_a = adapter_a
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create writer a");
     for (fiber_id, event_id, payload) in &events_n {
         writer_a
             .append_to_fiber(*fiber_id, *event_id, payload.clone())
@@ -806,7 +855,9 @@ fn test_file_reopen_same_stream_append_continuation_matches_batch() {
     }
     drop(writer_a);
 
-    let mut writer_b = adapter_b.create(&claim).expect("create writer b");
+    let mut writer_b = adapter_b
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create writer b");
     for (fiber_id, event_id, payload) in &events_n {
         writer_b
             .append_to_fiber(*fiber_id, *event_id, payload.clone())
@@ -901,7 +952,9 @@ fn test_file_open_write_concurrent_writer_rejected_while_holding_lock() {
     let adapter = FileStorageAdapter::new(&base_path);
     let claim = sample_claim(1);
 
-    let writer = adapter.create(&claim).expect("create");
+    let writer = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create");
     drop(writer);
 
     let writer1 = adapter
@@ -930,7 +983,9 @@ fn test_file_open_write_acquires_lock_before_authority_metadata_read() {
     let adapter = FileStorageAdapter::new(&base_path);
     let claim = sample_claim(1);
 
-    let writer = adapter.create(&claim).expect("create");
+    let writer = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create");
     drop(writer);
 
     let writer1 = adapter

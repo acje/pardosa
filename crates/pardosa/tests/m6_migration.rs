@@ -93,9 +93,13 @@ fn test_m6_migration_basic_lifecycle_and_cutover() {
     let target = FileStorageAdapter::new(&target_path);
 
     let claim1 = sample_claim(1);
-    source.create(&claim1).expect("create source");
+    source
+        .create(&claim1, &AdmittedDescriptor::default_for_test())
+        .expect("create source");
     let claim2 = sample_claim(1);
-    target.create(&claim2).expect("create target");
+    target
+        .create(&claim2, &AdmittedDescriptor::default_for_test())
+        .expect("create target");
 
     let mut writer = source.open_write(1).expect("open write source");
     let env1 = sample_genesis_envelope(1, 0xaa, b"payload1");
@@ -189,8 +193,12 @@ fn test_m6_caller_transformation_closure_and_refusal() {
     let target = FileStorageAdapter::new(dir.path().join("target_tx"));
 
     let claim = sample_claim(1);
-    source.create(&claim).expect("create source");
-    target.create(&claim).expect("create target");
+    source
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create source");
+    target
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create target");
 
     let mut writer = source.open_write(1).expect("open write source");
     let env1 = sample_genesis_envelope(1, 0xaa, b"input_data");
@@ -221,8 +229,12 @@ fn test_m6_per_fiber_policies_keep_purge_lock_and_prune() {
     let target = FileStorageAdapter::new(dir.path().join("target_policies"));
 
     let claim = sample_claim(1);
-    source.create(&claim).expect("create source");
-    target.create(&claim).expect("create target");
+    source
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create source");
+    target
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create target");
 
     let mut writer = source.open_write(1).expect("open write source");
 
@@ -251,8 +263,12 @@ fn test_m6_dense_rechaining_and_pairwise_order() {
     let target = FileStorageAdapter::new(dir.path().join("target_order"));
 
     let claim = sample_claim(1);
-    source.create(&claim).expect("create source");
-    target.create(&claim).expect("create target");
+    source
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create source");
+    target
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create target");
 
     let mut writer = source.open_write(1).expect("open write source");
 
@@ -286,8 +302,12 @@ fn test_m6_broken_chain_election_refuse_vs_permit() {
     let target_refuse = FileStorageAdapter::new(dir.path().join("target_refuse"));
 
     let claim = sample_claim(1);
-    source_refuse.create(&claim).expect("create source refuse");
-    target_refuse.create(&claim).expect("create target refuse");
+    source_refuse
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create source refuse");
+    target_refuse
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create target refuse");
 
     let mut writer = source_refuse.open_write(1).expect("open write source");
     let env1 = sample_genesis_envelope(1, 0xaa, b"valid1");
@@ -304,8 +324,9 @@ fn test_m6_broken_chain_election_refuse_vs_permit() {
     writer.append_envelope_verdict(&env1).expect("append env1");
     let mut broken_buf = Vec::new();
     broken_env.encode(&mut broken_buf);
-    writer
-        .append_unvalidated_frame(&broken_buf)
+    drop(writer);
+    source_refuse
+        .append_unvalidated_frame_for_test(&broken_buf)
         .expect("append broken raw frame");
 
     let err_refuse =
@@ -318,8 +339,12 @@ fn test_m6_broken_chain_election_refuse_vs_permit() {
 
     let source_permit = FileStorageAdapter::new(dir.path().join("source_permit"));
     let target_permit = FileStorageAdapter::new(dir.path().join("target_permit"));
-    source_permit.create(&claim).expect("create source permit");
-    target_permit.create(&claim).expect("create target permit");
+    source_permit
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create source permit");
+    target_permit
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create target permit");
 
     let mut writer_permit = source_permit
         .open_write(1)
@@ -327,8 +352,9 @@ fn test_m6_broken_chain_election_refuse_vs_permit() {
     writer_permit
         .append_envelope_verdict(&env1)
         .expect("append env1");
-    writer_permit
-        .append_unvalidated_frame(&broken_buf)
+    drop(writer_permit);
+    source_permit
+        .append_unvalidated_frame_for_test(&broken_buf)
         .expect("append broken raw frame");
 
     let mut src_reader = source_permit.open_read().expect("open source reader");

@@ -1197,9 +1197,8 @@ fn test_compile_fail_and_positive_controls_external_boundary() {
 
     let file_writer_mutation_positive_code = r#"
         use pardosa::prelude::*;
-        pub fn run_valid(mut writer: FileWriterSession, env: &EventEnvelope, desc: &AdmittedDescriptor, adapter: &FileStorageAdapter) {
+        pub fn run_valid(mut writer: FileWriterSession, env: &EventEnvelope, adapter: &FileStorageAdapter) {
             let _ = writer.append_envelope_verdict(env);
-            let _ = writer.set_schema_descriptor(desc);
             let _claim: &OwnershipClaimRecord = writer.claim();
             let _ = writer.release_exclusion();
             let _ = adapter.try_presence();
@@ -1209,6 +1208,77 @@ fn test_compile_fail_and_positive_controls_external_boundary() {
     assert!(
         writer_mut_ok,
         "FileWriterSession must expose valid writer controls (H2):\n{writer_mut_stderr}"
+    );
+
+    let file_writer_set_schema_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_invalid(mut writer: FileWriterSession, desc: &AdmittedDescriptor) {
+            let _ = writer.set_schema_descriptor(desc);
+        }
+    "#;
+    let (writer_schema_ok, writer_schema_stderr) = run_rustc(file_writer_set_schema_code);
+    assert!(
+        !writer_schema_ok,
+        "FileWriterSession must not expose set_schema_descriptor"
+    );
+    assert!(
+        writer_schema_stderr.contains("no method named `set_schema_descriptor`")
+            || writer_schema_stderr.contains("E0599"),
+        "rejection must cite missing method: {writer_schema_stderr}"
+    );
+
+    let migration_source_record_meta_code = r#"
+        use pardosa::prelude::*;
+        use pardosa::migration::MigrationSource;
+        pub fn run_invalid<S: MigrationSource>(source: &S, record: &OwnershipRecord) {
+            let _ = source.record_meta(record);
+        }
+    "#;
+    let (source_meta_ok, source_meta_stderr) = run_rustc(migration_source_record_meta_code);
+    assert!(
+        !source_meta_ok,
+        "MigrationSource must not expose record_meta"
+    );
+    assert!(
+        source_meta_stderr.contains("no method named `record_meta`")
+            || source_meta_stderr.contains("E0599"),
+        "rejection must cite missing method: {source_meta_stderr}"
+    );
+
+    let migration_target_record_meta_code = r#"
+        use pardosa::prelude::*;
+        use pardosa::migration::MigrationTarget;
+        pub fn run_invalid<T: MigrationTarget>(target: &T, record: &OwnershipRecord) {
+            let _ = target.record_meta(record);
+        }
+    "#;
+    let (target_meta_ok, target_meta_stderr) = run_rustc(migration_target_record_meta_code);
+    assert!(
+        !target_meta_ok,
+        "MigrationTarget must not expose record_meta"
+    );
+    assert!(
+        target_meta_stderr.contains("no method named `record_meta`")
+            || target_meta_stderr.contains("E0599"),
+        "rejection must cite missing method: {target_meta_stderr}"
+    );
+
+    let storage_engine_record_meta_code = r#"
+        use pardosa::prelude::*;
+        use pardosa::store::StorageEngine;
+        pub fn run_invalid<E: StorageEngine>(engine: &mut E, record: &OwnershipRecord) {
+            let _ = engine.record_meta_record(record);
+        }
+    "#;
+    let (engine_meta_ok, engine_meta_stderr) = run_rustc(storage_engine_record_meta_code);
+    assert!(
+        !engine_meta_ok,
+        "StorageEngine must not expose record_meta_record"
+    );
+    assert!(
+        engine_meta_stderr.contains("no method named `record_meta_record`")
+            || engine_meta_stderr.contains("E0599"),
+        "rejection must cite missing method: {engine_meta_stderr}"
     );
 
     let store_from_parts_code = r#"
@@ -1694,17 +1764,6 @@ impl StorageEngine for MockEngine {
 
     fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
         None
-    }
-
-    fn set_schema_descriptor(
-        &mut self,
-        _descriptor: &AdmittedDescriptor,
-    ) -> Result<(), OperationFailure> {
-        Ok(())
-    }
-
-    fn record_meta_record(&mut self, _record: &OwnershipRecord) -> Result<(), OperationFailure> {
-        Ok(())
     }
 
     fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {

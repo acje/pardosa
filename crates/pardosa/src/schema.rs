@@ -699,6 +699,13 @@ impl AdmittedDescriptor {
     pub fn identity(&self) -> SchemaIdentity {
         SchemaIdentity::from_descriptor(self)
     }
+
+    /// Creates a default valid descriptor for testing.
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    #[must_use]
+    pub fn default_for_test() -> Self {
+        Self(SchemaDescriptor::new(1, DescriptorNode::U64))
+    }
 }
 
 impl TryFrom<SchemaDescriptor> for AdmittedDescriptor {

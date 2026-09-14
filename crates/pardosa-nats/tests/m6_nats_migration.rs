@@ -58,9 +58,13 @@ fn test_m6_migration_on_nats_adapter() {
     let target = NatsStorageAdapter::new(server.url(), &dst_stem).expect("connect dst");
 
     let claim = sample_claim(1);
-    let mut writer = source.create(&claim).expect("create source");
+    let mut writer = source
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create source");
     let target_claim = sample_claim(1);
-    target.create(&target_claim).expect("create target");
+    target
+        .create(&target_claim, &AdmittedDescriptor::default_for_test())
+        .expect("create target");
 
     let env1 = sample_genesis_envelope(1, 0x55, b"nats_e1");
     let comm1 = env1.commitment();
@@ -93,14 +97,16 @@ fn test_m6_migration_on_nats_adapter() {
         end_time_ns: 2_000_000_000,
         status: MigrationStatus::Complete,
     };
-    MigrationTarget::record_meta(&target, &OwnershipRecord::MigrationEnd(end_record))
+    target
+        .record_meta_record_for_test(&OwnershipRecord::MigrationEnd(end_record))
         .expect("record migration end");
 
     let rescue_choice = RescuePolicyChoiceRecord {
         policy_tag: RescuePolicy::Strict.to_u8(),
         parameter_payload: Vec::new(),
     };
-    MigrationTarget::record_meta(&target, &OwnershipRecord::RescuePolicyChoice(rescue_choice))
+    target
+        .record_meta_record_for_test(&OwnershipRecord::RescuePolicyChoice(rescue_choice))
         .expect("record rescue choice");
 
     let outbound = OutboundPointerRecord {
@@ -108,7 +114,7 @@ fn test_m6_migration_on_nats_adapter() {
         cutover_epoch: source_epoch,
     };
     source
-        .record_outbound_pointer(&outbound)
+        .record_outbound_pointer_for_test(&outbound)
         .expect("record outbound");
 
     assert!(source.is_retired_source().expect("source retired"));
@@ -150,8 +156,12 @@ fn test_m6_migration_cross_adapter_file_to_nats() {
     let target = NatsStorageAdapter::new(server.url(), &dst_stem).expect("connect dst");
 
     let claim = sample_claim(1);
-    source.create(&claim).expect("create source");
-    target.create(&claim).expect("create target");
+    source
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create source");
+    target
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create target");
 
     let mut writer = source.open_write(1).expect("open write source");
     let env1 = sample_genesis_envelope(1, 0x77, b"cross_data");
@@ -177,9 +187,13 @@ fn test_m6_nats_broken_chain_election() {
     let target = NatsStorageAdapter::new(server.url(), &dst_stem).expect("connect dst");
 
     let claim = sample_claim(1);
-    let mut writer = source.create(&claim).expect("create source");
+    let mut writer = source
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create source");
     let target_claim = sample_claim(1);
-    target.create(&target_claim).expect("create target");
+    target
+        .create(&target_claim, &AdmittedDescriptor::default_for_test())
+        .expect("create target");
 
     let env1 = sample_genesis_envelope(1, 0xbb, b"nats_valid1");
     let broken_env = EventEnvelope {
@@ -195,8 +209,9 @@ fn test_m6_nats_broken_chain_election() {
     writer.append_envelope_verdict(&env1).expect("append env1");
     let mut broken_buf = Vec::new();
     broken_env.encode(&mut broken_buf);
-    writer
-        .append_unvalidated_frame(&broken_buf)
+    drop(writer);
+    source
+        .append_unvalidated_frame_for_test(&broken_buf)
         .expect("append broken raw frame");
 
     let mut src_reader = source.open_read().expect("open source reader");
@@ -229,9 +244,13 @@ fn test_m6_nats_policies_and_dense_rechaining() {
     let target = NatsStorageAdapter::new(server.url(), &dst_stem).expect("connect dst");
 
     let claim = sample_claim(1);
-    let mut writer = source.create(&claim).expect("create source");
+    let mut writer = source
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create source");
     let target_claim = sample_claim(1);
-    target.create(&target_claim).expect("create target");
+    target
+        .create(&target_claim, &AdmittedDescriptor::default_for_test())
+        .expect("create target");
 
     let a1 = sample_genesis_envelope(1, 0x44, b"nats_k1");
     let comm_a1 = a1.commitment();

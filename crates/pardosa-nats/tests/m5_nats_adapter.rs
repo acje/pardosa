@@ -108,11 +108,8 @@ fn test_m5_c8_2_schema_completeness_on_nats_adapter() {
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
     let claim = sample_claim(1);
 
-    let mut writer = adapter.create(&claim).expect("create writer");
     let admitted = AdmittedDescriptor::try_from_descriptor(valid_schema.clone()).unwrap();
-    writer
-        .set_schema_descriptor(&admitted)
-        .expect("set schema descriptor");
+    let writer = adapter.create(&claim, &admitted).expect("create writer");
     drop(writer);
 
     let reader = adapter.open_read().expect("open read");
@@ -142,13 +139,15 @@ fn test_m5_format_vectors_roundtrip_on_nats_adapter() {
             let (env, _) = EventEnvelope::decode(&bytes).unwrap();
             let stem = unique_stem(&format!("format_vec_{idx}"));
             let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
-            let mut writer = adapter.create(&claim).expect("create writer");
+            let writer = adapter
+                .create(&claim, &AdmittedDescriptor::default_for_test())
+                .expect("create writer");
+            drop(writer);
             let mut env_buf = Vec::new();
             env.encode(&mut env_buf);
-            writer
-                .append_unvalidated_frame(&env_buf)
+            adapter
+                .append_unvalidated_frame_for_test(&env_buf)
                 .expect("append raw frame");
-            drop(writer);
 
             let mut reader = adapter.open_read().expect("open reader");
             let read_envelopes = reader
@@ -178,10 +177,14 @@ fn test_m5_nats_strict_create_and_open() {
     );
 
     let claim = sample_claim(1);
-    let writer = adapter.create(&claim).expect("create writer");
+    let writer = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create writer");
     assert_eq!(writer.carried_epoch(), 1);
 
-    let dup_err = adapter.create(&claim).unwrap_err();
+    let dup_err = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .unwrap_err();
     assert_eq!(dup_err.condition(), &FailureCondition::StoreAlreadyExists);
 
     adapter.delete_streams().expect("cleanup");
@@ -194,15 +197,17 @@ fn test_m5_nats_two_writer_occ_exclusion() {
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
     let claim = sample_claim(1);
 
-    let mut writer1 = adapter.create(&claim).expect("create writer 1");
+    let mut writer1 = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create writer 1");
     let mut writer2 = adapter.open_write(1).expect("open writer 2");
 
-    let count1 = writer1
-        .append_raw_frame(b"event-from-w1")
-        .expect("w1 append");
-    assert_eq!(count1, 1);
+    let env1 = EventEnvelope::genesis([1; 16], [2; 16], b"event-from-w1").unwrap();
+    let count1 = writer1.append_envelope_verdict(&env1).expect("w1 append");
+    assert_eq!(count1, WriteLandingVerdict::Landed(1));
 
-    let conflict = writer2.append_raw_frame(b"event-from-w2").unwrap_err();
+    let env2 = EventEnvelope::genesis([2; 16], [3; 16], b"event-from-w2").unwrap();
+    let conflict = writer2.append_envelope_verdict(&env2).unwrap_err();
     assert_eq!(conflict.condition(), &FailureCondition::ConcurrencyConflict);
 
     adapter.delete_streams().expect("cleanup");
@@ -215,15 +220,19 @@ fn test_m5_nats_per_landing_epoch_verification() {
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
     let claim1 = sample_claim(1);
 
-    let mut writer1 = adapter.create(&claim1).expect("create writer 1");
-    let _ = writer1.append_raw_frame(b"event-1").expect("append 1");
+    let mut writer1 = adapter
+        .create(&claim1, &AdmittedDescriptor::default_for_test())
+        .expect("create writer 1");
+    let env1 = EventEnvelope::genesis([1; 16], [2; 16], b"event-1").unwrap();
+    let _ = writer1.append_envelope_verdict(&env1).expect("append 1");
 
     let claim2 = sample_claim(2);
     adapter
         .record_ownership_claim_for_test(&claim2)
         .expect("supersede with epoch 2");
 
-    let stale = writer1.append_raw_frame(b"event-2").unwrap_err();
+    let env2 = EventEnvelope::genesis([2; 16], [3; 16], b"event-2").unwrap();
+    let stale = writer1.append_envelope_verdict(&env2).unwrap_err();
     assert_eq!(stale.condition(), &FailureCondition::StaleEpoch);
 
     adapter.delete_streams().expect("cleanup");
@@ -236,7 +245,9 @@ fn test_m5_nats_indeterminate_landing_verdict() {
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect");
     let claim = sample_claim(1);
 
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create writer");
     let env1 = EventEnvelope::genesis([0x01; 16], [0xaa; 16], b"event-1").unwrap();
     let mut buf1 = Vec::new();
     env1.encode(&mut buf1);

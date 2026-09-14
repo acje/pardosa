@@ -2,9 +2,9 @@
 
 use crate::encoding::{
     InboundPointerRecord, MigrationEndRecord, MigrationStartRecord, OutboundPointerRecord,
-    OwnershipClaimRecord, OwnershipRecord, RescuePolicyChoiceRecord,
+    OwnershipClaimRecord, RescuePolicyChoiceRecord,
 };
-use crate::schema::{AdmittedDescriptor, SchemaDescriptor};
+use crate::schema::SchemaDescriptor;
 use crate::store::{OpenAdmission, OperationFailure, WriteLandingVerdict};
 
 /// Callback invoked for each recovered frame during incremental recovery.
@@ -152,85 +152,28 @@ pub trait StorageEngine {
     /// Returns the schema descriptor attached to this artefact, if present.
     fn schema_descriptor(&self) -> Option<&SchemaDescriptor>;
 
-    /// Attaches or updates the schema descriptor on this artefact.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if writing descriptor fails.
-    fn set_schema_descriptor(
-        &mut self,
-        descriptor: &AdmittedDescriptor,
-    ) -> Result<(), OperationFailure>;
-
-    /// Records an ownership record into metadata.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if recording fails.
-    fn record_meta_record(&mut self, record: &OwnershipRecord) -> Result<(), OperationFailure>;
-
     /// Returns the outbound pointer record, if recorded.
-    fn outbound_pointer(&self) -> Option<&OutboundPointerRecord>;
+    fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
+        None
+    }
 
     /// Returns the inbound pointer record, if recorded.
-    fn inbound_pointer(&self) -> Option<&InboundPointerRecord>;
+    fn inbound_pointer(&self) -> Option<&InboundPointerRecord> {
+        None
+    }
 
     /// Returns the migration start record, if recorded.
-    fn migration_start(&self) -> Option<&MigrationStartRecord>;
+    fn migration_start(&self) -> Option<&MigrationStartRecord> {
+        None
+    }
 
     /// Returns the migration end record, if recorded.
-    fn migration_end(&self) -> Option<&MigrationEndRecord>;
+    fn migration_end(&self) -> Option<&MigrationEndRecord> {
+        None
+    }
 
     /// Returns the rescue policy choice record, if recorded.
-    fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord>;
-
-    /// Appends an outbound pointer record to metadata.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if recording fails.
-    fn record_outbound_pointer(
-        &mut self,
-        pointer: &OutboundPointerRecord,
-    ) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::OutboundPointer(pointer.clone()))
-    }
-
-    /// Appends an inbound pointer record to metadata.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if recording fails.
-    fn record_inbound_pointer(
-        &mut self,
-        pointer: &InboundPointerRecord,
-    ) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::InboundPointer(pointer.clone()))
-    }
-
-    /// Appends a migration start record to metadata.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if recording fails.
-    fn record_migration_start(
-        &mut self,
-        start: &MigrationStartRecord,
-    ) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::MigrationStart(start.clone()))
-    }
-
-    /// Appends a migration end record to metadata.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if recording fails.
-    fn record_migration_end(&mut self, end: &MigrationEndRecord) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::MigrationEnd(end.clone()))
-    }
-
-    /// Appends a rescue policy choice record to metadata.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if recording fails.
-    fn record_rescue_policy_choice(
-        &mut self,
-        choice: &RescuePolicyChoiceRecord,
-    ) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::RescuePolicyChoice(choice.clone()))
+    fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
+        None
     }
 }

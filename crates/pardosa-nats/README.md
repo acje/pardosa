@@ -32,7 +32,10 @@ let claim = OwnershipClaimRecord {
     claim_time_ns: 2_000_000,
     operator_label: "service-worker".to_string(),
 };
-let mut writer = adapter.create(&claim)?;
+let descriptor = AdmittedDescriptor::try_from_descriptor(
+    SchemaDescriptor::new(1, DescriptorNode::U64)
+)?;
+let mut writer = adapter.create(&claim, &descriptor)?;
 
 // Derive deterministic fiber ID and append event
 let fiber_id = derive_fiber_id("order-9876");
