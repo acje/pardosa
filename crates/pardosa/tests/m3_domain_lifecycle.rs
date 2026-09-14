@@ -698,46 +698,55 @@ fn run_rustc(code: &str) -> (bool, String) {
         .expect("parent deps directory")
         .to_path_buf();
 
-    let target_debug = deps_dir.parent().expect("target/debug dir");
-    let lib_rlib = target_debug.join("libpardosa.rlib");
-    if !lib_rlib.exists() {
-        let cargo_cmd = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-        let _ = Command::new(&cargo_cmd)
-            .args(["build", "-p", "pardosa", "--lib"])
-            .output();
+    let cargo_cmd = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let output = Command::new(&cargo_cmd)
+        .args(["build", "-p", "pardosa", "--lib", "--message-format=json"])
+        .output()
+        .expect("invoke cargo build for pardosa");
+    if !output.status.success() {
+        panic!(
+            "cargo build failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
-    let rlib = if lib_rlib.exists() {
-        lib_rlib
-    } else {
-        let entries = std::fs::read_dir(&deps_dir)
-            .unwrap_or_else(|e| panic!("failed to read deps dir {}: {e}", deps_dir.display()));
-        let mut rlibs = Vec::new();
-        for entry in entries {
-            let entry = entry
-                .unwrap_or_else(|e| panic!("failed to read entry in {}: {e}", deps_dir.display()));
-            let p = entry.path();
-            if let Some(s) = p.file_name().and_then(|n| n.to_str()) {
-                if s.starts_with("libpardosa-") && s.ends_with(".rlib") {
-                    rlibs.push(p.clone());
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let mut rlib_path: Option<std::path::PathBuf> = None;
+    for line in stdout_str.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if val.get("reason").and_then(|r| r.as_str()) == Some("compiler-artifact") {
+                let target = val.get("target");
+                let name = target.and_then(|t| t.get("name")).and_then(|n| n.as_str());
+                let kind = target
+                    .and_then(|t| t.get("kind"))
+                    .and_then(|k| k.as_array());
+                let is_lib = kind.is_some_and(|arr| arr.iter().any(|k| k.as_str() == Some("lib")));
+                if name == Some("pardosa") && is_lib {
+                    if let Some(filenames) = val.get("filenames").and_then(|f| f.as_array()) {
+                        for fname in filenames {
+                            if let Some(s) = fname.as_str() {
+                                if s.ends_with(".rlib") {
+                                    rlib_path = Some(std::path::PathBuf::from(s));
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
-        match rlibs.len() {
-            0 => panic!(
-                "could not locate libpardosa rlib in deps directory: {}",
-                deps_dir.display()
-            ),
-            1 => rlibs.remove(0),
-            _ => {
-                rlibs.sort_by_key(|p| {
-                    std::fs::metadata(p)
-                        .and_then(|m| m.modified())
-                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-                });
-                rlibs.pop().unwrap()
-            }
-        }
-    };
+    }
+
+    let rlib = rlib_path.unwrap_or_else(|| {
+        panic!(
+            "could not locate pardosa rlib in cargo build output: {}",
+            stdout_str
+        )
+    });
 
     let rustc_cmd = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
     let mut cmd = Command::new(&rustc_cmd);
