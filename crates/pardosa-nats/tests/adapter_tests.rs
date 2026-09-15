@@ -2510,9 +2510,64 @@ fn test_nats_data_stream_missing_seq1_fails_closed() {
 }
 
 #[test]
-fn test_nats_open_write_both_presence_missing_or_invalid_schema_descriptor_fails_closed() {
+fn test_nats_complete_creation_missing_descriptor_fails_closed() {
     let server = LiveNatsServer::acquire();
-    let stem = unique_stem("both_missing_schema_desc");
+    let stem = unique_stem("nats_complete_missing_desc");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
+    let claim = sample_claim(1);
+
+    adapter
+        .create_incomplete_meta_only(&claim)
+        .expect("create incomplete meta");
+
+    assert_eq!(
+        adapter.try_presence().unwrap(),
+        ArtefactPresence::OwnershipRecordOnly
+    );
+
+    let err = adapter
+        .complete_creation(&claim)
+        .expect_err("complete_creation must fail when descriptor missing");
+    assert_eq!(*err.condition(), FailureCondition::MissingSchemaDescriptor);
+
+    adapter.delete_streams().expect("cleanup");
+}
+
+#[test]
+fn test_nats_complete_creation_persisted_invalid_descriptor_fails_closed() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("nats_complete_invalid_desc");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
+    let claim = sample_claim(1);
+
+    adapter
+        .create_incomplete_meta_only(&claim)
+        .expect("create incomplete meta");
+
+    adapter
+        .record_meta_record_for_test(&OwnershipRecord::SchemaDescriptor {
+            schema_version: 0,
+            descriptor_bytes: vec![1],
+        })
+        .expect("record invalid version 0 descriptor");
+
+    assert_eq!(
+        adapter.try_presence().unwrap(),
+        ArtefactPresence::OwnershipRecordOnly
+    );
+
+    let err = adapter
+        .complete_creation(&claim)
+        .expect_err("complete_creation must fail when descriptor has invalid version 0");
+    assert_eq!(*err.condition(), FailureCondition::MissingSchemaDescriptor);
+
+    adapter.delete_streams().expect("cleanup");
+}
+
+#[test]
+fn test_nats_open_write_both_missing_descriptor_fails_closed() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("nats_both_missing_desc");
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
     let claim = sample_claim(1);
 
@@ -2558,13 +2613,24 @@ fn test_nats_open_write_both_presence_missing_or_invalid_schema_descriptor_fails
 
     assert_eq!(adapter.try_presence().unwrap(), ArtefactPresence::Both);
 
-    let err_missing = adapter
+    let err = adapter
         .open_write(1)
         .expect_err("open_write must fail when descriptor missing in Both presence");
-    assert_eq!(
-        *err_missing.condition(),
-        FailureCondition::MissingSchemaDescriptor
-    );
+    assert_eq!(*err.condition(), FailureCondition::MissingSchemaDescriptor);
+
+    adapter.delete_streams().expect("cleanup");
+}
+
+#[test]
+fn test_nats_open_write_both_persisted_invalid_descriptor_fails_closed() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("nats_both_invalid_desc");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
+    let claim = sample_claim(1);
+
+    adapter
+        .create_incomplete_meta_only(&claim)
+        .expect("create incomplete meta");
 
     adapter
         .record_meta_record_for_test(&OwnershipRecord::SchemaDescriptor {
@@ -2573,15 +2639,48 @@ fn test_nats_open_write_both_presence_missing_or_invalid_schema_descriptor_fails
         })
         .expect("record invalid version 0 descriptor");
 
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        let client = async_nats::connect(server.url())
+            .await
+            .expect("connect async_nats");
+        let js = async_nats::jetstream::new(client);
+        js.create_stream(async_nats::jetstream::stream::Config {
+            name: adapter.data_stream_name().to_string(),
+            subjects: vec![adapter.data_subject().to_string()],
+            storage: async_nats::jetstream::stream::StorageType::File,
+            ..Default::default()
+        })
+        .await
+        .expect("create data stream");
+
+        let header_bytes = ContainerHeader::new().to_bytes();
+        let mut init_data_headers = async_nats::HeaderMap::new();
+        init_data_headers.insert(
+            async_nats::header::NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
+            async_nats::HeaderValue::from(0),
+        );
+        init_data_headers.insert(
+            async_nats::header::NATS_EXPECTED_STREAM,
+            async_nats::HeaderValue::from(adapter.data_stream_name()),
+        );
+        js.publish_with_headers(
+            adapter.data_subject().to_string(),
+            init_data_headers,
+            header_bytes.to_vec().into(),
+        )
+        .await
+        .expect("publish header to data stream")
+        .await
+        .expect("ack header on data stream");
+    });
+
     assert_eq!(adapter.try_presence().unwrap(), ArtefactPresence::Both);
 
-    let err_invalid = adapter
+    let err = adapter
         .open_write(1)
         .expect_err("open_write must fail when descriptor has invalid version 0 in Both presence");
-    assert_eq!(
-        *err_invalid.condition(),
-        FailureCondition::MissingSchemaDescriptor
-    );
+    assert_eq!(*err.condition(), FailureCondition::MissingSchemaDescriptor);
 
     adapter.delete_streams().expect("cleanup");
 }

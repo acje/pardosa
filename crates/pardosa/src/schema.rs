@@ -12,6 +12,21 @@ pub use floats::{EventF32, EventF64, OrderedF32, OrderedF64};
 /// Maximum recursion depth allowed during descriptor AST decoding to prevent cycles.
 pub const MAX_DESCRIPTOR_DEPTH: usize = 16;
 
+/// Maximum encoded descriptor record size in bytes per C8.2 (64 KiB).
+pub const MAX_DESCRIPTOR_RECORD_BYTES: usize = 65536;
+
+pub(crate) fn check_descriptor_record_len(len: usize) -> Result<(), OperationFailure> {
+    if u32::try_from(len).is_err() || len > MAX_DESCRIPTOR_RECORD_BYTES {
+        return Err(OperationFailure::new(
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            },
+            format!("encoded descriptor record exceeds 64 KiB: {len}"),
+        ));
+    }
+    Ok(())
+}
+
 /// A field within a struct descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldDescriptor {
@@ -143,11 +158,16 @@ impl DescriptorNode {
     ///
     /// # Errors
     /// Returns `EncodeError::DepthExceeded` if recursion depth exceeds `MAX_DESCRIPTOR_DEPTH`.
-    /// Returns `EncodeError::Custom` if a discriminant exceeds its width.
+    /// Returns `EncodeError::Custom` if a discriminant exceeds its width or if wire length exceeds `u32::MAX`.
     pub fn encode(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
         self.encode_recursive(buf, 0)
     }
 
+    /// Recursively serializes this descriptor node into binary AST format.
+    ///
+    /// # Errors
+    /// Returns `EncodeError::DepthExceeded` if recursion depth exceeds `MAX_DESCRIPTOR_DEPTH`.
+    /// Returns `EncodeError::Custom` if a discriminant exceeds its width or if wire length exceeds `u32::MAX`.
     fn encode_recursive(&self, buf: &mut Vec<u8>, depth: usize) -> Result<(), EncodeError> {
         if depth > MAX_DESCRIPTOR_DEPTH {
             return Err(EncodeError::DepthExceeded {
@@ -671,7 +691,9 @@ impl AdmittedDescriptor {
     ///
     /// # Errors
     /// Returns [`OperationFailure`] if the schema descriptor violates structural completeness,
-    /// has version 0, depth > 16, invalid or duplicate discriminants, or invalid widths.
+    /// has version 0, depth > 16, invalid or duplicate discriminants, invalid widths,
+    /// encoding wire length overflow, or if the encoded descriptor record exceeds
+    /// [`MAX_DESCRIPTOR_RECORD_BYTES`] (64 KiB per C8.2).
     pub fn try_from_descriptor(descriptor: SchemaDescriptor) -> Result<Self, OperationFailure> {
         descriptor.validate_structural_completeness()?;
         let mut desc_bytes = Vec::new();
@@ -689,6 +711,7 @@ impl AdmittedDescriptor {
         };
         let mut encoded_record = Vec::new();
         desc_record.encode(&mut encoded_record);
+        check_descriptor_record_len(encoded_record.len())?;
         let identity = SchemaIdentity::from_raw(*blake3::hash(&encoded_record[1..]).as_bytes());
         Ok(Self {
             descriptor,
@@ -929,7 +952,7 @@ impl SchemaIdentity {
     /// Computes schema identity from schema version and descriptor AST root, propagating encoding errors.
     ///
     /// # Errors
-    /// Returns [`EncodeError`] if descriptor encoding fails (e.g. recursion depth exceeds 16 or invalid discriminant width).
+    /// Returns [`EncodeError`] if descriptor encoding fails (e.g. recursion depth exceeds 16, invalid discriminant width, or wire length overflow).
     pub fn try_from_descriptor(version: u32, root: &DescriptorNode) -> Result<Self, EncodeError> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&version.to_le_bytes());
@@ -1913,5 +1936,21 @@ mod tests {
                 constraint: ValueConstraint::TooLong
             }
         ));
+    }
+
+    #[test]
+    fn test_descriptor_record_len_boundary_allocation_free() {
+        assert!(check_descriptor_record_len(MAX_DESCRIPTOR_RECORD_BYTES).is_ok());
+        let err = check_descriptor_record_len(MAX_DESCRIPTOR_RECORD_BYTES + 1).unwrap_err();
+        match err.condition() {
+            FailureCondition::ValueConstraintViolated { constraint } => {
+                assert_eq!(constraint, &ValueConstraint::TooLong);
+            }
+            other => panic!("expected ValueConstraintViolated, got {other:?}"),
+        }
+        assert_eq!(
+            err.diagnostic_detail().message(),
+            "encoded descriptor record exceeds 64 KiB: 65537"
+        );
     }
 }

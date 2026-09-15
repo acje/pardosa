@@ -1,9 +1,9 @@
 //! Container format and framing for Pardosa artefacts.
 
 use crate::encoding::{
-    DecodeError, EventEnvelope, EventEnvelopeRef, InboundPointerRecord, MigrationEndRecord,
-    MigrationStartRecord, OutboundPointerRecord, OwnershipClaimRecord, OwnershipRecord,
-    RescuePolicyChoiceRecord, ValueConstraint,
+    DecodeError, EncodeError, EventEnvelope, EventEnvelopeRef, InboundPointerRecord,
+    MigrationEndRecord, MigrationStartRecord, OutboundPointerRecord, OwnershipClaimRecord,
+    OwnershipRecord, RescuePolicyChoiceRecord, ValueConstraint,
 };
 use crate::schema::{AdmittedDescriptor, DescriptorNode, SchemaDescriptor};
 use crate::store::{
@@ -108,12 +108,32 @@ impl ContainerFrame {
     }
 
     /// Encodes a payload into container framing format (length + payload + CRC32C).
+    ///
+    /// # Panics
+    /// Panics if `payload.len()` exceeds `u32::MAX` per C3.4 framing.
     pub fn encode_payload(payload: &[u8], buf: &mut Vec<u8>) {
-        let len = payload.len() as u32;
+        let len =
+            u32::try_from(payload.len()).expect("payload length must fit u32 per C3.4 framing");
         buf.extend_from_slice(&len.to_le_bytes());
         buf.extend_from_slice(payload);
         let crc = crc32c::crc32c(payload);
         buf.extend_from_slice(&crc.to_le_bytes());
+    }
+
+    /// Tries to encode a payload into container framing format (length + payload + CRC32C).
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::LengthExceeded`] if `payload.len()` exceeds `u32::MAX`.
+    pub fn try_encode_payload(payload: &[u8], buf: &mut Vec<u8>) -> Result<(), EncodeError> {
+        let len = u32::try_from(payload.len()).map_err(|_| EncodeError::LengthExceeded {
+            length: payload.len(),
+            max: u32::MAX as usize,
+        })?;
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(payload);
+        let crc = crc32c::crc32c(payload);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        Ok(())
     }
 
     /// Decodes a framed chunk from a byte slice.
@@ -1824,6 +1844,16 @@ mod tests {
         let payload = b"Hello, Pardosa Container!".to_vec();
         let mut buf = Vec::new();
         ContainerFrame::encode_payload(&payload, &mut buf);
+        let (decoded, consumed) = ContainerFrame::decode(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn test_container_frame_try_encode_payload_roundtrip() {
+        let payload = b"Hello, Pardosa Container!".to_vec();
+        let mut buf = Vec::new();
+        ContainerFrame::try_encode_payload(&payload, &mut buf).unwrap();
         let (decoded, consumed) = ContainerFrame::decode(&buf).unwrap();
         assert_eq!(consumed, buf.len());
         assert_eq!(decoded, payload);
