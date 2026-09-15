@@ -532,38 +532,12 @@ pub struct FileStorageAdapter {
     exclusion_policy: FileExclusionPolicy,
 }
 
-#[cfg(any(test, feature = "unstable-test-support"))]
 /// Computes the serialized wire length of an ownership claim record bounded by a maximum wire length.
 ///
 /// # Errors
 /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] and
 /// [`ValueConstraint::TooLong`] if the wire length overflows `usize` or exceeds `max_wire_len` or `u32::MAX`.
 pub fn compute_claim_wire_len_bounded(
-    label_len: usize,
-    max_wire_len: usize,
-) -> Result<u32, OperationFailure> {
-    let base = 69usize;
-    let total = base.checked_add(label_len).ok_or_else(|| {
-        OperationFailure::new(
-            FailureCondition::ValueConstraintViolated {
-                constraint: ValueConstraint::TooLong,
-            },
-            "claim wire length overflows usize",
-        )
-    })?;
-    if total > max_wire_len || total > u32::MAX as usize {
-        return Err(OperationFailure::new(
-            FailureCondition::ValueConstraintViolated {
-                constraint: ValueConstraint::TooLong,
-            },
-            format!("claim wire length {total} exceeds maximum frame limit ({max_wire_len})"),
-        ));
-    }
-    Ok(total as u32)
-}
-
-#[cfg(not(any(test, feature = "unstable-test-support")))]
-pub(crate) fn compute_claim_wire_len_bounded(
     label_len: usize,
     max_wire_len: usize,
 ) -> Result<u32, OperationFailure> {
@@ -706,13 +680,6 @@ impl FileStorageAdapter {
         })
     }
 
-    /// Creates the artefact files exclusively with initial ownership claim per C5.10, C5.64, and C12.3.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::StoreAlreadyExists`] if artefact already exists.
-    /// Returns [`OperationFailure`] with [`FailureCondition::ExclusionUnavailable`] or
-    /// [`FailureCondition::AnotherOwnerHoldsExclusion`] if writer exclusion fails.
-    /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] if initial claim exceeds `u32::MAX`.
     fn create_with_limit(
         &self,
         initial_claim: &OwnershipClaimRecord,
@@ -869,7 +836,9 @@ impl FileStorageAdapter {
     /// Creates the artefact files with an injected maximum wire length bound for testing.
     ///
     /// # Errors
-    /// Returns [`OperationFailure`] if store already exists or claim wire length exceeds `max_wire_len`.
+    /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] if claim wire length
+    /// overflows `usize` or exceeds `max_wire_len` or `u32::MAX`.
+    /// Propagates any creation failure documented on [`Self::create`].
     #[cfg(any(test, feature = "unstable-test-support"))]
     pub fn create_with_claim_bound(
         &self,

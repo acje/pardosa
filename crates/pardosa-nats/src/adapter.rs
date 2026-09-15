@@ -1,8 +1,5 @@
 //! JetStream storage adapter implementation for Pardosa.
 
-#[cfg(not(any(test, feature = "unstable-test-support")))]
-use pardosa::file::compute_claim_wire_len;
-#[cfg(any(test, feature = "unstable-test-support"))]
 use pardosa::file::compute_claim_wire_len_bounded;
 use pardosa::file::CONTAINER_FORMAT_VERSION;
 use pardosa::prelude::*;
@@ -775,12 +772,6 @@ impl NatsStorageAdapter {
         })
     }
 
-    /// Creates the artefact streams exclusively with initial ownership claim and schema descriptor per C5.10, C5.64, C8.2, and C12.3.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::StoreAlreadyExists`] if artefact already exists.
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if creation fails.
-    /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] if initial claim exceeds `u32::MAX`.
     fn create_with_limit(
         &self,
         initial_claim: &OwnershipClaimRecord,
@@ -788,14 +779,7 @@ impl NatsStorageAdapter {
         max_wire_len: usize,
     ) -> Result<NatsWriterSession, OperationFailure> {
         admit_create(self.try_presence()?)?;
-
-        #[cfg(any(test, feature = "unstable-test-support"))]
         let _ = compute_claim_wire_len_bounded(initial_claim.operator_label.len(), max_wire_len)?;
-        #[cfg(not(any(test, feature = "unstable-test-support")))]
-        {
-            let _ = max_wire_len;
-            let _ = compute_claim_wire_len(initial_claim.operator_label.len())?;
-        }
 
         let js = self.js.clone();
         let client = self.client.clone();
@@ -1116,7 +1100,9 @@ impl NatsStorageAdapter {
     /// Creates the artefact streams with an injected maximum wire length bound for testing.
     ///
     /// # Errors
-    /// Returns [`OperationFailure`] if creation fails or initial claim wire length exceeds `max_wire_len`.
+    /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] if claim wire length
+    /// overflows `usize` or exceeds `max_wire_len` or `u32::MAX`.
+    /// Propagates any creation failure documented on [`Self::create`].
     #[cfg(any(test, feature = "unstable-test-support"))]
     pub fn create_with_claim_bound(
         &self,
