@@ -12,7 +12,7 @@ pub use floats::{EventF32, EventF64, OrderedF32, OrderedF64};
 /// Maximum recursion depth allowed during descriptor AST decoding to prevent cycles.
 pub const MAX_DESCRIPTOR_DEPTH: usize = 16;
 
-/// Maximum encoded descriptor record size in bytes per C8.2 (64 KiB).
+/// Authorized implementation bound: 64 KiB maximum encoded descriptor record size to prevent unbounded metadata allocations.
 pub const MAX_DESCRIPTOR_RECORD_BYTES: usize = 65536;
 
 pub(crate) fn check_descriptor_record_len(len: usize) -> Result<(), OperationFailure> {
@@ -157,17 +157,12 @@ impl DescriptorNode {
     /// Serializes this descriptor node into binary AST format per C6.23.
     ///
     /// # Errors
-    /// Returns `EncodeError::DepthExceeded` if recursion depth exceeds `MAX_DESCRIPTOR_DEPTH`.
+    /// Returns `EncodeError::DepthExceeded` if recursion depth exceeds `MAX_DESCRIPTOR_DEPTH` (16).
     /// Returns `EncodeError::Custom` if a discriminant exceeds its width or if wire length exceeds `u32::MAX`.
     pub fn encode(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
         self.encode_recursive(buf, 0)
     }
 
-    /// Recursively serializes this descriptor node into binary AST format.
-    ///
-    /// # Errors
-    /// Returns `EncodeError::DepthExceeded` if recursion depth exceeds `MAX_DESCRIPTOR_DEPTH`.
-    /// Returns `EncodeError::Custom` if a discriminant exceeds its width or if wire length exceeds `u32::MAX`.
     fn encode_recursive(&self, buf: &mut Vec<u8>, depth: usize) -> Result<(), EncodeError> {
         if depth > MAX_DESCRIPTOR_DEPTH {
             return Err(EncodeError::DepthExceeded {
@@ -600,7 +595,8 @@ impl SchemaDescriptor {
     /// Encodes this schema descriptor into wire format (version + AST).
     ///
     /// # Errors
-    /// Returns `EncodeError` on AST encoding failure.
+    /// Returns `EncodeError::DepthExceeded` if recursion depth exceeds `MAX_DESCRIPTOR_DEPTH` (16).
+    /// Returns `EncodeError::Custom` if a discriminant exceeds its width or if wire length exceeds `u32::MAX`.
     pub fn encode(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
         buf.extend_from_slice(&self.version.to_le_bytes());
         self.root.encode(buf)
@@ -678,6 +674,73 @@ impl SchemaDescriptor {
     }
 }
 
+fn check_ast_string_lengths(node: &DescriptorNode) -> Result<(), OperationFailure> {
+    match node {
+        DescriptorNode::Struct { name, fields } => {
+            if name.len() > MAX_DESCRIPTOR_RECORD_BYTES {
+                return Err(OperationFailure::new(
+                    FailureCondition::ValueConstraintViolated {
+                        constraint: ValueConstraint::TooLong,
+                    },
+                    format!(
+                        "struct name exceeds maximum descriptor record bytes: {}",
+                        name.len()
+                    ),
+                ));
+            }
+            for f in fields {
+                if f.name.len() > MAX_DESCRIPTOR_RECORD_BYTES {
+                    return Err(OperationFailure::new(
+                        FailureCondition::ValueConstraintViolated {
+                            constraint: ValueConstraint::TooLong,
+                        },
+                        format!(
+                            "struct field name exceeds maximum descriptor record bytes: {}",
+                            f.name.len()
+                        ),
+                    ));
+                }
+                check_ast_string_lengths(&f.node)?;
+            }
+            Ok(())
+        }
+        DescriptorNode::Enum { name, variants, .. } => {
+            if name.len() > MAX_DESCRIPTOR_RECORD_BYTES {
+                return Err(OperationFailure::new(
+                    FailureCondition::ValueConstraintViolated {
+                        constraint: ValueConstraint::TooLong,
+                    },
+                    format!(
+                        "enum name exceeds maximum descriptor record bytes: {}",
+                        name.len()
+                    ),
+                ));
+            }
+            for v in variants {
+                if v.name.len() > MAX_DESCRIPTOR_RECORD_BYTES {
+                    return Err(OperationFailure::new(
+                        FailureCondition::ValueConstraintViolated {
+                            constraint: ValueConstraint::TooLong,
+                        },
+                        format!(
+                            "enum variant name exceeds maximum descriptor record bytes: {}",
+                            v.name.len()
+                        ),
+                    ));
+                }
+                if let Some(payload) = &v.payload {
+                    check_ast_string_lengths(payload)?;
+                }
+            }
+            Ok(())
+        }
+        DescriptorNode::EventVec { inner, .. } | DescriptorNode::Option { inner } => {
+            check_ast_string_lengths(inner)
+        }
+        _ => Ok(()),
+    }
+}
+
 /// A validated schema descriptor guaranteed to be structurally complete and admitted per C8.2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmittedDescriptor {
@@ -692,10 +755,12 @@ impl AdmittedDescriptor {
     /// # Errors
     /// Returns [`OperationFailure`] if the schema descriptor violates structural completeness,
     /// has version 0, depth > 16, invalid or duplicate discriminants, invalid widths,
+    /// root AST string lengths exceed [`MAX_DESCRIPTOR_RECORD_BYTES`],
     /// encoding wire length overflow, or if the encoded descriptor record exceeds
     /// [`MAX_DESCRIPTOR_RECORD_BYTES`] (64 KiB per C8.2).
     pub fn try_from_descriptor(descriptor: SchemaDescriptor) -> Result<Self, OperationFailure> {
         descriptor.validate_structural_completeness()?;
+        check_ast_string_lengths(&descriptor.root)?;
         let mut desc_bytes = Vec::new();
         descriptor.root.encode(&mut desc_bytes).map_err(|err| {
             OperationFailure::new(
@@ -705,6 +770,17 @@ impl AdmittedDescriptor {
                 format!("schema descriptor encoding failed: {err}"),
             )
         })?;
+        if desc_bytes.len() > MAX_DESCRIPTOR_RECORD_BYTES {
+            return Err(OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                },
+                format!(
+                    "encoded descriptor AST exceeds 64 KiB: {}",
+                    desc_bytes.len()
+                ),
+            ));
+        }
         let desc_record = OwnershipRecord::SchemaDescriptor {
             schema_version: descriptor.version,
             descriptor_bytes: desc_bytes,
@@ -1952,5 +2028,62 @@ mod tests {
             err.diagnostic_detail().message(),
             "encoded descriptor record exceeds 64 KiB: 65537"
         );
+    }
+
+    #[test]
+    fn test_descriptor_exact_wire_boundary_struct_admission() {
+        let exact_field_len = 65516;
+        let desc_exact = SchemaDescriptor::new(
+            1,
+            DescriptorNode::Struct {
+                name: "S".to_string(),
+                fields: vec![FieldDescriptor {
+                    name: "f".repeat(exact_field_len),
+                    node: DescriptorNode::U8,
+                }],
+            },
+        );
+        let admitted = AdmittedDescriptor::try_from_descriptor(desc_exact)
+            .expect("exact 65,536 bytes must be admitted");
+        assert_eq!(admitted.encoded_record().len(), 65536);
+
+        let over_field_len = 65517;
+        let desc_over = SchemaDescriptor::new(
+            1,
+            DescriptorNode::Struct {
+                name: "S".to_string(),
+                fields: vec![FieldDescriptor {
+                    name: "f".repeat(over_field_len),
+                    node: DescriptorNode::U8,
+                }],
+            },
+        );
+        let err = AdmittedDescriptor::try_from_descriptor(desc_over)
+            .expect_err("65,537 bytes must be rejected");
+        match err.condition() {
+            FailureCondition::ValueConstraintViolated { constraint } => {
+                assert_eq!(constraint, &ValueConstraint::TooLong);
+            }
+            other => panic!("expected ValueConstraintViolated, got {other:?}"),
+        }
+
+        let huge_name_desc = SchemaDescriptor::new(
+            1,
+            DescriptorNode::Struct {
+                name: "S".repeat(MAX_DESCRIPTOR_RECORD_BYTES + 1),
+                fields: vec![FieldDescriptor {
+                    name: "f".to_string(),
+                    node: DescriptorNode::U8,
+                }],
+            },
+        );
+        let err_huge = AdmittedDescriptor::try_from_descriptor(huge_name_desc)
+            .expect_err("AST string exceeding bound must be rejected before allocation");
+        match err_huge.condition() {
+            FailureCondition::ValueConstraintViolated { constraint } => {
+                assert_eq!(constraint, &ValueConstraint::TooLong);
+            }
+            other => panic!("expected ValueConstraintViolated, got {other:?}"),
+        }
     }
 }

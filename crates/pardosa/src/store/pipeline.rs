@@ -3,6 +3,7 @@
 use crate::encoding::{
     EventEnvelope, EventEnvelopeRef, InboundPointerRecord, MigrationEndRecord,
     MigrationStartRecord, OutboundPointerRecord, OwnershipClaimRecord, RescuePolicyChoiceRecord,
+    ValueConstraint,
 };
 use crate::file::{ContainerFrame, RollingCommitment};
 use crate::schema::{derive_fiber_id, SchemaDescriptor};
@@ -374,7 +375,14 @@ impl<E: StorageEngine> Store<E> {
         self.fiber_index.validate_append(&env)?;
 
         let mut frame_buf = Vec::new();
-        ContainerFrame::encode_payload(payload, &mut frame_buf);
+        ContainerFrame::try_encode_payload(payload, &mut frame_buf).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                },
+                format!("frame encoding failed: {err}"),
+            )
+        })?;
 
         let verdict = self.engine.append_block(&frame_buf)?;
         match verdict {
