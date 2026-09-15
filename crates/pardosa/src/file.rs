@@ -109,11 +109,10 @@ impl ContainerFrame {
 
     /// Encodes a payload into container framing format (length + payload + CRC32C).
     ///
-    /// # Panics
-    /// Panics if `payload.len()` exceeds `u32::MAX` per C3.4 framing.
-    pub fn encode_payload(payload: &[u8], buf: &mut Vec<u8>) {
+    /// # Errors
+    /// Returns [`EncodeError::LengthExceeded`] if `payload.len()` exceeds `u32::MAX`.
+    pub fn encode_payload(payload: &[u8], buf: &mut Vec<u8>) -> Result<(), EncodeError> {
         Self::try_encode_payload(payload, buf)
-            .expect("payload length must fit u32 per C3.4 framing");
     }
 
     /// Tries to encode a payload into container framing format (length + payload + CRC32C).
@@ -491,7 +490,14 @@ fn append_meta_record_impl(
     let mut rec_buf = Vec::new();
     record.encode(&mut rec_buf);
     let mut frame_buf = Vec::new();
-    ContainerFrame::encode_payload(&rec_buf, &mut frame_buf);
+    ContainerFrame::encode_payload(&rec_buf, &mut frame_buf).map_err(|err| {
+        MetaWriteError::WriteOrSync(OperationFailure::new(
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            },
+            format!("failed to encode record frame: {err}"),
+        ))
+    })?;
     let write_res = if simulate_write_error {
         Err(std::io::Error::other("simulated write_all failure"))
     } else {
@@ -642,12 +648,31 @@ impl FileStorageAdapter {
     /// Returns [`OperationFailure`] with [`FailureCondition::StoreAlreadyExists`] if artefact already exists.
     /// Returns [`OperationFailure`] with [`FailureCondition::ExclusionUnavailable`] or
     /// [`FailureCondition::AnotherOwnerHoldsExclusion`] if writer exclusion fails.
+    /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] if initial claim exceeds `u32::MAX`.
     pub fn create(
         &self,
         initial_claim: &OwnershipClaimRecord,
         descriptor: &AdmittedDescriptor,
     ) -> Result<FileWriterSession, OperationFailure> {
         admit_create(self.try_presence()?)?;
+        let claim_wire_len = 69usize
+            .checked_add(initial_claim.operator_label.len())
+            .ok_or_else(|| {
+                OperationFailure::new(
+                    FailureCondition::ValueConstraintViolated {
+                        constraint: ValueConstraint::TooLong,
+                    },
+                    "initial claim wire length exceeds address space",
+                )
+            })?;
+        if u32::try_from(claim_wire_len).is_err() {
+            return Err(OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                },
+                format!("initial claim wire length exceeds u32::MAX: {claim_wire_len}"),
+            ));
+        }
         let mut meta_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -676,7 +701,14 @@ impl FileStorageAdapter {
         let mut claim_bytes = Vec::new();
         OwnershipRecord::OwnershipClaim(initial_claim.clone()).encode(&mut claim_bytes);
         let mut frame_buf = Vec::new();
-        ContainerFrame::encode_payload(&claim_bytes, &mut frame_buf);
+        ContainerFrame::encode_payload(&claim_bytes, &mut frame_buf).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                },
+                format!("failed to encode claim frame: {err}"),
+            )
+        })?;
         meta_file.write_all(&frame_buf).map_err(|err| {
             OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
@@ -685,7 +717,16 @@ impl FileStorageAdapter {
         })?;
 
         let mut desc_frame = Vec::new();
-        ContainerFrame::encode_payload(descriptor.encoded_record(), &mut desc_frame);
+        ContainerFrame::encode_payload(descriptor.encoded_record(), &mut desc_frame).map_err(
+            |err| {
+                OperationFailure::new(
+                    FailureCondition::ValueConstraintViolated {
+                        constraint: ValueConstraint::TooLong,
+                    },
+                    format!("failed to encode schema descriptor frame: {err}"),
+                )
+            },
+        )?;
         meta_file.write_all(&desc_frame).map_err(|err| {
             OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
@@ -772,7 +813,14 @@ impl FileStorageAdapter {
         payload: &[u8],
     ) -> Result<u64, OperationFailure> {
         let mut frame_buf = Vec::new();
-        ContainerFrame::encode_payload(payload, &mut frame_buf);
+        ContainerFrame::encode_payload(payload, &mut frame_buf).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                },
+                format!("failed to encode frame: {err}"),
+            )
+        })?;
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -842,7 +890,14 @@ impl FileStorageAdapter {
         let mut claim_bytes = Vec::new();
         OwnershipRecord::OwnershipClaim(claim.clone()).encode(&mut claim_bytes);
         let mut frame_buf = Vec::new();
-        ContainerFrame::encode_payload(&claim_bytes, &mut frame_buf);
+        ContainerFrame::encode_payload(&claim_bytes, &mut frame_buf).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                },
+                format!("failed to encode claim frame: {err}"),
+            )
+        })?;
         meta_file.write_all(&frame_buf).map_err(|err| {
             OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
@@ -1839,7 +1894,7 @@ mod tests {
     fn test_container_frame_roundtrip() {
         let payload = b"Hello, Pardosa Container!".to_vec();
         let mut buf = Vec::new();
-        ContainerFrame::encode_payload(&payload, &mut buf);
+        ContainerFrame::encode_payload(&payload, &mut buf).unwrap();
         let (decoded, consumed) = ContainerFrame::decode(&buf).unwrap();
         assert_eq!(consumed, buf.len());
         assert_eq!(decoded, payload);
@@ -1859,7 +1914,7 @@ mod tests {
     fn test_corrupt_frame_checksum() {
         let payload = b"Data to corrupt".to_vec();
         let mut buf = Vec::new();
-        ContainerFrame::encode_payload(&payload, &mut buf);
+        ContainerFrame::encode_payload(&payload, &mut buf).unwrap();
         let last_idx = buf.len() - 1;
         buf[last_idx] ^= 0xFF;
         let err = ContainerFrame::decode(&buf).unwrap_err();
@@ -1873,14 +1928,14 @@ mod tests {
         let initial_digest = commitment.current_commitment();
 
         let mut frame1 = Vec::new();
-        ContainerFrame::encode_payload(b"event-1", &mut frame1);
+        ContainerFrame::encode_payload(b"event-1", &mut frame1).unwrap();
         commitment.update_frame(&frame1);
         assert_eq!(commitment.frame_count(), 1);
         let digest1 = commitment.current_commitment();
         assert_ne!(initial_digest, digest1);
 
         let mut frame2 = Vec::new();
-        ContainerFrame::encode_payload(b"event-2", &mut frame2);
+        ContainerFrame::encode_payload(b"event-2", &mut frame2).unwrap();
         commitment.update_frame(&frame2);
         assert_eq!(commitment.frame_count(), 2);
         let digest2 = commitment.current_commitment();
@@ -2876,6 +2931,43 @@ mod tests {
         assert_eq!(
             *err.condition(),
             FailureCondition::OwnershipRecordUnreadable
+        );
+    }
+
+    #[test]
+    fn test_file_adapter_create_oversized_claim_rejected_without_creating_files() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stem = temp_dir.path().join("oversized_claim");
+        let adapter = FileStorageAdapter::new(&stem);
+        let oversized_label = "x".repeat(u32::MAX as usize - 68);
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1u8; 16],
+            boot_id: [2u8; 16],
+            process_id: 12345,
+            process_start_time_ns: 1_000_000,
+            claim_time_ns: 2_000_000,
+            operator_label: oversized_label,
+        };
+        let desc =
+            AdmittedDescriptor::try_from_descriptor(SchemaDescriptor::new(1, DescriptorNode::U64))
+                .unwrap();
+        let err = adapter
+            .create(&claim, &desc)
+            .expect_err("oversized claim must be rejected");
+        match err.condition() {
+            FailureCondition::ValueConstraintViolated { constraint } => {
+                assert_eq!(constraint, &ValueConstraint::TooLong);
+            }
+            other => panic!("expected ValueConstraintViolated, got {other:?}"),
+        }
+        assert!(
+            !adapter.meta_path().exists(),
+            "no .meta file must be created on disk"
+        );
+        assert!(
+            !adapter.pgno_path().exists(),
+            "no .pgno file must be created on disk"
         );
     }
 }

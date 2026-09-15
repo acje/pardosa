@@ -776,12 +776,32 @@ impl NatsStorageAdapter {
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::StoreAlreadyExists`] if artefact already exists.
     /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if creation fails.
+    /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] if initial claim exceeds `u32::MAX`.
     pub fn create(
         &self,
         initial_claim: &OwnershipClaimRecord,
         descriptor: &AdmittedDescriptor,
     ) -> Result<NatsWriterSession, OperationFailure> {
         admit_create(self.try_presence()?)?;
+
+        let claim_wire_len = 69usize
+            .checked_add(initial_claim.operator_label.len())
+            .ok_or_else(|| {
+                OperationFailure::new(
+                    FailureCondition::ValueConstraintViolated {
+                        constraint: ValueConstraint::TooLong,
+                    },
+                    "initial claim wire length exceeds address space",
+                )
+            })?;
+        if u32::try_from(claim_wire_len).is_err() {
+            return Err(OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                },
+                format!("initial claim wire length exceeds u32::MAX: {claim_wire_len}"),
+            ));
+        }
 
         let js = self.js.clone();
         let client = self.client.clone();
@@ -867,7 +887,14 @@ impl NatsStorageAdapter {
             let mut claim_bytes = Vec::new();
             OwnershipRecord::OwnershipClaim(claim.clone()).encode(&mut claim_bytes);
             let mut claim_frame = Vec::new();
-            ContainerFrame::encode_payload(&claim_bytes, &mut claim_frame);
+            ContainerFrame::encode_payload(&claim_bytes, &mut claim_frame).map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::ValueConstraintViolated {
+                        constraint: ValueConstraint::TooLong,
+                    },
+                    format!("failed to encode claim frame: {err}"),
+                )
+            })?;
 
             let mut claim_meta_headers = async_nats::HeaderMap::new();
             claim_meta_headers.insert(
@@ -919,7 +946,15 @@ impl NatsStorageAdapter {
             }
 
             let mut desc_frame = Vec::new();
-            ContainerFrame::encode_payload(descriptor_clone.encoded_record(), &mut desc_frame);
+            ContainerFrame::encode_payload(descriptor_clone.encoded_record(), &mut desc_frame)
+                .map_err(|err| {
+                    OperationFailure::new(
+                        FailureCondition::ValueConstraintViolated {
+                            constraint: ValueConstraint::TooLong,
+                        },
+                        format!("failed to encode schema descriptor frame: {err}"),
+                    )
+                })?;
 
             let mut desc_meta_headers = async_nats::HeaderMap::new();
             desc_meta_headers.insert(
@@ -1165,7 +1200,14 @@ impl NatsStorageAdapter {
             let mut claim_bytes = Vec::new();
             OwnershipRecord::OwnershipClaim(claim_clone).encode(&mut claim_bytes);
             let mut claim_frame = Vec::new();
-            ContainerFrame::encode_payload(&claim_bytes, &mut claim_frame);
+            ContainerFrame::encode_payload(&claim_bytes, &mut claim_frame).map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::ValueConstraintViolated {
+                        constraint: ValueConstraint::TooLong,
+                    },
+                    format!("failed to encode claim frame: {err}"),
+                )
+            })?;
 
             let mut claim_meta_headers = async_nats::HeaderMap::new();
             claim_meta_headers.insert(
@@ -1237,7 +1279,14 @@ impl NatsStorageAdapter {
 
         run_future(&handle, async move {
             let mut frame_buf = Vec::new();
-            ContainerFrame::encode_payload(&payload_vec, &mut frame_buf);
+            ContainerFrame::encode_payload(&payload_vec, &mut frame_buf).map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::ValueConstraintViolated {
+                        constraint: ValueConstraint::TooLong,
+                    },
+                    format!("failed to encode frame: {err}"),
+                )
+            })?;
 
             let mut headers = async_nats::HeaderMap::new();
             headers.insert(
@@ -1658,7 +1707,14 @@ impl NatsStorageAdapter {
             let mut record_bytes = Vec::new();
             record_clone.encode(&mut record_bytes);
             let mut record_frame = Vec::new();
-            ContainerFrame::encode_payload(&record_bytes, &mut record_frame);
+            ContainerFrame::encode_payload(&record_bytes, &mut record_frame).map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::ValueConstraintViolated {
+                        constraint: ValueConstraint::TooLong,
+                    },
+                    format!("failed to encode meta frame: {err}"),
+                )
+            })?;
 
             let mut headers = async_nats::HeaderMap::new();
             headers.insert(

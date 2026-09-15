@@ -49,7 +49,7 @@ fn test_container_header_conformance_vectors() {
                 assert_eq!(payload, expected_utf8.as_bytes());
 
                 let mut enc = Vec::new();
-                ContainerFrame::encode_payload(&payload, &mut enc);
+                ContainerFrame::encode_payload(&payload, &mut enc).unwrap();
                 assert_eq!(enc, bytes);
             }
             "corrupted_crc32c_checksum" => {

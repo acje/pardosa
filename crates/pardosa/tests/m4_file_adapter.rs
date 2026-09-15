@@ -1047,7 +1047,7 @@ fn test_file_complete_creation_missing_descriptor_fails_closed() {
     let mut claim_bytes = Vec::new();
     OwnershipRecord::OwnershipClaim(claim.clone()).encode(&mut claim_bytes);
     let mut claim_frame = Vec::new();
-    ContainerFrame::encode_payload(&claim_bytes, &mut claim_frame);
+    ContainerFrame::encode_payload(&claim_bytes, &mut claim_frame).unwrap();
     meta_file
         .write_all(&claim_frame)
         .expect("write claim frame");
@@ -1084,7 +1084,7 @@ fn test_file_complete_creation_persisted_invalid_descriptor_fails_closed() {
     let mut claim_bytes = Vec::new();
     OwnershipRecord::OwnershipClaim(claim.clone()).encode(&mut claim_bytes);
     let mut claim_frame = Vec::new();
-    ContainerFrame::encode_payload(&claim_bytes, &mut claim_frame);
+    ContainerFrame::encode_payload(&claim_bytes, &mut claim_frame).unwrap();
     meta_file
         .write_all(&claim_frame)
         .expect("write claim frame");
@@ -1096,7 +1096,7 @@ fn test_file_complete_creation_persisted_invalid_descriptor_fails_closed() {
     }
     .encode(&mut desc_bytes);
     let mut desc_frame = Vec::new();
-    ContainerFrame::encode_payload(&desc_bytes, &mut desc_frame);
+    ContainerFrame::encode_payload(&desc_bytes, &mut desc_frame).unwrap();
     meta_file
         .write_all(&desc_frame)
         .expect("write invalid descriptor frame");
@@ -1133,7 +1133,7 @@ fn test_file_open_write_both_missing_descriptor_fails_closed() {
     let mut claim_bytes = Vec::new();
     OwnershipRecord::OwnershipClaim(claim.clone()).encode(&mut claim_bytes);
     let mut claim_frame = Vec::new();
-    ContainerFrame::encode_payload(&claim_bytes, &mut claim_frame);
+    ContainerFrame::encode_payload(&claim_bytes, &mut claim_frame).unwrap();
     meta_file
         .write_all(&claim_frame)
         .expect("write claim frame");
@@ -1177,7 +1177,7 @@ fn test_file_open_write_both_persisted_invalid_descriptor_fails_closed() {
     let mut claim_bytes = Vec::new();
     OwnershipRecord::OwnershipClaim(claim.clone()).encode(&mut claim_bytes);
     let mut claim_frame = Vec::new();
-    ContainerFrame::encode_payload(&claim_bytes, &mut claim_frame);
+    ContainerFrame::encode_payload(&claim_bytes, &mut claim_frame).unwrap();
     meta_file
         .write_all(&claim_frame)
         .expect("write claim frame");
@@ -1189,7 +1189,7 @@ fn test_file_open_write_both_persisted_invalid_descriptor_fails_closed() {
     }
     .encode(&mut desc_bytes);
     let mut desc_frame = Vec::new();
-    ContainerFrame::encode_payload(&desc_bytes, &mut desc_frame);
+    ContainerFrame::encode_payload(&desc_bytes, &mut desc_frame).unwrap();
     meta_file
         .write_all(&desc_frame)
         .expect("write invalid descriptor frame");

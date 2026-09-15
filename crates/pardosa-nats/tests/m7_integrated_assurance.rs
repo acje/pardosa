@@ -1175,7 +1175,7 @@ fn test_m7_dimension_8_unanchored_history_and_rolling_commitment() {
         let mut env_buf = Vec::new();
         env.encode(&mut env_buf);
         let mut frame_buf = Vec::new();
-        ContainerFrame::encode_payload(&env_buf, &mut frame_buf);
+        ContainerFrame::encode_payload(&env_buf, &mut frame_buf).unwrap();
         expected_commitment.update_frame(&frame_buf);
         file_writer
             .append_envelope_verdict(&env)

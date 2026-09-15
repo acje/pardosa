@@ -46,7 +46,12 @@ impl<E: StorageEngine> Store<E> {
         let mut fiber_index = SessionIndex::new();
         engine.recover_frames(64, &mut |_seq, frame| {
             let mut frame_buf = Vec::new();
-            ContainerFrame::encode_payload(frame, &mut frame_buf);
+            ContainerFrame::encode_payload(frame, &mut frame_buf).map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    format!("frame encoding failed: {err}"),
+                )
+            })?;
             rolling_commitment.update_frame(&frame_buf);
             fiber_index.process_frame(frame)
         })?;
@@ -69,7 +74,12 @@ impl<E: StorageEngine> Store<E> {
 
         let res = engine.recover_frames(64, &mut |_seq, frame| {
             let mut frame_buf = Vec::new();
-            ContainerFrame::encode_payload(frame, &mut frame_buf);
+            ContainerFrame::encode_payload(frame, &mut frame_buf).map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    format!("frame encoding failed: {err}"),
+                )
+            })?;
             rolling.update_frame(&frame_buf);
 
             if broken_cause.is_none() {
@@ -383,7 +393,7 @@ impl<E: StorageEngine> Store<E> {
         self.fiber_index.validate_append(&env)?;
 
         let mut frame_buf = Vec::new();
-        ContainerFrame::try_encode_payload(payload, &mut frame_buf).map_err(|err| {
+        ContainerFrame::encode_payload(payload, &mut frame_buf).map_err(|err| {
             OperationFailure::new(
                 FailureCondition::ValueConstraintViolated {
                     constraint: ValueConstraint::TooLong,
@@ -526,7 +536,12 @@ impl<E: StorageEngine> Store<E> {
         let mut rolling = RollingCommitment::new();
         for frame in &frames {
             let mut frame_buf = Vec::new();
-            ContainerFrame::encode_payload(frame, &mut frame_buf);
+            ContainerFrame::encode_payload(frame, &mut frame_buf).map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    format!("frame encoding failed: {err}"),
+                )
+            })?;
             rolling.update_frame(&frame_buf);
         }
         self.rolling_commitment = rolling;
@@ -666,7 +681,12 @@ impl<E: StorageEngine> Store<E> {
             validation_index.commit_envelope_unchecked(owned_env);
 
             let mut frame_buf = Vec::new();
-            ContainerFrame::encode_payload(frame, &mut frame_buf);
+            ContainerFrame::encode_payload(frame, &mut frame_buf).map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    format!("frame encoding failed: {err}"),
+                )
+            })?;
             rolling.update_frame(&frame_buf);
 
             match f(env_ref) {
@@ -1319,7 +1339,7 @@ mod tests {
             let count = engine
                 .recover_frames(chunk_size, &mut |_seq, frame| {
                     let mut frame_buf = Vec::new();
-                    ContainerFrame::encode_payload(frame, &mut frame_buf);
+                    ContainerFrame::encode_payload(frame, &mut frame_buf).expect("encode frame");
                     rolling.update_frame(&frame_buf);
                     index.process_frame(frame)
                 })

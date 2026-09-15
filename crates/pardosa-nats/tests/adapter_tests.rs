@@ -2016,7 +2016,7 @@ fn test_nats_unreadable_newer_claim_halts_writes_zero_data_appends() {
         OwnershipRecord::OwnershipClaim(sample_claim(2)).encode(&mut malformed_payload);
         malformed_payload.extend_from_slice(b"trailing-corrupt-bytes");
         let mut frame_bytes = Vec::new();
-        ContainerFrame::encode_payload(&malformed_payload, &mut frame_bytes);
+        ContainerFrame::encode_payload(&malformed_payload, &mut frame_bytes).unwrap();
 
         js.publish(adapter.meta_subject().to_string(), frame_bytes.into())
             .await
@@ -2077,7 +2077,7 @@ fn test_nats_unreadable_retirement_record_halts_writes_zero_data_appends() {
         OwnershipRecord::OutboundPointer(outbound).encode(&mut malformed_payload);
         malformed_payload.extend_from_slice(b"trailing-corrupt-bytes");
         let mut frame_bytes = Vec::new();
-        ContainerFrame::encode_payload(&malformed_payload, &mut frame_bytes);
+        ContainerFrame::encode_payload(&malformed_payload, &mut frame_bytes).unwrap();
 
         js.publish(adapter.meta_subject().to_string(), frame_bytes.into())
             .await
@@ -2201,7 +2201,7 @@ fn test_nats_and_file_read_meta_records_reject_trailing_bytes() {
     claim_bytes.extend_from_slice(b"trailing-bytes");
 
     let mut frame_bytes = Vec::new();
-    ContainerFrame::encode_payload(&claim_bytes, &mut frame_bytes);
+    ContainerFrame::encode_payload(&claim_bytes, &mut frame_bytes).unwrap();
     file_bytes.extend_from_slice(&frame_bytes);
 
     std::fs::write(&meta_path, &file_bytes).expect("write meta");

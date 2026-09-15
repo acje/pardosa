@@ -12,9 +12,13 @@ pub use floats::{EventF32, EventF64, OrderedF32, OrderedF64};
 /// Maximum recursion depth allowed during descriptor AST decoding to prevent cycles.
 pub const MAX_DESCRIPTOR_DEPTH: usize = 16;
 
+/// Alias for maximum recursion depth allowed during descriptor AST operations.
+pub const MAX_RECURSION_DEPTH: usize = MAX_DESCRIPTOR_DEPTH;
+
 /// Authorized implementation bound: 64 KiB maximum encoded descriptor record size to prevent unbounded metadata allocations.
 pub const MAX_DESCRIPTOR_RECORD_BYTES: usize = 65536;
 
+#[allow(dead_code)]
 pub(crate) fn check_descriptor_record_len(len: usize) -> Result<(), OperationFailure> {
     if u32::try_from(len).is_err() || len > MAX_DESCRIPTOR_RECORD_BYTES {
         return Err(OperationFailure::new(
@@ -161,6 +165,134 @@ impl DescriptorNode {
     /// Returns `EncodeError::Custom` if a discriminant exceeds its width or if wire length exceeds `u32::MAX`.
     pub fn encode(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
         self.encode_recursive(buf, 0)
+    }
+
+    /// Calculates the exact encoded length of this descriptor node without allocating.
+    ///
+    /// # Errors
+    /// Returns `EncodeError::DepthExceeded` if recursion depth exceeds `MAX_RECURSION_DEPTH` (16).
+    /// Returns `EncodeError::Custom` if wire length overflows or exceeds `u32::MAX`, or if a discriminant exceeds its width.
+    pub fn encoded_len(&self) -> Result<usize, EncodeError> {
+        self.encoded_len_recursive(0)
+    }
+
+    fn encoded_len_recursive(&self, depth: usize) -> Result<usize, EncodeError> {
+        if depth > MAX_RECURSION_DEPTH {
+            return Err(EncodeError::DepthExceeded {
+                depth,
+                max: MAX_RECURSION_DEPTH,
+            });
+        }
+        let tag_len = 1usize;
+        match self {
+            Self::U8
+            | Self::U16
+            | Self::U32
+            | Self::U64
+            | Self::I8
+            | Self::I16
+            | Self::I32
+            | Self::I64
+            | Self::Bool
+            | Self::Timestamp
+            | Self::Uuid
+            | Self::OrderedF32
+            | Self::OrderedF64 => Ok(tag_len),
+            Self::EventString { .. }
+            | Self::NonEmptyEventString { .. }
+            | Self::EventBytes { .. } => tag_len
+                .checked_add(4)
+                .ok_or_else(|| EncodeError::Custom("length overflow".into())),
+            Self::EventVec { inner, .. } => {
+                let inner_len = inner.encoded_len_recursive(depth + 1)?;
+                tag_len
+                    .checked_add(inner_len)
+                    .and_then(|l| l.checked_add(4))
+                    .ok_or_else(|| EncodeError::Custom("length overflow".into()))
+            }
+            Self::Option { inner } => {
+                let inner_len = inner.encoded_len_recursive(depth + 1)?;
+                tag_len
+                    .checked_add(inner_len)
+                    .ok_or_else(|| EncodeError::Custom("length overflow".into()))
+            }
+            Self::Struct { name, fields } => {
+                let name_bytes = name.as_bytes();
+                let name_len = u32::try_from(name_bytes.len())
+                    .map_err(|_| EncodeError::Custom("length exceeds u32::MAX".into()))?
+                    as usize;
+                let mut total = tag_len
+                    .checked_add(4)
+                    .and_then(|l| l.checked_add(name_len))
+                    .and_then(|l| l.checked_add(4))
+                    .ok_or_else(|| EncodeError::Custom("length overflow".into()))?;
+                let _ = u32::try_from(fields.len())
+                    .map_err(|_| EncodeError::Custom("length exceeds u32::MAX".into()))?;
+                for f in fields {
+                    let fname_bytes = f.name.as_bytes();
+                    let fname_len = u32::try_from(fname_bytes.len())
+                        .map_err(|_| EncodeError::Custom("length exceeds u32::MAX".into()))?
+                        as usize;
+                    let fnode_len = f.node.encoded_len_recursive(depth + 1)?;
+                    total = total
+                        .checked_add(4)
+                        .and_then(|l| l.checked_add(fname_len))
+                        .and_then(|l| l.checked_add(fnode_len))
+                        .ok_or_else(|| EncodeError::Custom("length overflow".into()))?;
+                }
+                Ok(total)
+            }
+            Self::Enum {
+                name,
+                discriminant_width,
+                variants,
+            } => {
+                let name_bytes = name.as_bytes();
+                let name_len = u32::try_from(name_bytes.len())
+                    .map_err(|_| EncodeError::Custom("length exceeds u32::MAX".into()))?
+                    as usize;
+                let mut total = tag_len
+                    .checked_add(4)
+                    .and_then(|l| l.checked_add(name_len))
+                    .and_then(|l| l.checked_add(1))
+                    .and_then(|l| l.checked_add(4))
+                    .ok_or_else(|| EncodeError::Custom("length overflow".into()))?;
+                let _ = u32::try_from(variants.len())
+                    .map_err(|_| EncodeError::Custom("length exceeds u32::MAX".into()))?;
+                for v in variants {
+                    let disc_len = if *discriminant_width == 1 {
+                        if v.discriminant > 255 {
+                            return Err(EncodeError::Custom(
+                                "discriminant exceeds 1-byte width".to_string(),
+                            ));
+                        }
+                        1usize
+                    } else {
+                        if v.discriminant > 65535 {
+                            return Err(EncodeError::Custom(
+                                "discriminant exceeds 2-byte width".to_string(),
+                            ));
+                        }
+                        2usize
+                    };
+                    let vname_bytes = v.name.as_bytes();
+                    let vname_len = u32::try_from(vname_bytes.len())
+                        .map_err(|_| EncodeError::Custom("length exceeds u32::MAX".into()))?
+                        as usize;
+                    let payload_len = match &v.payload {
+                        Some(payload) => payload.encoded_len_recursive(depth + 1)?,
+                        None => 1usize,
+                    };
+                    total = total
+                        .checked_add(disc_len)
+                        .and_then(|l| l.checked_add(4))
+                        .and_then(|l| l.checked_add(vname_len))
+                        .and_then(|l| l.checked_add(payload_len))
+                        .ok_or_else(|| EncodeError::Custom("length overflow".into()))?;
+                }
+                Ok(total)
+            }
+        }
     }
 
     fn encode_recursive(&self, buf: &mut Vec<u8>, depth: usize) -> Result<(), EncodeError> {
@@ -602,6 +734,19 @@ impl SchemaDescriptor {
         self.root.encode(buf)
     }
 
+    /// Calculates the exact encoded length of this schema descriptor as an ownership record without allocating.
+    ///
+    /// # Errors
+    /// Returns `EncodeError::DepthExceeded` if recursion depth exceeds `MAX_RECURSION_DEPTH` (16).
+    /// Returns `EncodeError::Custom` if wire length overflows or exceeds `u32::MAX`, or if a discriminant exceeds its width.
+    pub fn encoded_record_len(&self) -> Result<usize, EncodeError> {
+        let root_len = self.root.encoded_len()?;
+        1usize
+            .checked_add(4)
+            .and_then(|prefix| prefix.checked_add(root_len))
+            .ok_or_else(|| EncodeError::Custom("length overflow".into()))
+    }
+
     /// Decodes a schema descriptor from wire bytes.
     ///
     /// # Errors
@@ -674,73 +819,6 @@ impl SchemaDescriptor {
     }
 }
 
-fn check_ast_string_lengths(node: &DescriptorNode) -> Result<(), OperationFailure> {
-    match node {
-        DescriptorNode::Struct { name, fields } => {
-            if name.len() > MAX_DESCRIPTOR_RECORD_BYTES {
-                return Err(OperationFailure::new(
-                    FailureCondition::ValueConstraintViolated {
-                        constraint: ValueConstraint::TooLong,
-                    },
-                    format!(
-                        "struct name exceeds maximum descriptor record bytes: {}",
-                        name.len()
-                    ),
-                ));
-            }
-            for f in fields {
-                if f.name.len() > MAX_DESCRIPTOR_RECORD_BYTES {
-                    return Err(OperationFailure::new(
-                        FailureCondition::ValueConstraintViolated {
-                            constraint: ValueConstraint::TooLong,
-                        },
-                        format!(
-                            "struct field name exceeds maximum descriptor record bytes: {}",
-                            f.name.len()
-                        ),
-                    ));
-                }
-                check_ast_string_lengths(&f.node)?;
-            }
-            Ok(())
-        }
-        DescriptorNode::Enum { name, variants, .. } => {
-            if name.len() > MAX_DESCRIPTOR_RECORD_BYTES {
-                return Err(OperationFailure::new(
-                    FailureCondition::ValueConstraintViolated {
-                        constraint: ValueConstraint::TooLong,
-                    },
-                    format!(
-                        "enum name exceeds maximum descriptor record bytes: {}",
-                        name.len()
-                    ),
-                ));
-            }
-            for v in variants {
-                if v.name.len() > MAX_DESCRIPTOR_RECORD_BYTES {
-                    return Err(OperationFailure::new(
-                        FailureCondition::ValueConstraintViolated {
-                            constraint: ValueConstraint::TooLong,
-                        },
-                        format!(
-                            "enum variant name exceeds maximum descriptor record bytes: {}",
-                            v.name.len()
-                        ),
-                    ));
-                }
-                if let Some(payload) = &v.payload {
-                    check_ast_string_lengths(payload)?;
-                }
-            }
-            Ok(())
-        }
-        DescriptorNode::EventVec { inner, .. } | DescriptorNode::Option { inner } => {
-            check_ast_string_lengths(inner)
-        }
-        _ => Ok(()),
-    }
-}
-
 /// A validated schema descriptor guaranteed to be structurally complete and admitted per C8.2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmittedDescriptor {
@@ -755,13 +833,27 @@ impl AdmittedDescriptor {
     /// # Errors
     /// Returns [`OperationFailure`] if the schema descriptor violates structural completeness,
     /// has version 0, depth > 16, invalid or duplicate discriminants, invalid widths,
-    /// root AST string lengths exceed [`MAX_DESCRIPTOR_RECORD_BYTES`],
     /// encoding wire length overflow, or if the encoded descriptor record exceeds
     /// [`MAX_DESCRIPTOR_RECORD_BYTES`] (64 KiB per authorized 64 KiB implementation resource bound).
     pub fn try_from_descriptor(descriptor: SchemaDescriptor) -> Result<Self, OperationFailure> {
         descriptor.validate_structural_completeness()?;
-        check_ast_string_lengths(&descriptor.root)?;
-        let mut desc_bytes = Vec::new();
+        let record_len = descriptor.encoded_record_len().map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                },
+                format!("schema descriptor encoded length calculation failed: {err}"),
+            )
+        })?;
+        if record_len > MAX_DESCRIPTOR_RECORD_BYTES {
+            return Err(OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                },
+                format!("encoded descriptor record exceeds 64 KiB: {record_len}"),
+            ));
+        }
+        let mut desc_bytes = Vec::with_capacity(record_len);
         descriptor.root.encode(&mut desc_bytes).map_err(|err| {
             OperationFailure::new(
                 FailureCondition::ValueConstraintViolated {
@@ -770,24 +862,12 @@ impl AdmittedDescriptor {
                 format!("schema descriptor encoding failed: {err}"),
             )
         })?;
-        if desc_bytes.len() > MAX_DESCRIPTOR_RECORD_BYTES {
-            return Err(OperationFailure::new(
-                FailureCondition::ValueConstraintViolated {
-                    constraint: ValueConstraint::TooLong,
-                },
-                format!(
-                    "encoded descriptor AST exceeds 64 KiB: {}",
-                    desc_bytes.len()
-                ),
-            ));
-        }
         let desc_record = OwnershipRecord::SchemaDescriptor {
             schema_version: descriptor.version,
             descriptor_bytes: desc_bytes,
         };
-        let mut encoded_record = Vec::new();
+        let mut encoded_record = Vec::with_capacity(record_len);
         desc_record.encode(&mut encoded_record);
-        check_descriptor_record_len(encoded_record.len())?;
         let identity = SchemaIdentity::from_raw(*blake3::hash(&encoded_record[1..]).as_bytes());
         Ok(Self {
             descriptor,
@@ -2080,6 +2160,37 @@ mod tests {
         let err_huge = AdmittedDescriptor::try_from_descriptor(huge_name_desc)
             .expect_err("AST string exceeding bound must be rejected before allocation");
         match err_huge.condition() {
+            FailureCondition::ValueConstraintViolated { constraint } => {
+                assert_eq!(constraint, &ValueConstraint::TooLong);
+            }
+            other => panic!("expected ValueConstraintViolated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_descriptor_aggregate_oversized_fields_rejected_before_allocation() {
+        let field_name_1 = "a".repeat(33_000);
+        let field_name_2 = "b".repeat(33_000);
+        let desc = SchemaDescriptor::new(
+            1,
+            DescriptorNode::Struct {
+                name: "S".to_string(),
+                fields: vec![
+                    FieldDescriptor {
+                        name: field_name_1,
+                        node: DescriptorNode::U8,
+                    },
+                    FieldDescriptor {
+                        name: field_name_2,
+                        node: DescriptorNode::U8,
+                    },
+                ],
+            },
+        );
+        let err = AdmittedDescriptor::try_from_descriptor(desc).expect_err(
+            "aggregate fields exceeding 64 KiB must be rejected with TooLong before allocation",
+        );
+        match err.condition() {
             FailureCondition::ValueConstraintViolated { constraint } => {
                 assert_eq!(constraint, &ValueConstraint::TooLong);
             }
