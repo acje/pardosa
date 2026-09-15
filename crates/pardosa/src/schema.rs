@@ -1,8 +1,8 @@
 //! Schema descriptors, admitted S3 constructor AST, and derived schema identity.
 
 use crate::encoding::{
-    DecodeError, EncodeError, EventBytes, EventString, EventVec, NonEmptyEventString, Timestamp,
-    Uuid, ValueConstraint,
+    DecodeError, EncodeError, EventBytes, EventString, EventVec, NonEmptyEventString,
+    OwnershipRecord, Timestamp, Uuid, ValueConstraint,
 };
 use crate::store::{FailureCondition, OperationFailure};
 
@@ -184,12 +184,18 @@ impl DescriptorNode {
             Self::Option { inner } => inner.encode_recursive(buf, depth + 1),
             Self::Struct { name, fields } => {
                 let name_bytes = name.as_bytes();
-                buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+                let name_len = u32::try_from(name_bytes.len())
+                    .map_err(|_| EncodeError::Custom("length exceeds u32::MAX".into()))?;
+                buf.extend_from_slice(&name_len.to_le_bytes());
                 buf.extend_from_slice(name_bytes);
-                buf.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+                let fields_len = u32::try_from(fields.len())
+                    .map_err(|_| EncodeError::Custom("length exceeds u32::MAX".into()))?;
+                buf.extend_from_slice(&fields_len.to_le_bytes());
                 for f in fields {
                     let fname_bytes = f.name.as_bytes();
-                    buf.extend_from_slice(&(fname_bytes.len() as u32).to_le_bytes());
+                    let fname_len = u32::try_from(fname_bytes.len())
+                        .map_err(|_| EncodeError::Custom("length exceeds u32::MAX".into()))?;
+                    buf.extend_from_slice(&fname_len.to_le_bytes());
                     buf.extend_from_slice(fname_bytes);
                     f.node.encode_recursive(buf, depth + 1)?;
                 }
@@ -201,10 +207,14 @@ impl DescriptorNode {
                 variants,
             } => {
                 let name_bytes = name.as_bytes();
-                buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+                let name_len = u32::try_from(name_bytes.len())
+                    .map_err(|_| EncodeError::Custom("length exceeds u32::MAX".into()))?;
+                buf.extend_from_slice(&name_len.to_le_bytes());
                 buf.extend_from_slice(name_bytes);
                 buf.push(*discriminant_width);
-                buf.extend_from_slice(&(variants.len() as u32).to_le_bytes());
+                let variants_len = u32::try_from(variants.len())
+                    .map_err(|_| EncodeError::Custom("length exceeds u32::MAX".into()))?;
+                buf.extend_from_slice(&variants_len.to_le_bytes());
                 for v in variants {
                     if *discriminant_width == 1 {
                         if v.discriminant > 255 {
@@ -222,7 +232,9 @@ impl DescriptorNode {
                         buf.extend_from_slice(&(v.discriminant as u16).to_le_bytes());
                     }
                     let vname_bytes = v.name.as_bytes();
-                    buf.extend_from_slice(&(vname_bytes.len() as u32).to_le_bytes());
+                    let vname_len = u32::try_from(vname_bytes.len())
+                        .map_err(|_| EncodeError::Custom("length exceeds u32::MAX".into()))?;
+                    buf.extend_from_slice(&vname_len.to_le_bytes());
                     buf.extend_from_slice(vname_bytes);
                     match &v.payload {
                         Some(payload) => payload.encode_recursive(buf, depth + 1)?,
@@ -648,7 +660,11 @@ impl SchemaDescriptor {
 
 /// A validated schema descriptor guaranteed to be structurally complete and admitted per C8.2.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdmittedDescriptor(SchemaDescriptor);
+pub struct AdmittedDescriptor {
+    descriptor: SchemaDescriptor,
+    encoded_record: Vec<u8>,
+    identity: SchemaIdentity,
+}
 
 impl AdmittedDescriptor {
     /// Validates and admits a schema descriptor.
@@ -658,8 +674,8 @@ impl AdmittedDescriptor {
     /// has version 0, depth > 16, invalid or duplicate discriminants, or invalid widths.
     pub fn try_from_descriptor(descriptor: SchemaDescriptor) -> Result<Self, OperationFailure> {
         descriptor.validate_structural_completeness()?;
-        let mut buf = Vec::new();
-        descriptor.encode(&mut buf).map_err(|err| {
+        let mut desc_bytes = Vec::new();
+        descriptor.root.encode(&mut desc_bytes).map_err(|err| {
             OperationFailure::new(
                 FailureCondition::ValueConstraintViolated {
                     constraint: ValueConstraint::TooLong,
@@ -667,44 +683,62 @@ impl AdmittedDescriptor {
                 format!("schema descriptor encoding failed: {err}"),
             )
         })?;
-        Ok(Self(descriptor))
+        let desc_record = OwnershipRecord::SchemaDescriptor {
+            schema_version: descriptor.version,
+            descriptor_bytes: desc_bytes,
+        };
+        let mut encoded_record = Vec::new();
+        desc_record.encode(&mut encoded_record);
+        let identity = SchemaIdentity::from_raw(*blake3::hash(&encoded_record[1..]).as_bytes());
+        Ok(Self {
+            descriptor,
+            encoded_record,
+            identity,
+        })
     }
 
     /// Returns the declared schema version.
     #[must_use]
     pub fn version(&self) -> u32 {
-        self.0.version
+        self.descriptor.version
     }
 
     /// Returns the root descriptor AST node.
     #[must_use]
     pub fn root(&self) -> &DescriptorNode {
-        &self.0.root
+        &self.descriptor.root
     }
 
     /// Returns the inner [`SchemaDescriptor`].
     #[must_use]
     pub fn into_inner(self) -> SchemaDescriptor {
-        self.0
+        self.descriptor
     }
 
     /// Returns a reference to the inner [`SchemaDescriptor`].
     #[must_use]
     pub fn descriptor(&self) -> &SchemaDescriptor {
-        &self.0
+        &self.descriptor
     }
 
     /// Derives the schema identity.
     #[must_use]
     pub fn identity(&self) -> SchemaIdentity {
-        SchemaIdentity::from_descriptor(self)
+        self.identity
+    }
+
+    /// Returns the canonical encoded [`OwnershipRecord::SchemaDescriptor`] wire bytes.
+    #[must_use]
+    pub fn encoded_record(&self) -> &[u8] {
+        &self.encoded_record
     }
 
     /// Creates a default valid descriptor for testing.
     #[cfg(any(test, feature = "unstable-test-support"))]
     #[must_use]
     pub fn default_for_test() -> Self {
-        Self(SchemaDescriptor::new(1, DescriptorNode::U64))
+        Self::try_from_descriptor(SchemaDescriptor::new(1, DescriptorNode::U64))
+            .expect("default_for_test descriptor must be valid")
     }
 }
 
@@ -720,13 +754,13 @@ impl std::ops::Deref for AdmittedDescriptor {
     type Target = SchemaDescriptor;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.descriptor
     }
 }
 
 impl AsRef<SchemaDescriptor> for AdmittedDescriptor {
     fn as_ref(&self) -> &SchemaDescriptor {
-        &self.0
+        &self.descriptor
     }
 }
 
@@ -907,8 +941,7 @@ impl SchemaIdentity {
     /// Computes schema identity from an admitted schema descriptor.
     #[must_use]
     pub fn from_descriptor(descriptor: &AdmittedDescriptor) -> Self {
-        Self::try_from_descriptor(descriptor.version(), descriptor.root())
-            .expect("AdmittedDescriptor is guaranteed valid by construction")
+        descriptor.identity()
     }
 
     /// Returns reference to 32-byte hash digest.

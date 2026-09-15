@@ -1026,3 +1026,67 @@ fn test_file_open_write_acquires_lock_before_authority_metadata_read() {
 
     drop(writer1);
 }
+
+#[test]
+fn test_file_open_write_both_presence_missing_or_invalid_schema_descriptor_fails_closed() {
+    use std::io::Write;
+
+    let dir = TestDir::new("both_missing_schema_desc");
+    let base_path = dir.path().join("store");
+    let adapter = FileStorageAdapter::new(&base_path);
+    let claim = sample_claim(1);
+
+    let mut meta_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(adapter.meta_path())
+        .expect("create meta");
+    meta_file
+        .write_all(&ContainerHeader::new().to_bytes())
+        .expect("write meta header");
+    let mut claim_bytes = Vec::new();
+    OwnershipRecord::OwnershipClaim(claim.clone()).encode(&mut claim_bytes);
+    let mut claim_frame = Vec::new();
+    ContainerFrame::encode_payload(&claim_bytes, &mut claim_frame);
+    meta_file
+        .write_all(&claim_frame)
+        .expect("write claim frame");
+    drop(meta_file);
+
+    let mut pgno_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(adapter.pgno_path())
+        .expect("create pgno");
+    pgno_file
+        .write_all(&ContainerHeader::new().to_bytes())
+        .expect("write pgno header");
+    drop(pgno_file);
+
+    assert_eq!(adapter.try_presence().unwrap(), ArtefactPresence::Both);
+
+    let err_missing = adapter
+        .open_write(1)
+        .expect_err("open_write must fail when descriptor missing in Both presence");
+    assert_eq!(
+        *err_missing.condition(),
+        FailureCondition::MissingSchemaDescriptor
+    );
+
+    adapter
+        .record_meta_record_for_test(&OwnershipRecord::SchemaDescriptor {
+            schema_version: 0,
+            descriptor_bytes: vec![1],
+        })
+        .expect("record invalid version 0 descriptor");
+
+    assert_eq!(adapter.try_presence().unwrap(), ArtefactPresence::Both);
+
+    let err_invalid = adapter
+        .open_write(1)
+        .expect_err("open_write must fail when descriptor has invalid version 0 in Both presence");
+    assert_eq!(
+        *err_invalid.condition(),
+        FailureCondition::MissingSchemaDescriptor
+    );
+}

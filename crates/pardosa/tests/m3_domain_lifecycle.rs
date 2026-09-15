@@ -699,8 +699,12 @@ fn run_rustc(code: &str) -> (bool, String) {
         .to_path_buf();
 
     let cargo_cmd = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let mut cargo_args = vec!["build", "-p", "pardosa", "--lib", "--message-format=json"];
+    if deps_dir.iter().any(|c| c == "release") || cfg!(not(debug_assertions)) {
+        cargo_args.push("--release");
+    }
     let output = Command::new(&cargo_cmd)
-        .args(["build", "-p", "pardosa", "--lib", "--message-format=json"])
+        .args(&cargo_args)
         .output()
         .expect("invoke cargo build for pardosa");
     if !output.status.success() {

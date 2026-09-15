@@ -918,26 +918,8 @@ impl NatsStorageAdapter {
                 ));
             }
 
-            let mut desc_bytes = Vec::new();
-            descriptor_clone
-                .root()
-                .encode(&mut desc_bytes)
-                .map_err(|err| {
-                    OperationFailure::new(
-                        FailureCondition::ValueConstraintViolated {
-                            constraint: ValueConstraint::TooLong,
-                        },
-                        format!("failed to encode schema descriptor: {err}"),
-                    )
-                })?;
-            let desc_record = OwnershipRecord::SchemaDescriptor {
-                schema_version: descriptor_clone.version(),
-                descriptor_bytes: desc_bytes,
-            };
-            let mut desc_record_bytes = Vec::new();
-            desc_record.encode(&mut desc_record_bytes);
             let mut desc_frame = Vec::new();
-            ContainerFrame::encode_payload(&desc_record_bytes, &mut desc_frame);
+            ContainerFrame::encode_payload(descriptor_clone.encoded_record(), &mut desc_frame);
 
             let mut desc_meta_headers = async_nats::HeaderMap::new();
             desc_meta_headers.insert(
