@@ -825,6 +825,7 @@ impl FileStorageAdapter {
     /// Returns [`OperationFailure`] with [`FailureCondition::ExclusionUnavailable`] or
     /// [`FailureCondition::AnotherOwnerHoldsExclusion`] if writer exclusion fails.
     /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] if initial claim exceeds `u32::MAX`.
+    /// All underlying presence, creation, write, sync, and exclusion failures propagate.
     pub fn create(
         &self,
         initial_claim: &OwnershipClaimRecord,

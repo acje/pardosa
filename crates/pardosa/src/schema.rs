@@ -165,7 +165,7 @@ impl DescriptorNode {
     ///
     /// # Errors
     /// Returns `EncodeError::DepthExceeded` if recursion depth exceeds `MAX_RECURSION_DEPTH` (16).
-    /// Returns `EncodeError::Custom` on length overflow, if a discriminant exceeds its width, or if wire length exceeds `u32::MAX`.
+    /// Returns `EncodeError::Custom` on component u32 overflow, aggregate usize overflow, or if a discriminant exceeds its width. Aggregate wire bounds (64 KiB) are enforced separately during descriptor admission.
     pub fn encoded_len(&self) -> Result<usize, EncodeError> {
         self.encoded_len_recursive(0)
     }
@@ -732,7 +732,7 @@ impl SchemaDescriptor {
     ///
     /// # Errors
     /// Returns `EncodeError::DepthExceeded` if recursion depth exceeds `MAX_RECURSION_DEPTH` (16).
-    /// Returns `EncodeError::Custom` on length overflow, if wire length exceeds `u32::MAX`, or if a discriminant exceeds its width.
+    /// Returns `EncodeError::Custom` on component u32 overflow, aggregate usize overflow, or if a discriminant exceeds its width. Aggregate wire bounds (64 KiB) are enforced separately during descriptor admission.
     pub fn encoded_record_len(&self) -> Result<usize, EncodeError> {
         let root_len = self.root.encoded_len()?;
         1usize

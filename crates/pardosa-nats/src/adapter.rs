@@ -1087,8 +1087,8 @@ impl NatsStorageAdapter {
     ///
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::StoreAlreadyExists`] if artefact already exists.
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if creation fails.
     /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] if initial claim exceeds `u32::MAX`.
+    /// All underlying presence, JetStream stream creation, metadata publish, sync, and exclusion failures propagate.
     pub fn create(
         &self,
         initial_claim: &OwnershipClaimRecord,
