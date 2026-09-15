@@ -346,6 +346,14 @@ impl<E: StorageEngine> Store<E> {
         &mut self,
         payload: &[u8],
     ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
+        if payload.len() > u32::MAX as usize {
+            return Err(OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                },
+                "payload exceeds maximum container frame length (u32::MAX)",
+            ));
+        }
         self.check_session_authority()?;
         if payload.len() < 85 {
             return Err(OperationFailure::new(

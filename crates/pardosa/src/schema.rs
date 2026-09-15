@@ -757,7 +757,7 @@ impl AdmittedDescriptor {
     /// has version 0, depth > 16, invalid or duplicate discriminants, invalid widths,
     /// root AST string lengths exceed [`MAX_DESCRIPTOR_RECORD_BYTES`],
     /// encoding wire length overflow, or if the encoded descriptor record exceeds
-    /// [`MAX_DESCRIPTOR_RECORD_BYTES`] (64 KiB per C8.2).
+    /// [`MAX_DESCRIPTOR_RECORD_BYTES`] (64 KiB per authorized 64 KiB implementation resource bound).
     pub fn try_from_descriptor(descriptor: SchemaDescriptor) -> Result<Self, OperationFailure> {
         descriptor.validate_structural_completeness()?;
         check_ast_string_lengths(&descriptor.root)?;

@@ -109,11 +109,11 @@ impl ContainerFrame {
 
     /// Encodes a payload into container framing format (length + payload + CRC32C).
     ///
-    /// If `payload.len()` exceeds `u32::MAX`, this function returns safely without modifying
-    /// `buf` rather than panicking. Callers requiring fallible error propagation should use
-    /// [`try_encode_payload`](Self::try_encode_payload).
+    /// # Panics
+    /// Panics if `payload.len()` exceeds `u32::MAX` per C3.4 framing.
     pub fn encode_payload(payload: &[u8], buf: &mut Vec<u8>) {
-        let _ = Self::try_encode_payload(payload, buf);
+        Self::try_encode_payload(payload, buf)
+            .expect("payload length must fit u32 per C3.4 framing");
     }
 
     /// Tries to encode a payload into container framing format (length + payload + CRC32C).
