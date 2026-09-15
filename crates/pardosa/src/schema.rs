@@ -18,19 +18,6 @@ pub const MAX_RECURSION_DEPTH: usize = MAX_DESCRIPTOR_DEPTH;
 /// Authorized implementation bound: 64 KiB maximum encoded descriptor record size to prevent unbounded metadata allocations.
 pub const MAX_DESCRIPTOR_RECORD_BYTES: usize = 65536;
 
-#[allow(dead_code)]
-pub(crate) fn check_descriptor_record_len(len: usize) -> Result<(), OperationFailure> {
-    if u32::try_from(len).is_err() || len > MAX_DESCRIPTOR_RECORD_BYTES {
-        return Err(OperationFailure::new(
-            FailureCondition::ValueConstraintViolated {
-                constraint: ValueConstraint::TooLong,
-            },
-            format!("encoded descriptor record exceeds 64 KiB: {len}"),
-        ));
-    }
-    Ok(())
-}
-
 /// A field within a struct descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldDescriptor {
@@ -2095,22 +2082,6 @@ mod tests {
     }
 
     #[test]
-    fn test_descriptor_record_len_boundary_allocation_free() {
-        assert!(check_descriptor_record_len(MAX_DESCRIPTOR_RECORD_BYTES).is_ok());
-        let err = check_descriptor_record_len(MAX_DESCRIPTOR_RECORD_BYTES + 1).unwrap_err();
-        match err.condition() {
-            FailureCondition::ValueConstraintViolated { constraint } => {
-                assert_eq!(constraint, &ValueConstraint::TooLong);
-            }
-            other => panic!("expected ValueConstraintViolated, got {other:?}"),
-        }
-        assert_eq!(
-            err.diagnostic_detail().message(),
-            "encoded descriptor record exceeds 64 KiB: 65537"
-        );
-    }
-
-    #[test]
     fn test_descriptor_exact_wire_boundary_struct_admission() {
         let exact_field_len = 65516;
         let desc_exact = SchemaDescriptor::new(
@@ -2195,6 +2166,165 @@ mod tests {
                 assert_eq!(constraint, &ValueConstraint::TooLong);
             }
             other => panic!("expected ValueConstraintViolated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_descriptor_node_encoded_len_parity() {
+        let shapes = vec![
+            DescriptorNode::U8,
+            DescriptorNode::U16,
+            DescriptorNode::U32,
+            DescriptorNode::U64,
+            DescriptorNode::I8,
+            DescriptorNode::I16,
+            DescriptorNode::I32,
+            DescriptorNode::I64,
+            DescriptorNode::Bool,
+            DescriptorNode::Timestamp,
+            DescriptorNode::Uuid,
+            DescriptorNode::OrderedF32,
+            DescriptorNode::OrderedF64,
+            DescriptorNode::EventString { max_bytes: 100 },
+            DescriptorNode::NonEmptyEventString { max_bytes: 50 },
+            DescriptorNode::EventBytes { max_bytes: 256 },
+            DescriptorNode::Option {
+                inner: Box::new(DescriptorNode::Uuid),
+            },
+            DescriptorNode::Option {
+                inner: Box::new(DescriptorNode::EventString { max_bytes: 64 }),
+            },
+            DescriptorNode::EventVec {
+                inner: Box::new(DescriptorNode::U32),
+                max_items: 10,
+            },
+            DescriptorNode::EventVec {
+                inner: Box::new(DescriptorNode::Option {
+                    inner: Box::new(DescriptorNode::I16),
+                }),
+                max_items: 5,
+            },
+            DescriptorNode::Struct {
+                name: "Empty".to_string(),
+                fields: vec![],
+            },
+            DescriptorNode::Struct {
+                name: "Person".to_string(),
+                fields: vec![
+                    FieldDescriptor {
+                        name: "age".to_string(),
+                        node: DescriptorNode::U8,
+                    },
+                    FieldDescriptor {
+                        name: "name".to_string(),
+                        node: DescriptorNode::EventString { max_bytes: 32 },
+                    },
+                ],
+            },
+            DescriptorNode::Enum {
+                name: "State".to_string(),
+                discriminant_width: 1,
+                variants: vec![
+                    VariantDescriptor {
+                        discriminant: 0,
+                        name: "Off".to_string(),
+                        payload: None,
+                    },
+                    VariantDescriptor {
+                        discriminant: 1,
+                        name: "On".to_string(),
+                        payload: None,
+                    },
+                ],
+            },
+            DescriptorNode::Enum {
+                name: "Action".to_string(),
+                discriminant_width: 1,
+                variants: vec![
+                    VariantDescriptor {
+                        discriminant: 0,
+                        name: "Stop".to_string(),
+                        payload: None,
+                    },
+                    VariantDescriptor {
+                        discriminant: 1,
+                        name: "Move".to_string(),
+                        payload: Some(DescriptorNode::U32),
+                    },
+                ],
+            },
+            DescriptorNode::Enum {
+                name: "Code".to_string(),
+                discriminant_width: 2,
+                variants: vec![
+                    VariantDescriptor {
+                        discriminant: 256,
+                        name: "High".to_string(),
+                        payload: Some(DescriptorNode::Uuid),
+                    },
+                    VariantDescriptor {
+                        discriminant: 65535,
+                        name: "Max".to_string(),
+                        payload: None,
+                    },
+                ],
+            },
+            DescriptorNode::Struct {
+                name: "Complex".to_string(),
+                fields: vec![
+                    FieldDescriptor {
+                        name: "id".to_string(),
+                        node: DescriptorNode::Uuid,
+                    },
+                    FieldDescriptor {
+                        name: "items".to_string(),
+                        node: DescriptorNode::EventVec {
+                            inner: Box::new(DescriptorNode::Option {
+                                inner: Box::new(DescriptorNode::Enum {
+                                    name: "Sub".to_string(),
+                                    discriminant_width: 1,
+                                    variants: vec![VariantDescriptor {
+                                        discriminant: 42,
+                                        name: "V".to_string(),
+                                        payload: None,
+                                    }],
+                                }),
+                            }),
+                            max_items: 100,
+                        },
+                    },
+                ],
+            },
+        ];
+
+        for (idx, node) in shapes.iter().enumerate() {
+            let mut actual_encoded_bytes = Vec::new();
+            node.encode(&mut actual_encoded_bytes)
+                .unwrap_or_else(|err| panic!("encoding shape {idx} must succeed: {err}"));
+            let predicted_len = node
+                .encoded_len()
+                .unwrap_or_else(|err| panic!("sizing shape {idx} must succeed: {err}"));
+            assert_eq!(
+                predicted_len,
+                actual_encoded_bytes.len(),
+                "node.encoded_len() must exactly match actual encoded byte length for shape {idx}"
+            );
+
+            let desc = SchemaDescriptor::new(1, node.clone());
+            let mut actual_record_bytes = Vec::new();
+            OwnershipRecord::SchemaDescriptor {
+                schema_version: 1,
+                descriptor_bytes: actual_encoded_bytes,
+            }
+            .encode(&mut actual_record_bytes);
+            let predicted_record_len = desc
+                .encoded_record_len()
+                .unwrap_or_else(|err| panic!("sizing record for shape {idx} must succeed: {err}"));
+            assert_eq!(
+                predicted_record_len,
+                actual_record_bytes.len(),
+                "desc.encoded_record_len() must exactly match actual encoded record byte length for shape {idx}"
+            );
         }
     }
 }

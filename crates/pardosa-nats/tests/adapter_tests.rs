@@ -2842,3 +2842,34 @@ fn test_nats_existing_stream_legacy_underscore_routing_reopen_and_append_continu
     adapter_a.delete_streams().expect("cleanup a");
     adapter_b.delete_streams().expect("cleanup b");
 }
+
+#[test]
+fn test_nats_adapter_create_oversized_claim_rejected_without_creating_streams() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("oversized_claim");
+    let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
+    let oversized_label = "x".repeat(u32::MAX as usize - 68);
+    let claim = OwnershipClaimRecord {
+        epoch: 1,
+        machine_id: [1u8; 16],
+        boot_id: [2u8; 16],
+        process_id: 12345,
+        process_start_time_ns: 1_000_000,
+        claim_time_ns: 2_000_000,
+        operator_label: oversized_label,
+    };
+    let err = adapter
+        .create(&claim, &sample_descriptor())
+        .expect_err("oversized claim must be rejected");
+    match err.condition() {
+        FailureCondition::ValueConstraintViolated { constraint } => {
+            assert_eq!(constraint, &ValueConstraint::TooLong);
+        }
+        other => panic!("expected ValueConstraintViolated, got {other:?}"),
+    }
+    assert_eq!(
+        adapter.try_presence().unwrap(),
+        ArtefactPresence::None,
+        "no streams must be created on JetStream broker"
+    );
+}

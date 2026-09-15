@@ -1,6 +1,6 @@
 //! JetStream storage adapter implementation for Pardosa.
 
-use pardosa::file::CONTAINER_FORMAT_VERSION;
+use pardosa::file::{compute_claim_wire_len, CONTAINER_FORMAT_VERSION};
 use pardosa::prelude::*;
 use std::fmt;
 use std::sync::Arc;
@@ -784,24 +784,7 @@ impl NatsStorageAdapter {
     ) -> Result<NatsWriterSession, OperationFailure> {
         admit_create(self.try_presence()?)?;
 
-        let claim_wire_len = 69usize
-            .checked_add(initial_claim.operator_label.len())
-            .ok_or_else(|| {
-                OperationFailure::new(
-                    FailureCondition::ValueConstraintViolated {
-                        constraint: ValueConstraint::TooLong,
-                    },
-                    "initial claim wire length exceeds address space",
-                )
-            })?;
-        if u32::try_from(claim_wire_len).is_err() {
-            return Err(OperationFailure::new(
-                FailureCondition::ValueConstraintViolated {
-                    constraint: ValueConstraint::TooLong,
-                },
-                format!("initial claim wire length exceeds u32::MAX: {claim_wire_len}"),
-            ));
-        }
+        let _ = compute_claim_wire_len(initial_claim.operator_label.len())?;
 
         let js = self.js.clone();
         let client = self.client.clone();

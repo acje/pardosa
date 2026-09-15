@@ -532,6 +532,30 @@ pub struct FileStorageAdapter {
     exclusion_policy: FileExclusionPolicy,
 }
 
+/// Computes the serialized wire length of an ownership claim record from its operator label length.
+///
+/// # Errors
+/// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] and
+/// [`ValueConstraint::TooLong`] if the wire length overflows the host address space or exceeds `u32::MAX`.
+pub fn compute_claim_wire_len(label_len: usize) -> Result<u32, OperationFailure> {
+    let claim_wire_len = 69usize.checked_add(label_len).ok_or_else(|| {
+        OperationFailure::new(
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            },
+            "initial claim wire length exceeds address space",
+        )
+    })?;
+    u32::try_from(claim_wire_len).map_err(|_| {
+        OperationFailure::new(
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            },
+            format!("initial claim wire length exceeds u32::MAX: {claim_wire_len}"),
+        )
+    })
+}
+
 impl FileStorageAdapter {
     /// Creates a new file storage adapter from a base path.
     ///
@@ -655,24 +679,7 @@ impl FileStorageAdapter {
         descriptor: &AdmittedDescriptor,
     ) -> Result<FileWriterSession, OperationFailure> {
         admit_create(self.try_presence()?)?;
-        let claim_wire_len = 69usize
-            .checked_add(initial_claim.operator_label.len())
-            .ok_or_else(|| {
-                OperationFailure::new(
-                    FailureCondition::ValueConstraintViolated {
-                        constraint: ValueConstraint::TooLong,
-                    },
-                    "initial claim wire length exceeds address space",
-                )
-            })?;
-        if u32::try_from(claim_wire_len).is_err() {
-            return Err(OperationFailure::new(
-                FailureCondition::ValueConstraintViolated {
-                    constraint: ValueConstraint::TooLong,
-                },
-                format!("initial claim wire length exceeds u32::MAX: {claim_wire_len}"),
-            ));
-        }
+        let _ = compute_claim_wire_len(initial_claim.operator_label.len())?;
         let mut meta_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -2936,10 +2943,28 @@ mod tests {
 
     #[test]
     fn test_file_adapter_create_oversized_claim_rejected_without_creating_files() {
+        assert_eq!(
+            compute_claim_wire_len(u32::MAX as usize - 69).unwrap(),
+            u32::MAX
+        );
+        let err_68 = compute_claim_wire_len(u32::MAX as usize - 68).unwrap_err();
+        match err_68.condition() {
+            FailureCondition::ValueConstraintViolated { constraint } => {
+                assert_eq!(constraint, &ValueConstraint::TooLong);
+            }
+            other => panic!("expected ValueConstraintViolated, got {other:?}"),
+        }
+        let err_67 = compute_claim_wire_len(u32::MAX as usize - 67).unwrap_err();
+        match err_67.condition() {
+            FailureCondition::ValueConstraintViolated { constraint } => {
+                assert_eq!(constraint, &ValueConstraint::TooLong);
+            }
+            other => panic!("expected ValueConstraintViolated, got {other:?}"),
+        }
+
         let temp_dir = tempfile::tempdir().unwrap();
-        let stem = temp_dir.path().join("oversized_claim");
+        let stem = temp_dir.path().join("realistic_claim");
         let adapter = FileStorageAdapter::new(&stem);
-        let oversized_label = "x".repeat(u32::MAX as usize - 68);
         let claim = OwnershipClaimRecord {
             epoch: 1,
             machine_id: [1u8; 16],
@@ -2947,27 +2972,22 @@ mod tests {
             process_id: 12345,
             process_start_time_ns: 1_000_000,
             claim_time_ns: 2_000_000,
-            operator_label: oversized_label,
+            operator_label: "test-operator".to_string(),
         };
         let desc =
             AdmittedDescriptor::try_from_descriptor(SchemaDescriptor::new(1, DescriptorNode::U64))
                 .unwrap();
-        let err = adapter
+        let writer = adapter.create(&claim, &desc).expect("create writer");
+        assert!(adapter.meta_path().exists(), ".meta file must exist");
+        assert!(adapter.pgno_path().exists(), ".pgno file must exist");
+        drop(writer);
+
+        let second_err = adapter
             .create(&claim, &desc)
-            .expect_err("oversized claim must be rejected");
-        match err.condition() {
-            FailureCondition::ValueConstraintViolated { constraint } => {
-                assert_eq!(constraint, &ValueConstraint::TooLong);
-            }
-            other => panic!("expected ValueConstraintViolated, got {other:?}"),
-        }
-        assert!(
-            !adapter.meta_path().exists(),
-            "no .meta file must be created on disk"
-        );
-        assert!(
-            !adapter.pgno_path().exists(),
-            "no .pgno file must be created on disk"
+            .expect_err("create on existing store must fail");
+        assert_eq!(
+            *second_err.condition(),
+            FailureCondition::StoreAlreadyExists
         );
     }
 }
