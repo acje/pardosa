@@ -532,28 +532,68 @@ pub struct FileStorageAdapter {
     exclusion_policy: FileExclusionPolicy,
 }
 
+#[cfg(any(test, feature = "unstable-test-support"))]
+/// Computes the serialized wire length of an ownership claim record bounded by a maximum wire length.
+///
+/// # Errors
+/// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] and
+/// [`ValueConstraint::TooLong`] if the wire length overflows `usize` or exceeds `max_wire_len` or `u32::MAX`.
+pub fn compute_claim_wire_len_bounded(
+    label_len: usize,
+    max_wire_len: usize,
+) -> Result<u32, OperationFailure> {
+    let base = 69usize;
+    let total = base.checked_add(label_len).ok_or_else(|| {
+        OperationFailure::new(
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            },
+            "claim wire length overflows usize",
+        )
+    })?;
+    if total > max_wire_len || total > u32::MAX as usize {
+        return Err(OperationFailure::new(
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            },
+            format!("claim wire length {total} exceeds maximum frame limit ({max_wire_len})"),
+        ));
+    }
+    Ok(total as u32)
+}
+
+#[cfg(not(any(test, feature = "unstable-test-support")))]
+pub(crate) fn compute_claim_wire_len_bounded(
+    label_len: usize,
+    max_wire_len: usize,
+) -> Result<u32, OperationFailure> {
+    let base = 69usize;
+    let total = base.checked_add(label_len).ok_or_else(|| {
+        OperationFailure::new(
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            },
+            "claim wire length overflows usize",
+        )
+    })?;
+    if total > max_wire_len || total > u32::MAX as usize {
+        return Err(OperationFailure::new(
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            },
+            format!("claim wire length {total} exceeds maximum frame limit ({max_wire_len})"),
+        ));
+    }
+    Ok(total as u32)
+}
+
 /// Computes the serialized wire length of an ownership claim record from its operator label length.
 ///
 /// # Errors
 /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] and
 /// [`ValueConstraint::TooLong`] if the wire length overflows the host address space or exceeds `u32::MAX`.
 pub fn compute_claim_wire_len(label_len: usize) -> Result<u32, OperationFailure> {
-    let claim_wire_len = 69usize.checked_add(label_len).ok_or_else(|| {
-        OperationFailure::new(
-            FailureCondition::ValueConstraintViolated {
-                constraint: ValueConstraint::TooLong,
-            },
-            "initial claim wire length exceeds address space",
-        )
-    })?;
-    u32::try_from(claim_wire_len).map_err(|_| {
-        OperationFailure::new(
-            FailureCondition::ValueConstraintViolated {
-                constraint: ValueConstraint::TooLong,
-            },
-            format!("initial claim wire length exceeds u32::MAX: {claim_wire_len}"),
-        )
-    })
+    compute_claim_wire_len_bounded(label_len, u32::MAX as usize)
 }
 
 impl FileStorageAdapter {
@@ -673,13 +713,14 @@ impl FileStorageAdapter {
     /// Returns [`OperationFailure`] with [`FailureCondition::ExclusionUnavailable`] or
     /// [`FailureCondition::AnotherOwnerHoldsExclusion`] if writer exclusion fails.
     /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] if initial claim exceeds `u32::MAX`.
-    pub fn create(
+    fn create_with_limit(
         &self,
         initial_claim: &OwnershipClaimRecord,
         descriptor: &AdmittedDescriptor,
+        max_wire_len: usize,
     ) -> Result<FileWriterSession, OperationFailure> {
         admit_create(self.try_presence()?)?;
-        let _ = compute_claim_wire_len(initial_claim.operator_label.len())?;
+        let _ = compute_claim_wire_len_bounded(initial_claim.operator_label.len(), max_wire_len)?;
         let mut meta_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -808,6 +849,35 @@ impl FileStorageAdapter {
 
         let store = Store::open_writer(engine)?;
         Ok(FileWriterSession { store })
+    }
+
+    /// Creates the artefact files exclusively with initial ownership claim per C5.10, C5.64, and C12.3.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::StoreAlreadyExists`] if artefact already exists.
+    /// Returns [`OperationFailure`] with [`FailureCondition::ExclusionUnavailable`] or
+    /// [`FailureCondition::AnotherOwnerHoldsExclusion`] if writer exclusion fails.
+    /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] if initial claim exceeds `u32::MAX`.
+    pub fn create(
+        &self,
+        initial_claim: &OwnershipClaimRecord,
+        descriptor: &AdmittedDescriptor,
+    ) -> Result<FileWriterSession, OperationFailure> {
+        self.create_with_limit(initial_claim, descriptor, u32::MAX as usize)
+    }
+
+    /// Creates the artefact files with an injected maximum wire length bound for testing.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if store already exists or claim wire length exceeds `max_wire_len`.
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    pub fn create_with_claim_bound(
+        &self,
+        initial_claim: &OwnershipClaimRecord,
+        descriptor: &AdmittedDescriptor,
+        max_wire_len: usize,
+    ) -> Result<FileWriterSession, OperationFailure> {
+        self.create_with_limit(initial_claim, descriptor, max_wire_len)
     }
 
     /// Appends an unvalidated frame directly to the container file for testing.
@@ -2942,7 +3012,7 @@ mod tests {
     }
 
     #[test]
-    fn test_file_adapter_create_oversized_claim_rejected_without_creating_files() {
+    fn test_claim_wire_len_boundary_arithmetic() {
         assert_eq!(
             compute_claim_wire_len(u32::MAX as usize - 69).unwrap(),
             u32::MAX
@@ -2961,7 +3031,40 @@ mod tests {
             }
             other => panic!("expected ValueConstraintViolated, got {other:?}"),
         }
+    }
 
+    #[test]
+    fn test_file_adapter_create_oversized_claim_rejected_without_creating_files() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stem = temp_dir.path().join("oversized_claim");
+        let adapter = FileStorageAdapter::new(&stem);
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1u8; 16],
+            boot_id: [2u8; 16],
+            process_id: 12345,
+            process_start_time_ns: 1_000_000,
+            claim_time_ns: 2_000_000,
+            operator_label: "a".repeat(50),
+        };
+        let desc =
+            AdmittedDescriptor::try_from_descriptor(SchemaDescriptor::new(1, DescriptorNode::U64))
+                .unwrap();
+        let err = adapter
+            .create_with_claim_bound(&claim, &desc, 100)
+            .expect_err("oversized claim must be rejected");
+        match err.condition() {
+            FailureCondition::ValueConstraintViolated { constraint } => {
+                assert_eq!(constraint, &ValueConstraint::TooLong);
+            }
+            other => panic!("expected ValueConstraintViolated, got {other:?}"),
+        }
+        assert!(!adapter.meta_path().exists(), ".meta file must not exist");
+        assert!(!adapter.pgno_path().exists(), ".pgno file must not exist");
+    }
+
+    #[test]
+    fn test_file_adapter_create_valid_claim_creates_files_and_prevents_duplicate() {
         let temp_dir = tempfile::tempdir().unwrap();
         let stem = temp_dir.path().join("realistic_claim");
         let adapter = FileStorageAdapter::new(&stem);

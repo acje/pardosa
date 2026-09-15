@@ -18,6 +18,11 @@ pub const MAX_RECURSION_DEPTH: usize = MAX_DESCRIPTOR_DEPTH;
 /// Authorized implementation bound: 64 KiB maximum encoded descriptor record size to prevent unbounded metadata allocations.
 pub const MAX_DESCRIPTOR_RECORD_BYTES: usize = 65536;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static THREAD_ENCODE_CALL_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A field within a struct descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldDescriptor {
@@ -151,14 +156,17 @@ impl DescriptorNode {
     /// Returns `EncodeError::DepthExceeded` if recursion depth exceeds `MAX_DESCRIPTOR_DEPTH` (16).
     /// Returns `EncodeError::Custom` if a discriminant exceeds its width or if wire length exceeds `u32::MAX`.
     pub fn encode(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
+        #[cfg(test)]
+        THREAD_ENCODE_CALL_COUNT.with(|cell| cell.set(cell.get() + 1));
         self.encode_recursive(buf, 0)
     }
 
-    /// Calculates the exact encoded length of this descriptor node without allocating.
+    /// Computes the exact encoded wire length using checked usize arithmetic.
     ///
     /// # Errors
     /// Returns `EncodeError::DepthExceeded` if recursion depth exceeds `MAX_RECURSION_DEPTH` (16).
-    /// Returns `EncodeError::Custom` if wire length overflows or exceeds `u32::MAX`, or if a discriminant exceeds its width.
+    /// Returns `EncodeError::LengthOverflow` if component lengths or aggregate length overflows `usize`.
+    /// Returns `EncodeError::Custom` if a discriminant exceeds its width or if wire length exceeds `u32::MAX`.
     pub fn encoded_len(&self) -> Result<usize, EncodeError> {
         self.encoded_len_recursive(0)
     }
@@ -721,11 +729,12 @@ impl SchemaDescriptor {
         self.root.encode(buf)
     }
 
-    /// Calculates the exact encoded length of this schema descriptor as an ownership record without allocating.
+    /// Computes the exact encoded wire length using checked usize arithmetic.
     ///
     /// # Errors
     /// Returns `EncodeError::DepthExceeded` if recursion depth exceeds `MAX_RECURSION_DEPTH` (16).
-    /// Returns `EncodeError::Custom` if wire length overflows or exceeds `u32::MAX`, or if a discriminant exceeds its width.
+    /// Returns `EncodeError::LengthOverflow` if component lengths or aggregate length overflows `usize`.
+    /// Returns `EncodeError::Custom` if wire length exceeds `u32::MAX`, or if a discriminant exceeds its width.
     pub fn encoded_record_len(&self) -> Result<usize, EncodeError> {
         let root_len = self.root.encoded_len()?;
         1usize
@@ -755,7 +764,8 @@ impl SchemaDescriptor {
     ///
     /// # Errors
     /// Returns [`OperationFailure`] if the descriptor violates structural completeness,
-    /// has version 0, depth > 16, invalid or duplicate discriminants, or invalid widths.
+    /// has version 0, depth > 16, invalid or duplicate discriminants, invalid widths,
+    /// or if encoded descriptor record exceeds 64 KiB.
     pub fn try_identity(&self) -> Result<SchemaIdentity, OperationFailure> {
         let admitted = AdmittedDescriptor::try_from_descriptor(self.clone())?;
         Ok(SchemaIdentity::from_descriptor(&admitted))
@@ -2158,15 +2168,32 @@ mod tests {
                 ],
             },
         );
+        let expected_len = desc
+            .encoded_record_len()
+            .expect("encoded_record_len must calculate length without allocating");
+        assert_eq!(expected_len, 66025);
+        assert!(expected_len > MAX_DESCRIPTOR_RECORD_BYTES);
+
+        let count_before = THREAD_ENCODE_CALL_COUNT.with(|cell| cell.get());
         let err = AdmittedDescriptor::try_from_descriptor(desc).expect_err(
             "aggregate fields exceeding 64 KiB must be rejected with TooLong before allocation",
         );
+        let count_after = THREAD_ENCODE_CALL_COUNT.with(|cell| cell.get());
+        assert_eq!(
+            count_before, count_after,
+            "root.encode must not be executed when aggregate descriptor exceeds 64 KiB"
+        );
+
         match err.condition() {
             FailureCondition::ValueConstraintViolated { constraint } => {
                 assert_eq!(constraint, &ValueConstraint::TooLong);
             }
             other => panic!("expected ValueConstraintViolated, got {other:?}"),
         }
+        assert_eq!(
+            err.diagnostic_detail().message(),
+            format!("encoded descriptor record exceeds 64 KiB: {expected_len}")
+        );
     }
 
     #[test]
