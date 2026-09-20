@@ -1,8 +1,39 @@
 # Agent Instructions
 
+## Current producer and delivery authority
+
+The implementation is in this repository: `crates/pardosa`,
+`crates/pardosa-derive`, and `crates/pardosa-nats`; `scripts` is the fourth
+workspace member. The compiler pin is `1.98.0`, while the three library
+manifests currently declare edition 2021 and MSRV 1.89.0 (resolver 2).
+
+Cross-repository operational authority is
+[gh-report trunk delivery](../gh-report/docs/trunk-delivery.md) in the canonical
+sibling checkout (`Mattilsynet/gh-report`, `docs/trunk-delivery.md`). Local
+specification and source authority remain here. Active adoption work is tracked
+in gh-report's `ghr-hxyqs.66`, alongside Pardosa's existing review records.
+
+After dependency intake, run implementation checks from this repository:
+
+```sh
+cargo atest -p pardosa --locked
+cargo aclippy -p pardosa --all-targets --locked -- -D warnings
+cargo atest -p pardosa -p pardosa-derive -p pardosa-nats --locked
+cargo aclippy -p pardosa -p pardosa-derive -p pardosa-nats --all-targets --locked -- -D warnings
+cargo fmt --all -- --check
+```
+
+The first pair is INNER; the three-package pair is the current adoption MID
+baseline. Record failures and live-NATS skips explicitly. Retain the root
+`Cargo.lock` as a reproducible producer verification/release input. The fresh
+admission baseline is recorded in gh-report bead `ghr-krvir`; historical
+producer revisions did not track a lock, so this is not historical dependency
+parity. Reassess intake when the lock, selected features, or execution context
+changes.
+
 ## Resuming the pardosa 1.0 spec work
 
-This repo's active work is a **wayfinder map** — a bd epic whose child tickets
+The specification roadmap is a **wayfinder map** — a bd epic whose child tickets
 are the open decisions between here and a defined end state for the pardosa
 library. To pick it up:
 
@@ -16,11 +47,12 @@ library. To pick it up:
 4. Resolve one ticket per session (research tickets are the exception — those
    may be batched). Record the answer with `bd comment <id>`, close with
    `bd close <id> --reason "<gist>"`, and add a one-line entry to the map's
-   Decisions-so-far via `bd update pardosa-jn1 --stdin`.
+   Decisions-so-far by safely appending to the existing description; `bd update
+   --stdin` replaces the body, so read and preserve it before updating.
 
-**Run `bd` from this repo's directory.** bd resolves its workspace from the
-current directory; from the gh-report checkout the same commands resolve a
-different store (prefix `adr-fmt`) and will not find `pardosa-jn1`.
+**Pin `bd -C <canonical-pardosa-root>` and verify the returned prefix/path.**
+The sibling gh-report store has prefix `ghr`; use its explicit root for the
+cross-repository adoption contract. Ambient discovery is not store identity.
 
 **On a fresh clone**, the beads data comes from the git remote, not the
 worktree: `git clone` then `bd dolt pull`. `.beads/issues.jsonl` is a passive
@@ -30,10 +62,9 @@ Ticket types carry a `wayfinder:<type>` label. `research` is AFK — dispatch
 `copernicus` via Task. `grilling` is HITL — it needs the human, and an agent
 answering its own grilling questions has broken the method.
 
-Reference material for the spec lives in `docs/origin/`; the working
-implementation being specified is in the sibling `gh-report` checkout under
-`crates/pardosa*`, and is reference material rather than the thing being
-published.
+Reference material for the spec lives in `docs/origin/`; the current producer
+implementation lives in this repository's `crates/pardosa*`. The sibling
+gh-report consumes revision-pinned git dependencies, not local Pardosa members.
 
 ## Checking the spec
 
@@ -41,7 +72,7 @@ published.
 ./scripts/check.sh
 ```
 
-This is the repo's only quality gate, and it runs locally — there is no CI. It
+This is the local spec-consistency gate, separate from implementation checks. It
 runs the `spec-coverage` checker in `scripts/` over `docs/spec/pardosa-1.0.md`
 and the RULED trace, and exits non-zero if any check fails. The nine checks
 assert that the trace and the spec stay mutually consistent: every RULED row in
@@ -57,10 +88,10 @@ both marker tokens, and without the exemption `regime_marker_unique` fires on it
 The exemption is spelled out at the call site rather than defaulted inside the
 binary, so that the one clause holding it stays visible.
 
-There is no GitHub Actions workflow, and that is a decision rather than an
-omission: the repo has no `.github/` at all, and adding one would mint a CI
-surface with permission and gate-failure commitments nobody has asked for.
-`scripts/check.sh` is the named local entry point instead.
+At the inspected `3d94d73` baseline there is no tracked `.github` workflow.
+This observation is not a prohibition on future reviewed CI work or evidence
+of GitHub branch-protection state. `scripts/check.sh` remains the named local
+spec entry point; it does not replace Cargo implementation checks.
 
 ### Two notes on the bd-generated sections below
 

@@ -32,4 +32,4 @@ serde_json = "1"
 
 [features]
 default = []
-unstable-test-support = ["dep:tempfile"]
+unstable-test-support = ["dep:tempfile", "pardosa/unstable-test-support"]

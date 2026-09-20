@@ -12,8 +12,11 @@
 //!   `Concluded`, `Retired`) governing event admission, cursor progression, and deterministic recovery.
 //! - **Single-Writer Ownership Fencing**: Monotonic epochs, machine/boot/process identity vectors, and fencing
 //!   guarantees ensuring at most one active writer session per artefact.
-//! - **Migration and Cutover**: Online chase/freeze/cutover lifecycle with caller-selected migration policies
-//!   and immutable predecessor/successor generation pointers.
+//! - **Migration and Cutover**: Live migration execution is disabled in this release per approved
+//!   constrained release decision (offline administrative migration only); historical migration records
+//!   ([`encoding::InboundPointerRecord`], [`encoding::OutboundPointerRecord`]) remain readable for lineage audit,
+//!   and strict `n -> n+1` compile-time verified migration contracts ([`migration::MigrationWitness`],
+//!   [`migration::VersionMigration`], [`migration::AdjacentMigration`]) enforce declared schema version transitions.
 //!
 //! # Per-Condition Remedies
 //!
@@ -28,10 +31,11 @@
 //!   Remedy: Relinquish writer session; do not retry without re-establishing mutual exclusion.
 //! - [`store::FailureCondition::OwnershipUnestablished`]: Writer session cannot conclusively prove current ownership.
 //!   Remedy: Refresh ownership claim or inspect operator fence state before retrying.
-//! - [`store::FailureCondition::InvariantBreakingConfiguration`]: Unrecoverable protocol or storage violation encountered.
-//!   Remedy: Close the store; inspect error details and execute migration or rescue recovery per C4.7.
+//! - [`store::FailureCondition::InvariantBreakingConfiguration`]: Unrecoverable protocol or storage violation encountered,
+//!   or invocation of disabled live migration execution.
+//!   Remedy: Close the store; inspect error details and execute offline administrative migration per approved release decision.
 //!
-//! # Truthful Seal Limits (S5)
+//! # Truthful Seal Limits (S5 / I2)
 //!
 //! Per C4.24 and C6.35:
 //! - Pardosa establishes that a schema descriptor was produced by one of the fixed producers recognized by this
@@ -40,8 +44,12 @@
 //!   Pardosa establishes. Pardosa states this boundary honestly wherever descriptors are consumed: structural
 //!   validity and producer authenticity are verified, but runtime semantic fidelity of user fields cannot be
 //!   proven by the storage engine.
-//! - Storage adapter traits remain sealed (C4.9, C4.10): Only internal adapters are admitted at 1.0. Third parties
-//!   establish conformance against public obligations rather than providing arbitrary external adapter implementations.
+//! - **Present Open vs Planned 1.0 Sealed Traits**: During the 0.5.x foundation line, [`store::StorageEngine`]
+//!   remains an open trait within workspace crates to permit adapter development and verification across both
+//!   filesystem and JetStream backends. At the 1.0 freeze, storage adapter traits are planned to be sealed
+//!   (C4.9, C4.10) so only official internal adapters (`FileStorageAdapter`, `NatsStorageAdapter`) are admitted.
+//!   Third parties establish conformance against public facade specifications rather than implementing external
+//!   storage driver engines.
 //!
 //! # Shipped Producer Inventory (S10)
 //!
@@ -66,7 +74,42 @@
 //!
 //! Per C4.21, an artefact is read only by the major line that wrote it. Cross-major data export is the operator's
 //! responsibility via the migration subsystem.
-
+//!
+//! # Resource Allocation and Accounting Disclosure (R12 / M6 / M9 / L4)
+//!
+//! Pardosa operates as an in-process library without autonomous memory sandboxing or background workers:
+//! - **Single-Event Ingestion**: Writes execute synchronously one event at a time via [`store::Store::append_to_fiber`],
+//!   [`store::Store::append_envelope_verdict`], or [`store::Store::append_frame_verdict`].
+//! - **Buffer Allocations and File Bulk Read Materialization**: Frame encoding allocates a local buffer proportional
+//!   to payload length, verified and durably committed prior to subsequent writes. Point lookups and event decoding
+//!   allocate single envelope structures on the caller heap. Bulk reads (`read_all`, `build_from_frames`, and file
+//!   container recovery) materialize all raw container frames into memory at once as contiguous byte vectors (`Vec<Vec<u8>>`);
+//!   callers opening reader sessions or running recovery over large container files must budget heap memory proportional
+//!   to total container size plus vector descriptor overhead.
+//! - **Session State and Event ID Accounting**: In-memory fiber indexing in [`store::SessionIndex`] tracks active
+//!   fiber state in heap-allocated maps. Session limits are bounded by `MAX_ACTIVE_FIBERS` (100,000) active fiber
+//!   handles and `MAX_EVENTS_PER_FIBER` (100,000) events per fiber. In addition, `seen_event_ids` retains every
+//!   observed event identifier across the entire session in a heap-allocated hash set (`HashSet<[u8; 16]>`) for
+//!   generation-wide duplicate rejection (C5.23 / H2); its memory overhead grows monotonically by ~32-48 bytes per
+//!   unique event ID and is never pruned during the session lifetime.
+//! - **Broken Slot Accounting**: When a fiber is marked broken or invalid history is discovered during recovery,
+//!   `SessionIndex` retains a `FiberSlot::Broken` entry rather than removing the fiber. This preserves error diagnostics
+//!   and event counts while refusing further appends or point lookups. Broken slots count against active fiber capacity
+//!   when new fibers are added.
+//! - **Fiber Tip Payloads**: Active fibers in `SessionIndex` retain their latest committed event envelope and payload
+//!   in memory to support predecessor commitment verification and $O(1)$ tip lookups via [`store::Store::get_latest`].
+//! - **NATS Buffer Copies**: Network operations in `NatsStorageAdapter` and `NatsEngine` perform buffer copies
+//!   between Pardosa frames, `async_nats::Message` payloads, and Tokio runtime buffers during publishing and recovery.
+//! - **Caller Backpressure Responsibilities**: Pardosa provides no asynchronous queues, worker pools, or automatic
+//!   rate-limiting. The calling host application is strictly responsible for managing thread concurrency, applying
+//!   backpressure to upstream event producers, enforcing global process memory quotas, and establishing collection
+//!   deadlines.
+//! - **EventVec Decode Work Bounds**: [`encoding::EventVec`] decoding bounds initial heap allocation by
+//!   `remaining_wire.min(count)` and bounds decoding work by `MAX`, ensuring collection decoding
+//!   cannot exceed admitted schema limits.
+//! - **Transport Isolation**: Transport operations execute synchronously with sequential durability. `NatsEngine`
+//!   drains each publish future sequentially before initiating subsequent requests.
+//!
 #![deny(missing_docs)]
 
 pub mod encoding;
@@ -76,4 +119,4 @@ pub mod prelude;
 pub mod schema;
 pub mod store;
 
-pub use pardosa_derive::PardosaSchema;
+pub use pardosa_derive::{PardosaSchema, PardosaType};

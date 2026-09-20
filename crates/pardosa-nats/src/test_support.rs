@@ -36,6 +36,15 @@ impl LiveNatsServer {
         fresh
     }
 
+    /// Starts a private server whose lifetime is independent of the shared fixture.
+    ///
+    /// # Panics
+    /// Panics if the private server cannot start.
+    #[must_use]
+    pub fn isolated() -> Self {
+        Self::spawn().expect("failed to spawn isolated nats-server")
+    }
+
     /// URL of the running server in `nats://127.0.0.1:<port>` format.
     #[must_use]
     pub fn url(&self) -> &str {
@@ -49,7 +58,7 @@ impl LiveNatsServer {
 
         let tempdir = TempDir::new()?;
         let host = "127.0.0.1";
-        let child = Command::new("nats-server")
+        let mut child = Command::new("nats-server")
             .arg("-a")
             .arg(host)
             .arg("-p")
@@ -63,7 +72,11 @@ impl LiveNatsServer {
             .spawn()?;
 
         let url = format!("nats://{host}:{port}");
-        wait_for_readiness(&url)?;
+        if let Err(err) = wait_for_readiness(&url) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
 
         Ok(Self {
             url,

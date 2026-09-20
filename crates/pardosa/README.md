@@ -44,8 +44,13 @@ let claim = OwnershipClaimRecord {
     operator_label: "service-worker".to_string(),
 };
 
+// Admitted schema descriptor
+let descriptor = AdmittedDescriptor::try_from_descriptor(
+    SchemaDescriptor::new(1, DescriptorNode::U64)
+)?;
+
 // Open or create writer session
-let mut writer = adapter.create(&claim)?;
+let mut writer = adapter.create(&claim, &descriptor)?;
 
 // Derive deterministic fiber ID from domain aggregate identity
 let fiber_id = derive_fiber_id("ord-12345");

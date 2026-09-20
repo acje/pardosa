@@ -48,6 +48,42 @@ fn sample_chained_envelope(
 }
 
 #[test]
+fn test_m6_live_migration_manager_and_freeze_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = FileStorageAdapter::new(dir.path().join("source"));
+    let target = FileStorageAdapter::new(dir.path().join("target"));
+
+    let err_new = MigrationManager::new(source.clone(), target.clone()).unwrap_err();
+    assert_eq!(
+        *err_new.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
+    assert!(err_new.to_string().contains("live migration is disabled in this release per approved constrained release decision; use offline administrative migration"));
+}
+
+#[test]
+fn test_compile_fail_migration_new_for_test_removed() {
+    let code = r#"
+        use pardosa::file::FileStorageAdapter;
+        use pardosa::migration::MigrationManager;
+
+        pub fn check() {
+            let dir = std::path::PathBuf::from("/tmp");
+            let source = FileStorageAdapter::new(dir.join("src"));
+            let target = FileStorageAdapter::new(dir.join("dst"));
+            let _ = MigrationManager::new_for_test(source, target);
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(!ok, "MigrationManager::new_for_test must not exist");
+    assert!(
+        stderr.contains("new_for_test")
+            && (stderr.contains("not found") || stderr.contains("no associated function")),
+        "stderr must indicate new_for_test is absent:\n{stderr}"
+    );
+}
+
+#[test]
 fn test_m6_migration_basic_lifecycle_and_cutover() {
     let dir = tempfile::tempdir().expect("tempdir");
     let source_path = dir.path().join("source");
@@ -57,29 +93,77 @@ fn test_m6_migration_basic_lifecycle_and_cutover() {
     let target = FileStorageAdapter::new(&target_path);
 
     let claim1 = sample_claim(1);
-    source.create(&claim1).expect("create source");
+    source
+        .create(&claim1, &AdmittedDescriptor::default_for_test())
+        .expect("create source");
     let claim2 = sample_claim(1);
-    target.create(&claim2).expect("create target");
+    target
+        .create(&claim2, &AdmittedDescriptor::default_for_test())
+        .expect("create target");
 
     let mut writer = source.open_write(1).expect("open write source");
     let env1 = sample_genesis_envelope(1, 0xaa, b"payload1");
     let comm1 = env1.commitment();
     let env2 = sample_chained_envelope(2, 0xaa, 1, comm1, b"payload2");
-    writer.append_envelope(&env1).expect("append 1");
-    writer.append_envelope(&env2).expect("append 2");
+    writer.append_envelope_verdict(&env1).expect("append 1");
+    writer.append_envelope_verdict(&env2).expect("append 2");
 
-    let mut manager = MigrationManager::new(source.clone(), target.clone());
-    let chased = manager.chase().expect("chase");
-    assert_eq!(chased, 2);
-    assert_eq!(manager.phase(), MigrationPhase::Chase);
+    let err_mgr = MigrationManager::new(source.clone(), target.clone()).unwrap_err();
+    assert_eq!(
+        *err_mgr.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
+    assert!(err_mgr.to_string().contains("live migration is disabled in this release per approved constrained release decision; use offline administrative migration"));
 
-    let frozen = manager.freeze().expect("freeze");
-    assert_eq!(frozen, 0);
-    assert_eq!(manager.phase(), MigrationPhase::Freeze);
+    let source_locator = source.locator_id();
+    let target_locator = target.locator_id();
+    let source_epoch = source.current_epoch().expect("source epoch");
 
-    let summary = manager.cutover().expect("cutover");
-    assert_eq!(summary.total_migrated_events, 2);
-    assert_eq!(summary.surviving_fibers, 1);
+    let inbound = InboundPointerRecord {
+        prior_generation_locator_id: source_locator,
+        prior_generation_epoch: source_epoch,
+    };
+    target
+        .record_inbound_pointer(&inbound)
+        .expect("record inbound");
+
+    let end_record = MigrationEndRecord {
+        source_generation: 1,
+        target_generation: 2,
+        end_time_ns: 2_000_000_000,
+        status: MigrationStatus::Complete,
+    };
+    target
+        .record_meta_record_for_test(&OwnershipRecord::MigrationEnd(end_record))
+        .expect("record migration end");
+
+    let rescue_choice = RescuePolicyChoiceRecord {
+        policy_tag: RescuePolicy::Strict.to_u8(),
+        parameter_payload: Vec::new(),
+    };
+    target
+        .record_meta_record_for_test(&OwnershipRecord::RescuePolicyChoice(rescue_choice))
+        .expect("record rescue choice");
+
+    let outbound = OutboundPointerRecord {
+        next_generation_locator_id: target_locator,
+        cutover_epoch: source_epoch,
+    };
+    source
+        .record_outbound_pointer_for_test(&outbound)
+        .expect("record outbound");
+
+    assert!(source.is_retired_source().expect("query retired"));
+
+    let err_append = writer
+        .append_envelope_verdict(&env1)
+        .expect_err("source writer retired");
+    assert_eq!(
+        *err_append.condition(),
+        FailureCondition::RetiredMigrationSource
+    );
+
+    drop(writer);
 
     let err_new = source.open_write(1).expect_err("source must be retired");
     assert_eq!(
@@ -87,15 +171,7 @@ fn test_m6_migration_basic_lifecycle_and_cutover() {
         FailureCondition::RetiredMigrationSource
     );
 
-    let err_append = writer
-        .append_envelope(&env1)
-        .expect_err("source writer retired");
-    assert_eq!(
-        *err_append.condition(),
-        FailureCondition::RetiredMigrationSource
-    );
-
-    let mut target_reader = target.open_read().expect("open target reader");
+    let target_reader = target.open_read().expect("open target reader");
     assert_eq!(
         target_reader
             .inbound_pointer()
@@ -103,16 +179,11 @@ fn test_m6_migration_basic_lifecycle_and_cutover() {
             .prior_generation_locator_id,
         source.locator_id()
     );
-    let migrated = target_reader.read_all_envelopes().expect("read migrated");
-    assert_eq!(migrated.len(), 2);
-    assert_ne!(migrated[0].header.event_id, env1.header.event_id);
-    assert_ne!(migrated[0].header.fiber_id, env1.header.fiber_id);
-    assert_eq!(migrated[0].header.precursor, [0u8; 16]);
-    assert_eq!(migrated[0].header.precursor_hash, [0u8; 32]);
-    assert_eq!(migrated[1].header.precursor, migrated[0].header.event_id);
-    assert_eq!(migrated[1].header.precursor_hash, migrated[0].commitment());
-    assert_eq!(migrated[0].payload, b"payload1");
-    assert_eq!(migrated[1].payload, b"payload2");
+
+    let meta = target.read_meta_records().expect("read meta records");
+    assert!(meta.inbound_pointer.is_some());
+    assert!(meta.migration_end.is_some());
+    assert!(meta.rescue_policy_choice.is_some());
 }
 
 #[test]
@@ -122,75 +193,48 @@ fn test_m6_caller_transformation_closure_and_refusal() {
     let target = FileStorageAdapter::new(dir.path().join("target_tx"));
 
     let claim = sample_claim(1);
-    source.create(&claim).expect("create source");
-    target.create(&claim).expect("create target");
+    source
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create source");
+    target
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create target");
 
     let mut writer = source.open_write(1).expect("open write source");
     let env1 = sample_genesis_envelope(1, 0xaa, b"input_data");
-    writer.append_envelope(&env1).expect("append 1");
+    writer.append_envelope_verdict(&env1).expect("append 1");
 
-    let manager_success = MigrationManager::new(source.clone(), target.clone()).with_transformer(
-        |payload: &[u8]| {
-            let mut transformed = payload.to_vec();
-            transformed.extend_from_slice(b"_v2");
-            Ok(transformed)
-        },
+    let err = MigrationManager::new(source.clone(), target.clone()).unwrap_err();
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::InvariantBreakingConfiguration
     );
-
-    let summary = manager_success.run_all().expect("run all migration");
-    assert_eq!(summary.total_migrated_events, 1);
-
-    let mut reader = target.open_read().expect("open target reader");
-    let migrated = reader.read_all_envelopes().expect("read envelopes");
-    assert_eq!(migrated[0].payload, b"input_data_v2");
-
-    let source_fail = FileStorageAdapter::new(dir.path().join("source_tx_fail"));
-    let target_fail = FileStorageAdapter::new(dir.path().join("target_tx_fail"));
-    source_fail.create(&claim).expect("create source");
-    target_fail.create(&claim).expect("create target");
-
-    let mut writer_fail = source_fail.open_write(1).expect("open write source");
-    writer_fail.append_envelope(&env1).expect("append");
-
-    let manager_fail = MigrationManager::new(source_fail.clone(), target_fail.clone())
-        .with_transformer(|_payload: &[u8]| {
-            Err(OperationFailure::new(
-                FailureCondition::TransformationRefused,
-                "schema upcast rejected payload",
-            ))
-        });
-
-    let err = manager_fail
-        .run_all()
-        .expect_err("transformation refusal must abort migration");
-    assert_eq!(*err.condition(), FailureCondition::TransformationRefused);
-
-    assert!(!source_fail.is_retired_source().expect("query retired"));
+    assert!(!source.is_retired_source().expect("query retired"));
     let env2 = sample_chained_envelope(2, 0xaa, 1, env1.commitment(), b"more_data");
-    writer_fail
-        .append_envelope(&env2)
+    writer
+        .append_envelope_verdict(&env2)
         .expect("existing writer still accepts appends");
-    drop(writer_fail);
-    let mut writer_new = source_fail.open_write(1).expect("new writer can be opened");
+    drop(writer);
+    let mut writer_new = source.open_write(1).expect("new writer can be opened");
     let env3 = sample_chained_envelope(3, 0xaa, 2, env2.commitment(), b"even_more_data");
     writer_new
-        .append_envelope(&env3)
+        .append_envelope_verdict(&env3)
         .expect("new writer accepts appends");
 }
 
 #[test]
-fn test_m6_per_fiber_policies_keep_purge_lock_and_prune() {
+fn test_m6_live_migration_refused_with_populated_single_fiber() {
     let dir = tempfile::tempdir().expect("tempdir");
     let source = FileStorageAdapter::new(dir.path().join("source_policies"));
     let target = FileStorageAdapter::new(dir.path().join("target_policies"));
 
     let claim = sample_claim(1);
-    source.create(&claim).expect("create source");
-    target.create(&claim).expect("create target");
-
-    let fiber_keep = [0x11u8; 16];
-    let fiber_purge = [0x22u8; 16];
-    let fiber_lock = [0x33u8; 16];
+    source
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create source");
+    target
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create target");
 
     let mut writer = source.open_write(1).expect("open write source");
 
@@ -200,63 +244,31 @@ fn test_m6_per_fiber_policies_keep_purge_lock_and_prune() {
     let comm_a2 = a2.commitment();
     let a3 = sample_chained_envelope(3, 0x11, 2, comm_a2, b"a3");
 
-    let b1 = sample_genesis_envelope(10, 0x22, b"b1");
-    let comm_b1 = b1.commitment();
-    let b2 = sample_chained_envelope(11, 0x22, 10, comm_b1, b"b2");
+    writer.append_envelope_verdict(&a1).expect("append a1");
+    writer.append_envelope_verdict(&a2).expect("append a2");
+    writer.append_envelope_verdict(&a3).expect("append a3");
 
-    let c1 = sample_genesis_envelope(20, 0x33, b"c1");
-    let comm_c1 = c1.commitment();
-    let c2 = sample_chained_envelope(21, 0x33, 20, comm_c1, b"c2");
-    let comm_c2 = c2.commitment();
-    let c3 = sample_chained_envelope(22, 0x33, 21, comm_c2, b"c3");
-
-    writer.append_envelope(&a1).expect("append a1");
-    writer.append_envelope(&b1).expect("append b1");
-    writer.append_envelope(&c1).expect("append c1");
-    writer.append_envelope(&a2).expect("append a2");
-    writer.append_envelope(&c2).expect("append c2");
-    writer.append_envelope(&b2).expect("append b2");
-    writer.append_envelope(&a3).expect("append a3");
-    writer.append_envelope(&c3).expect("append c3");
-
-    let manager = MigrationManager::new(source.clone(), target.clone())
-        .with_fiber_policy(fiber_keep, FiberMigrationPolicy::Keep)
-        .with_fiber_policy(fiber_purge, FiberMigrationPolicy::Purge)
-        .with_fiber_policy(fiber_lock, FiberMigrationPolicy::LockAndPrune);
-
-    let summary = manager.run_all().expect("run all migration");
-    assert_eq!(summary.total_migrated_events, 4);
-    assert_eq!(summary.surviving_fibers, 2);
-
-    let mut reader = target.open_read().expect("open target reader");
-    let migrated = reader.read_all_envelopes().expect("read envelopes");
-    assert_eq!(migrated.len(), 4);
-
-    assert_eq!(migrated[0].payload, b"a1");
-    assert_eq!(migrated[1].payload, b"a2");
-    assert_eq!(migrated[2].payload, b"a3");
-    assert_eq!(migrated[3].payload, b"c3");
-
-    assert!(migrated[3].header.detached);
-    assert_eq!(migrated[3].header.precursor, [0u8; 16]);
-    assert_eq!(migrated[3].header.precursor_hash, [0u8; 32]);
-
-    for env in &migrated {
-        assert_ne!(env.header.fiber_id, fiber_purge);
-        assert_ne!(env.payload, b"b1");
-        assert_ne!(env.payload, b"b2");
-    }
+    let err = MigrationManager::new(source.clone(), target.clone()).unwrap_err();
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
+    assert!(!source.is_retired_source().expect("query retired"));
 }
 
 #[test]
-fn test_m6_dense_rechaining_and_pairwise_order() {
+fn test_m6_live_migration_refused_with_interleaved_fibers() {
     let dir = tempfile::tempdir().expect("tempdir");
     let source = FileStorageAdapter::new(dir.path().join("source_order"));
     let target = FileStorageAdapter::new(dir.path().join("target_order"));
 
     let claim = sample_claim(1);
-    source.create(&claim).expect("create source");
-    target.create(&claim).expect("create target");
+    source
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create source");
+    target
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create target");
 
     let mut writer = source.open_write(1).expect("open write source");
 
@@ -269,59 +281,33 @@ fn test_m6_dense_rechaining_and_pairwise_order() {
     let b2 = sample_chained_envelope(4, 0x0b, 2, comm_b1, b"B2");
     let a3 = sample_chained_envelope(5, 0x0a, 3, comm_a2, b"A3");
 
-    writer.append_envelope(&a1).expect("append");
-    writer.append_envelope(&b1).expect("append");
-    writer.append_envelope(&a2).expect("append");
-    writer.append_envelope(&b2).expect("append");
-    writer.append_envelope(&a3).expect("append");
+    writer.append_envelope_verdict(&a1).expect("append");
+    writer.append_envelope_verdict(&b1).expect("append");
+    writer.append_envelope_verdict(&a2).expect("append");
+    writer.append_envelope_verdict(&b2).expect("append");
+    writer.append_envelope_verdict(&a3).expect("append");
 
-    let manager = MigrationManager::new(source.clone(), target.clone());
-    let summary = manager.run_all().expect("run all migration");
-    assert_eq!(summary.total_migrated_events, 5);
-
-    let mut reader = target.open_read().expect("open target reader");
-    let migrated = reader.read_all_envelopes().expect("read envelopes");
-
-    let payloads: Vec<&[u8]> = migrated.iter().map(|e| e.payload.as_slice()).collect();
-    assert_eq!(payloads, vec![b"A1", b"B1", b"A2", b"B2", b"A3"]);
-
-    let target_a_fiber = migrated[0].header.fiber_id;
-    let target_b_fiber = migrated[1].header.fiber_id;
-    assert_ne!(target_a_fiber, target_b_fiber);
-
-    let a_events: Vec<&EventEnvelope> = migrated
-        .iter()
-        .filter(|e| e.header.fiber_id == target_a_fiber)
-        .collect();
-    assert_eq!(a_events.len(), 3);
-    assert_eq!(a_events[0].header.precursor, [0u8; 16]);
-    assert_eq!(a_events[0].header.precursor_hash, [0u8; 32]);
-    assert_eq!(a_events[1].header.precursor, a_events[0].header.event_id);
-    assert_eq!(a_events[1].header.precursor_hash, a_events[0].commitment());
-    assert_eq!(a_events[2].header.precursor, a_events[1].header.event_id);
-    assert_eq!(a_events[2].header.precursor_hash, a_events[1].commitment());
-
-    let mut env_map = HashMap::new();
-    for env in &migrated {
-        env_map.insert(env.header.event_id, env);
-    }
-
-    for env in &migrated {
-        let link = PrecursorLink::classify(env).expect("classify target link");
-        admit_precursor_link(&env.header.fiber_id, &link, |id| env_map.get(id).copied())
-            .expect("target precursor link validation");
-    }
+    let err = MigrationManager::new(source.clone(), target.clone()).unwrap_err();
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
+    assert!(!source.is_retired_source().expect("query retired"));
 }
 
 #[test]
-fn test_m6_broken_chain_election_refuse_vs_permit() {
+fn test_m6_broken_history_readable_for_migration_but_live_manager_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
     let source_refuse = FileStorageAdapter::new(dir.path().join("source_refuse"));
     let target_refuse = FileStorageAdapter::new(dir.path().join("target_refuse"));
 
     let claim = sample_claim(1);
-    source_refuse.create(&claim).expect("create source refuse");
-    target_refuse.create(&claim).expect("create target refuse");
+    source_refuse
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create source refuse");
+    target_refuse
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create target refuse");
 
     let mut writer = source_refuse.open_write(1).expect("open write source");
     let env1 = sample_genesis_envelope(1, 0xaa, b"valid1");
@@ -335,36 +321,40 @@ fn test_m6_broken_chain_election_refuse_vs_permit() {
         },
         payload: b"broken_event".to_vec(),
     };
-    writer.append_envelope(&env1).expect("append env1");
+    writer.append_envelope_verdict(&env1).expect("append env1");
     let mut broken_buf = Vec::new();
-    broken_env.encode(&mut broken_buf);
-    writer
-        .append_unvalidated_frame(&broken_buf)
+    broken_env.encode(&mut broken_buf).unwrap();
+    drop(writer);
+    source_refuse
+        .append_unvalidated_frame_for_test(&broken_buf)
         .expect("append broken raw frame");
 
-    let manager_refuse = MigrationManager::new(source_refuse.clone(), target_refuse.clone())
-        .with_broken_chain_election(BrokenChainElection::RefuseOnBreak);
-
-    let err = manager_refuse
-        .run_all()
-        .expect_err("must refuse on broken chain");
-    assert!(matches!(
-        err.condition(),
-        FailureCondition::PrecursorChainBroken(_)
-    ));
+    let err_refuse =
+        MigrationManager::new(source_refuse.clone(), target_refuse.clone()).unwrap_err();
+    assert_eq!(
+        *err_refuse.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
     assert!(!source_refuse.is_retired_source().expect("query retired"));
 
     let source_permit = FileStorageAdapter::new(dir.path().join("source_permit"));
     let target_permit = FileStorageAdapter::new(dir.path().join("target_permit"));
-    source_permit.create(&claim).expect("create source permit");
-    target_permit.create(&claim).expect("create target permit");
+    source_permit
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create source permit");
+    target_permit
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create target permit");
 
     let mut writer_permit = source_permit
         .open_write(1)
         .expect("open write source permit");
-    writer_permit.append_envelope(&env1).expect("append env1");
     writer_permit
-        .append_unvalidated_frame(&broken_buf)
+        .append_envelope_verdict(&env1)
+        .expect("append env1");
+    drop(writer_permit);
+    source_permit
+        .append_unvalidated_frame_for_test(&broken_buf)
         .expect("append broken raw frame");
 
     let mut src_reader = source_permit.open_read().expect("open source reader");
@@ -393,99 +383,385 @@ fn test_m6_broken_chain_election_refuse_vs_permit() {
         FailureCondition::PrecursorChainBroken(_)
     ));
 
-    let manager_permit = MigrationManager::new(source_permit.clone(), target_permit.clone())
-        .with_broken_chain_election(BrokenChainElection::PermitBrokenHistory);
-
-    let summary = manager_permit
-        .run_all()
-        .expect("permit broken history migration");
-    assert_eq!(summary.total_migrated_events, 2);
-
-    let mut target_reader = target_permit.open_read().expect("open target reader");
-    let ordinary_target_err = target_reader
-        .read_all_envelopes()
-        .expect_err("ordinary reader on target with broken history must refuse");
-    assert!(matches!(
-        ordinary_target_err.condition(),
-        FailureCondition::PrecursorChainBroken(_)
-    ));
-    let migrated = target_reader
-        .read_all_envelopes_for_migration()
-        .expect("migration reader on target reads broken history");
-    assert_eq!(migrated.len(), 2);
-
-    assert_eq!(migrated[0].header.precursor, [0u8; 16]);
-    assert_eq!(migrated[0].header.precursor_hash, [0u8; 32]);
-    assert_eq!(migrated[1].header.precursor, [0u8; 16]);
-    assert_eq!(migrated[1].header.precursor_hash, [0u8; 32]);
-
-    let mut target_map = HashMap::new();
-    for env in &migrated {
-        target_map.insert(env.header.event_id, env);
-    }
-
-    for env in &migrated {
-        let link = PrecursorLink::classify(env).expect("classify link");
-        admit_precursor_link(&env.header.fiber_id, &link, |id| {
-            target_map.get(id).copied()
-        })
-        .expect("target reader validates successfully");
-    }
+    let err_permit =
+        MigrationManager::new(source_permit.clone(), target_permit.clone()).unwrap_err();
+    assert_eq!(
+        *err_permit.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
 }
 
 #[test]
-fn test_m6_chase_phase_concurrent_source_appends() {
+fn test_m6_live_migration_refusal_recommends_offline_administration() {
     let dir = tempfile::tempdir().expect("tempdir");
     let source = FileStorageAdapter::new(dir.path().join("source_chase"));
     let target = FileStorageAdapter::new(dir.path().join("target_chase"));
 
-    let claim = sample_claim(1);
-    source.create(&claim).expect("create source");
-    target.create(&claim).expect("create target");
+    let err = MigrationManager::new(source.clone(), target.clone()).unwrap_err();
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
+    assert!(err.to_string().contains("live migration is disabled in this release per approved constrained release decision; use offline administrative migration"));
+}
 
-    let mut writer = source.open_write(1).expect("open write source");
-    let env1 = sample_genesis_envelope(1, 0x11, b"chase1");
-    let comm1 = env1.commitment();
-    let env2 = sample_chained_envelope(2, 0x11, 1, comm1, b"chase2");
-    let comm2 = env2.commitment();
-    writer.append_envelope(&env1).expect("append env1");
-    writer.append_envelope(&env2).expect("append env2");
+#[test]
+fn test_m6_live_migration_refused_before_source_or_target_creation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = FileStorageAdapter::new(dir.path().join("source_retry"));
+    let target = FileStorageAdapter::new(dir.path().join("target_retry"));
 
-    let mut manager = MigrationManager::new(source.clone(), target.clone());
-    let chased = manager.chase().expect("chase initial batch");
-    assert_eq!(chased, 2);
-    assert_eq!(manager.phase(), MigrationPhase::Chase);
+    let err = MigrationManager::new(source.clone(), target.clone()).unwrap_err();
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::InvariantBreakingConfiguration
+    );
+    assert!(err.to_string().contains("live migration is disabled in this release per approved constrained release decision; use offline administrative migration"));
+}
 
-    let env3 = sample_chained_envelope(3, 0x11, 2, comm2, b"chase3");
-    let comm3 = env3.commitment();
-    let env4 = sample_chained_envelope(4, 0x11, 3, comm3, b"chase4");
-    writer
-        .append_envelope(&env3)
-        .expect("append env3 during chase");
-    writer
-        .append_envelope(&env4)
-        .expect("append env4 during chase");
+fn run_rustc(code: &str) -> (bool, String) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::sync::OnceLock;
+    static ARTIFACT: OnceLock<std::path::PathBuf> = OnceLock::new();
+    let artifact = ARTIFACT.get_or_init(|| {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let mut command = Command::new(env!("CARGO"));
+        command
+            .args([
+                "build",
+                "--locked",
+                "--lib",
+                "--message-format=json",
+                "--manifest-path",
+            ])
+            .arg(&manifest)
+            .args(["-p", env!("CARGO_PKG_NAME")]);
+        if cfg!(not(debug_assertions)) {
+            command.arg("--release");
+        }
+        let output = command.output().expect("build package proof artifact");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let records: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("Cargo JSON"))
+            .collect();
+        let matches: Vec<_> = records
+            .iter()
+            .filter(|r| {
+                r["reason"] == "compiler-artifact"
+                    && r["manifest_path"].as_str() == manifest.to_str()
+                    && r["target"]["name"] == "pardosa"
+                    && r["target"]["kind"] == serde_json::json!(["lib"])
+                    && r["features"] == serde_json::json!(["default", "uuid"])
+            })
+            .collect();
+        assert_eq!(matches.len(), 1, "exact package/target/features");
+        let paths: Vec<_> = matches[0]["filenames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.as_str())
+            .filter(|p| p.ends_with(".rlib"))
+            .collect();
+        assert_eq!(paths.len(), 1);
+        paths[0].into()
+    });
+    let mut child = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+        .args(["--edition=2021", "--crate-type=lib", "--emit=mir=-", "-"])
+        .arg("--extern")
+        .arg(format!("pardosa={}", artifact.display()))
+        .arg("-L")
+        .arg(format!(
+            "dependency={}",
+            artifact.parent().unwrap().join("deps").display()
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rustc");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(code.as_bytes())
+        .expect("write source");
+    let output = child.wait_with_output().expect("wait rustc");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
 
-    let frozen = manager.freeze().expect("freeze and drain remainder");
-    assert_eq!(frozen, 2);
-    assert_eq!(manager.phase(), MigrationPhase::Freeze);
+#[test]
+fn test_compile_success_strict_adjacent_migration() {
+    let code = r#"
+        use pardosa::migration::{AdjacentMigration, MigrationWitness, VersionMigration};
+        use pardosa::schema::{DescriptorNode, PardosaSchema};
 
-    let summary = manager.cutover().expect("cutover");
-    assert_eq!(summary.total_migrated_events, 4);
-    assert_eq!(summary.surviving_fibers, 1);
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct EventV1 {
+            pub value: u32,
+        }
 
-    let err = writer
-        .append_envelope(&env1)
-        .expect_err("source writer permanently retired");
-    assert_eq!(*err.condition(), FailureCondition::RetiredMigrationSource);
+        impl PardosaSchema for EventV1 {
+            const SCHEMA_VERSION: u32 = 1;
+            fn schema_descriptor() -> DescriptorNode {
+                DescriptorNode::U32
+            }
+            fn encode_payload(&self, buf: &mut Vec<u8>) -> Result<(), pardosa::encoding::EncodeError> {
+                buf.extend_from_slice(&self.value.to_le_bytes());
+                Ok(())
+            }
+            fn decode_payload(buf: &[u8]) -> Result<Self, pardosa::encoding::DecodeError> {
+                if buf.len() < 4 {
+                    return Err(pardosa::encoding::DecodeError::TruncatedPayload {
+                        expected: 4,
+                        available: buf.len(),
+                    });
+                }
+                let value = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                Ok(Self { value })
+            }
+        }
 
-    let mut target_reader = target.open_read().expect("open target reader");
-    let migrated = target_reader
-        .read_all_envelopes()
-        .expect("read target envelopes");
-    assert_eq!(migrated.len(), 4);
-    assert_eq!(migrated[0].payload, b"chase1");
-    assert_eq!(migrated[1].payload, b"chase2");
-    assert_eq!(migrated[2].payload, b"chase3");
-    assert_eq!(migrated[3].payload, b"chase4");
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct EventV2 {
+            pub value: u64,
+        }
+
+        impl PardosaSchema for EventV2 {
+            const SCHEMA_VERSION: u32 = 2;
+            fn schema_descriptor() -> DescriptorNode {
+                DescriptorNode::U64
+            }
+            fn encode_payload(&self, buf: &mut Vec<u8>) -> Result<(), pardosa::encoding::EncodeError> {
+                buf.extend_from_slice(&self.value.to_le_bytes());
+                Ok(())
+            }
+            fn decode_payload(buf: &[u8]) -> Result<Self, pardosa::encoding::DecodeError> {
+                if buf.len() < 8 {
+                    return Err(pardosa::encoding::DecodeError::TruncatedPayload {
+                        expected: 8,
+                        available: buf.len(),
+                    });
+                }
+                let value = u64::from_le_bytes([
+                    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                ]);
+                Ok(Self { value })
+            }
+        }
+
+        pub struct MigrateV1ToV2;
+
+        impl VersionMigration for MigrateV1ToV2 {
+            type SourceEvent = EventV1;
+            type TargetEvent = EventV2;
+            type Error = std::convert::Infallible;
+
+            fn transform(&self, event: &Self::SourceEvent) -> Result<Self::TargetEvent, Self::Error> {
+                Ok(EventV2 {
+                    value: event.value as u64,
+                })
+            }
+        }
+
+        pub fn check() {
+            MigrationWitness::<EventV1, EventV2>::assert_adjacent();
+            let migration = AdjacentMigration::new(MigrateV1ToV2);
+            let v1 = EventV1 { value: 42 };
+            let v2 = migration.transform(&v1).unwrap();
+            assert_eq!(v2.value, 42);
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(ok, "strict n->n+1 positive control must compile:\n{stderr}");
+}
+
+#[test]
+fn test_compile_fail_migration_skip_version_n_to_n_plus_2() {
+    let code = r#"
+        use pardosa::migration::{AdjacentMigration, VersionMigration};
+        use pardosa::schema::{DescriptorNode, PardosaSchema};
+
+        pub struct EventV1;
+        impl PardosaSchema for EventV1 {
+            const SCHEMA_VERSION: u32 = 1;
+            fn schema_descriptor() -> DescriptorNode { DescriptorNode::U8 }
+            fn encode_payload(&self, _: &mut Vec<u8>) -> Result<(), pardosa::encoding::EncodeError> { Ok(()) }
+            fn decode_payload(_: &[u8]) -> Result<Self, pardosa::encoding::DecodeError> { Ok(Self) }
+        }
+
+        pub struct EventV3;
+        impl PardosaSchema for EventV3 {
+            const SCHEMA_VERSION: u32 = 3;
+            fn schema_descriptor() -> DescriptorNode { DescriptorNode::U8 }
+            fn encode_payload(&self, _: &mut Vec<u8>) -> Result<(), pardosa::encoding::EncodeError> { Ok(()) }
+            fn decode_payload(_: &[u8]) -> Result<Self, pardosa::encoding::DecodeError> { Ok(Self) }
+        }
+
+        pub struct SkipMigration;
+        impl VersionMigration for SkipMigration {
+            type SourceEvent = EventV1;
+            type TargetEvent = EventV3;
+            type Error = std::convert::Infallible;
+            fn transform(&self, _: &Self::SourceEvent) -> Result<Self::TargetEvent, Self::Error> { Ok(EventV3) }
+        }
+
+        pub fn check() {
+            let _ = AdjacentMigration::new(SkipMigration);
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(!ok, "n -> n+2 migration must fail compilation");
+    assert!(
+        stderr.contains("Migration must be strict n -> n+1"),
+        "stderr must cite strict n -> n+1 invariant:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_compile_fail_migration_backwards_version() {
+    let code = r#"
+        use pardosa::migration::{AdjacentMigration, VersionMigration};
+        use pardosa::schema::{DescriptorNode, PardosaSchema};
+
+        pub struct EventV2;
+        impl PardosaSchema for EventV2 {
+            const SCHEMA_VERSION: u32 = 2;
+            fn schema_descriptor() -> DescriptorNode { DescriptorNode::U8 }
+            fn encode_payload(&self, _: &mut Vec<u8>) -> Result<(), pardosa::encoding::EncodeError> { Ok(()) }
+            fn decode_payload(_: &[u8]) -> Result<Self, pardosa::encoding::DecodeError> { Ok(Self) }
+        }
+
+        pub struct EventV1;
+        impl PardosaSchema for EventV1 {
+            const SCHEMA_VERSION: u32 = 1;
+            fn schema_descriptor() -> DescriptorNode { DescriptorNode::U8 }
+            fn encode_payload(&self, _: &mut Vec<u8>) -> Result<(), pardosa::encoding::EncodeError> { Ok(()) }
+            fn decode_payload(_: &[u8]) -> Result<Self, pardosa::encoding::DecodeError> { Ok(Self) }
+        }
+
+        pub struct BackwardMigration;
+        impl VersionMigration for BackwardMigration {
+            type SourceEvent = EventV2;
+            type TargetEvent = EventV1;
+            type Error = std::convert::Infallible;
+            fn transform(&self, _: &Self::SourceEvent) -> Result<Self::TargetEvent, Self::Error> { Ok(EventV1) }
+        }
+
+        pub fn check() {
+            let _ = AdjacentMigration::new(BackwardMigration);
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(!ok, "backwards migration must fail compilation");
+    assert!(
+        stderr.contains("Migration must be strict n -> n+1"),
+        "stderr must cite strict n -> n+1 invariant:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_compile_fail_migration_same_version() {
+    let code = r#"
+        use pardosa::migration::{AdjacentMigration, VersionMigration};
+        use pardosa::schema::{DescriptorNode, PardosaSchema};
+
+        pub struct EventV1;
+        impl PardosaSchema for EventV1 {
+            const SCHEMA_VERSION: u32 = 1;
+            fn schema_descriptor() -> DescriptorNode { DescriptorNode::U8 }
+            fn encode_payload(&self, _: &mut Vec<u8>) -> Result<(), pardosa::encoding::EncodeError> { Ok(()) }
+            fn decode_payload(_: &[u8]) -> Result<Self, pardosa::encoding::DecodeError> { Ok(Self) }
+        }
+
+        pub struct SameVersionMigration;
+        impl VersionMigration for SameVersionMigration {
+            type SourceEvent = EventV1;
+            type TargetEvent = EventV1;
+            type Error = std::convert::Infallible;
+            fn transform(&self, _: &Self::SourceEvent) -> Result<Self::TargetEvent, Self::Error> { Ok(EventV1) }
+        }
+
+        pub fn check() {
+            let _ = AdjacentMigration::new(SameVersionMigration);
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(!ok, "same-version migration must fail compilation");
+    assert!(
+        stderr.contains("Migration must be strict n -> n+1"),
+        "stderr must cite strict n -> n+1 invariant:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_compile_fail_migration_source_schema_version_max() {
+    let code = r#"
+        use pardosa::migration::{AdjacentMigration, VersionMigration};
+        use pardosa::schema::{DescriptorNode, PardosaSchema};
+
+        pub struct EventMax;
+        impl PardosaSchema for EventMax {
+            const SCHEMA_VERSION: u32 = u32::MAX;
+            fn schema_descriptor() -> DescriptorNode { DescriptorNode::U8 }
+            fn encode_payload(&self, _: &mut Vec<u8>) -> Result<(), pardosa::encoding::EncodeError> { Ok(()) }
+            fn decode_payload(_: &[u8]) -> Result<Self, pardosa::encoding::DecodeError> { Ok(Self) }
+        }
+
+        pub struct EventWrapped;
+        impl PardosaSchema for EventWrapped {
+            const SCHEMA_VERSION: u32 = 0;
+            fn schema_descriptor() -> DescriptorNode { DescriptorNode::U8 }
+            fn encode_payload(&self, _: &mut Vec<u8>) -> Result<(), pardosa::encoding::EncodeError> { Ok(()) }
+            fn decode_payload(_: &[u8]) -> Result<Self, pardosa::encoding::DecodeError> { Ok(Self) }
+        }
+
+        pub struct OverflowMigration;
+        impl VersionMigration for OverflowMigration {
+            type SourceEvent = EventMax;
+            type TargetEvent = EventWrapped;
+            type Error = std::convert::Infallible;
+            fn transform(&self, _: &Self::SourceEvent) -> Result<Self::TargetEvent, Self::Error> { Ok(EventWrapped) }
+        }
+
+        pub fn check() {
+            let _ = AdjacentMigration::new(OverflowMigration);
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(!ok, "u32::MAX source schema version must fail compilation");
+    assert!(
+        stderr.contains("Source schema version must be less than u32::MAX"),
+        "stderr must cite u32::MAX constraint:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_compile_fail_missing_mandatory_schema_version_const() {
+    let code = r#"
+        use pardosa::schema::{DescriptorNode, PardosaSchema};
+
+        pub struct MissingConstEvent;
+        impl PardosaSchema for MissingConstEvent {
+            fn schema_descriptor() -> DescriptorNode { DescriptorNode::U8 }
+            fn encode_payload(&self, _: &mut Vec<u8>) -> Result<(), pardosa::encoding::EncodeError> { Ok(()) }
+            fn decode_payload(_: &[u8]) -> Result<Self, pardosa::encoding::DecodeError> { Ok(Self) }
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(!ok, "omitting const SCHEMA_VERSION must fail compilation");
+    assert!(
+        stderr.contains("SCHEMA_VERSION")
+            || stderr.contains("not all trait items implemented, missing: `SCHEMA_VERSION`"),
+        "stderr must cite missing SCHEMA_VERSION item:\n{stderr}"
+    );
 }

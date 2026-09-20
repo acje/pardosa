@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use pardosa::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -52,7 +54,9 @@ fn test_readme_file_storage_adapter_example_compiles() {
     let dir = TestDir::new("readme_example");
     let adapter = FileStorageAdapter::new(dir.path().join("orders"));
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create writer");
 
     let fiber_id = derive_fiber_id("ord-12345");
     let event_id = [1u8; 16];
@@ -76,18 +80,26 @@ fn test_m4_strict_create_and_refuse_existing() {
     assert_eq!(adapter.stem(), "demo_store");
     assert_eq!(adapter.meta_path(), store_path.with_extension("meta"));
     assert_eq!(adapter.pgno_path(), store_path.with_extension("pgno"));
-    assert_eq!(adapter.presence(), ArtefactPresence::None);
+    assert_eq!(adapter.try_presence().unwrap(), ArtefactPresence::None);
 
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create should succeed");
-    assert_eq!(adapter.presence(), ArtefactPresence::Both);
+    let mut writer = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create should succeed");
+    assert_eq!(adapter.try_presence().unwrap(), ArtefactPresence::Both);
     assert_eq!(writer.carried_epoch(), 1);
     assert_eq!(writer.rolling_commitment().frame_count(), 0);
 
-    let err = adapter.create(&claim).unwrap_err();
+    let err = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .unwrap_err();
     assert_eq!(err.condition(), &FailureCondition::StoreAlreadyExists);
 
-    let _ = writer.append_raw_frame(b"first-event");
+    let genesis = EventEnvelope::genesis([1; 16], [2; 16], b"first-event").unwrap();
+    assert!(matches!(
+        writer.append_envelope_verdict(&genesis),
+        Ok(WriteLandingVerdict::Landed(_))
+    ));
 }
 
 #[test]
@@ -119,7 +131,7 @@ fn test_m4_concurrent_create_exactly_one_winner() {
         handles.push(thread::spawn(move || {
             let adapter = FileStorageAdapter::new(&store_path_clone);
             let claim = sample_claim(thread_idx as u64 + 1);
-            match adapter.create(&claim) {
+            match adapter.create(&claim, &AdmittedDescriptor::default_for_test()) {
                 Ok(_writer) => {
                     winners_clone.fetch_add(1, Ordering::SeqCst);
                 }
@@ -148,7 +160,7 @@ fn test_m4_writer_exclusion_and_policy() {
     let claim = sample_claim(1);
 
     let writer1 = adapter
-        .create(&claim)
+        .create(&claim, &AdmittedDescriptor::default_for_test())
         .expect("first writer creates and locks");
 
     let adapter2 = FileStorageAdapter::new(&store_path);
@@ -189,9 +201,26 @@ fn test_m4_readonly_open_concurrent_with_writer() {
     let adapter = FileStorageAdapter::new(&store_path);
     let claim = sample_claim(1);
 
-    let mut writer = adapter.create(&claim).expect("create writer");
-    writer.append_raw_frame(b"frame-1").expect("append frame 1");
-    writer.append_raw_frame(b"frame-2").expect("append frame 2");
+    let mut writer = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create writer");
+    let env1 = EventEnvelope::genesis([1; 16], [2; 16], b"frame-1").unwrap();
+    let env2 = EventEnvelope {
+        header: EnvelopeHeader {
+            event_id: [2; 16],
+            fiber_id: [2; 16],
+            detached: false,
+            precursor: env1.header.event_id,
+            precursor_hash: env1.commitment(),
+        },
+        payload: b"frame-2".to_vec(),
+    };
+    writer
+        .append_envelope_verdict(&env1)
+        .expect("append frame 1");
+    writer
+        .append_envelope_verdict(&env2)
+        .expect("append frame 2");
 
     let mut reader1 = adapter
         .open_read()
@@ -203,9 +232,14 @@ fn test_m4_readonly_open_concurrent_with_writer() {
     let frames1 = reader1.read_all_frames().expect("reader1 read all");
     let frames2 = reader2.read_all_frames().expect("reader2 read all");
 
+    let mut env1_buf = Vec::new();
+    env1.encode(&mut env1_buf).unwrap();
+    let mut env2_buf = Vec::new();
+    env2.encode(&mut env2_buf).unwrap();
+
     assert_eq!(frames1.len(), 2);
-    assert_eq!(frames1[0], b"frame-1");
-    assert_eq!(frames1[1], b"frame-2");
+    assert_eq!(frames1[0], env1_buf);
+    assert_eq!(frames1[1], env2_buf);
     assert_eq!(frames2, frames1);
 
     assert_eq!(reader1.rolling_commitment().frame_count(), 2);
@@ -225,7 +259,10 @@ fn test_m4_incomplete_creation_and_orphan() {
     adapter
         .create_incomplete_meta_only(&claim)
         .expect("create incomplete meta only");
-    assert_eq!(adapter.presence(), ArtefactPresence::OwnershipRecordOnly);
+    assert_eq!(
+        adapter.try_presence().unwrap(),
+        ArtefactPresence::OwnershipRecordOnly
+    );
 
     let reader = adapter
         .open_read()
@@ -235,25 +272,52 @@ fn test_m4_incomplete_creation_and_orphan() {
         OpenAdmission::IncompleteCreation(_)
     ));
 
+    let missing_desc_err = adapter
+        .complete_creation(&claim)
+        .expect_err("complete creation must refuse when schema descriptor is missing per C8.2");
+    assert_eq!(
+        *missing_desc_err.condition(),
+        FailureCondition::MissingSchemaDescriptor
+    );
+
+    let desc = AdmittedDescriptor::default_for_test();
+    let mut desc_bytes = Vec::new();
+    desc.root().encode(&mut desc_bytes).unwrap();
+    adapter
+        .record_meta_record_for_test(&OwnershipRecord::SchemaDescriptor {
+            schema_version: desc.version(),
+            descriptor_bytes: desc_bytes,
+        })
+        .expect("record schema descriptor");
+
     let mut writer = adapter
         .complete_creation(&claim)
         .expect("complete creation");
-    assert_eq!(adapter.presence(), ArtefactPresence::Both);
+    assert_eq!(adapter.try_presence().unwrap(), ArtefactPresence::Both);
+    let env_after = EventEnvelope::genesis([1; 16], [2; 16], b"after-completion").unwrap();
     writer
-        .append_raw_frame(b"after-completion")
+        .append_envelope_verdict(&env_after)
         .expect("append after completion");
     drop(writer);
 
     let orphan_path = dir.path().join("orphan_store");
     let orphan_adapter = FileStorageAdapter::new(&orphan_path);
-    let mut orphan_writer = orphan_adapter.create(&claim).expect("create normal");
+    let mut orphan_writer = orphan_adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create normal");
+    let env_orphan = EventEnvelope::genesis([2; 16], [3; 16], b"orphan-data").unwrap();
+    let mut env_orphan_buf = Vec::new();
+    env_orphan.encode(&mut env_orphan_buf).unwrap();
     orphan_writer
-        .append_raw_frame(b"orphan-data")
+        .append_envelope_verdict(&env_orphan)
         .expect("append");
     drop(orphan_writer);
 
     fs::remove_file(orphan_adapter.meta_path()).expect("remove meta to make orphan");
-    assert_eq!(orphan_adapter.presence(), ArtefactPresence::EventDataOnly);
+    assert_eq!(
+        orphan_adapter.try_presence().unwrap(),
+        ArtefactPresence::EventDataOnly
+    );
 
     let write_err = orphan_adapter.open_write(1).unwrap_err();
     assert_eq!(
@@ -267,7 +331,7 @@ fn test_m4_incomplete_creation_and_orphan() {
         .read_all_frames()
         .expect("read frames from orphan");
     assert_eq!(orphan_frames.len(), 1);
-    assert_eq!(orphan_frames[0], b"orphan-data");
+    assert_eq!(orphan_frames[0], env_orphan_buf);
 }
 
 #[test]
@@ -277,30 +341,33 @@ fn test_m4_per_landing_epoch_verification() {
     let adapter = FileStorageAdapter::new(&store_path);
     let claim1 = sample_claim(1);
 
-    let mut writer = adapter.create(&claim1).expect("create writer epoch 1");
+    let mut writer = adapter
+        .create(&claim1, &AdmittedDescriptor::default_for_test())
+        .expect("create writer epoch 1");
+    let env1 = EventEnvelope::genesis([1; 16], [2; 16], b"frame-at-epoch-1").unwrap();
+    let mut env1_buf = Vec::new();
+    env1.encode(&mut env1_buf).unwrap();
     writer
-        .append_raw_frame(b"frame-at-epoch-1")
+        .append_envelope_verdict(&env1)
         .expect("first append at epoch 1");
 
     let claim2 = sample_claim(2);
     adapter
-        .record_ownership_claim(&claim2)
+        .record_ownership_claim_for_test(&claim2)
         .expect("superseding claim in meta");
 
-    let stale_err = writer
-        .append_raw_frame(b"frame-with-stale-epoch")
-        .unwrap_err();
+    let env2 = EventEnvelope::genesis([2; 16], [3; 16], b"frame-with-stale-epoch").unwrap();
+    let stale_err = writer.append_envelope_verdict(&env2).unwrap_err();
     assert_eq!(stale_err.condition(), &FailureCondition::StaleEpoch);
 
     let mut reader = adapter.open_read().expect("reader opens");
     let frames = reader.read_all_frames().expect("read frames");
     assert_eq!(frames.len(), 1);
-    assert_eq!(frames[0], b"frame-at-epoch-1");
+    assert_eq!(frames[0], env1_buf);
 
     fs::write(adapter.meta_path(), b"truncated").expect("corrupt meta");
-    let unreadable_err = writer
-        .append_raw_frame(b"frame-with-corrupt-meta")
-        .unwrap_err();
+    let env3 = EventEnvelope::genesis([3; 16], [4; 16], b"frame-with-corrupt-meta").unwrap();
+    let unreadable_err = writer.append_envelope_verdict(&env3).unwrap_err();
     assert_eq!(
         unreadable_err.condition(),
         &FailureCondition::OwnershipRecordUnreadable
@@ -314,17 +381,21 @@ fn test_m4_continuous_rolling_commitment_and_crc32c() {
     let adapter = FileStorageAdapter::new(&store_path);
     let claim = sample_claim(1);
 
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create writer");
     assert_eq!(writer.rolling_commitment().frame_count(), 0);
 
+    let env_alpha = EventEnvelope::genesis([1; 16], [2; 16], b"payload-alpha").unwrap();
     writer
-        .append_raw_frame(b"payload-alpha")
+        .append_envelope_verdict(&env_alpha)
         .expect("append alpha");
     assert_eq!(writer.rolling_commitment().frame_count(), 1);
     let digest1 = writer.rolling_commitment().current_commitment();
 
+    let env_beta = EventEnvelope::genesis([2; 16], [3; 16], b"payload-beta").unwrap();
     writer
-        .append_raw_frame(b"payload-beta")
+        .append_envelope_verdict(&env_beta)
         .expect("append beta");
     assert_eq!(writer.rolling_commitment().frame_count(), 2);
     let digest2 = writer.rolling_commitment().current_commitment();
@@ -435,10 +506,8 @@ fn test_m4_c8_2_schema_structural_completeness() {
     let adapter = FileStorageAdapter::new(&store_path);
     let claim = sample_claim(1);
 
-    let mut writer = adapter.create(&claim).expect("create writer");
-    writer
-        .set_schema_descriptor(&valid_schema)
-        .expect("set schema descriptor");
+    let admitted = AdmittedDescriptor::try_from_descriptor(valid_schema.clone()).unwrap();
+    let writer = adapter.create(&claim, &admitted).expect("create writer");
     drop(writer);
 
     let reader = adapter.open_read().expect("open read");
@@ -466,13 +535,15 @@ fn test_m4_format_vectors_roundtrip_on_filesystem_adapter() {
             let (env, _) = EventEnvelope::decode(&bytes).unwrap();
             let store_path = dir.path().join(format!("vector_store_{idx}"));
             let adapter = FileStorageAdapter::new(&store_path);
-            let mut writer = adapter.create(&claim).expect("create writer");
-            let mut env_buf = Vec::new();
-            env.encode(&mut env_buf);
-            writer
-                .append_unvalidated_frame(&env_buf)
-                .expect("append raw frame");
+            let writer = adapter
+                .create(&claim, &AdmittedDescriptor::default_for_test())
+                .expect("create writer");
             drop(writer);
+            let mut env_buf = Vec::new();
+            env.encode(&mut env_buf).unwrap();
+            adapter
+                .append_unvalidated_frame_for_test(&env_buf)
+                .expect("append raw frame");
 
             let mut reader = adapter.open_read().expect("open reader");
             let read_envelopes = reader
@@ -491,7 +562,9 @@ fn test_m4_adapter_retirement_and_generation_records() {
     let base_path = dir.path().join("retired_source");
     let adapter = FileStorageAdapter::new(&base_path);
     let claim = sample_claim(1);
-    adapter.create(&claim).expect("create");
+    adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create");
 
     let mut writer = adapter.open_write(1).expect("open write");
     let env = EventEnvelope {
@@ -504,29 +577,33 @@ fn test_m4_adapter_retirement_and_generation_records() {
         },
         payload: b"sample payload".to_vec(),
     };
-    writer.append_envelope(&env).expect("append envelope");
+    writer
+        .append_envelope_verdict(&env)
+        .expect("append envelope");
 
     let outbound = OutboundPointerRecord {
         next_generation_locator_id: [42u8; 16],
         cutover_epoch: 1,
     };
     adapter
-        .record_outbound_pointer(&outbound)
+        .record_outbound_pointer_for_test(&outbound)
         .expect("record outbound pointer");
+
+    let err_append = writer
+        .append_envelope_verdict(&env)
+        .expect_err("existing writer append must be rejected");
+    assert_eq!(
+        *err_append.condition(),
+        FailureCondition::RetiredMigrationSource
+    );
+
+    drop(writer);
 
     let err_new_writer = adapter
         .open_write(1)
         .expect_err("new writer must be rejected");
     assert_eq!(
         *err_new_writer.condition(),
-        FailureCondition::RetiredMigrationSource
-    );
-
-    let err_append = writer
-        .append_envelope(&env)
-        .expect_err("existing writer append must be rejected");
-    assert_eq!(
-        *err_append.condition(),
         FailureCondition::RetiredMigrationSource
     );
 
@@ -538,238 +615,14 @@ fn test_m4_adapter_retirement_and_generation_records() {
 }
 
 #[test]
-fn test_m4_append_batch_rolling_commitment_matches_sequential_single_append() {
-    let dir = TestDir::new("batch_vs_single");
-    let store_path_a = dir.path().join("store_single");
-    let store_path_b = dir.path().join("store_batch");
-
-    let adapter_a = FileStorageAdapter::new(&store_path_a);
-    let adapter_b = FileStorageAdapter::new(&store_path_b);
-
-    let claim_a = sample_claim(1);
-    let claim_b = sample_claim(1);
-
-    let mut writer_a = adapter_a.create(&claim_a).expect("create writer a");
-    let mut writer_b = adapter_b.create(&claim_b).expect("create writer b");
-
-    let fiber1 = [0x41; 16];
-    let fiber2 = [0x42; 16];
-
-    let env1 =
-        EventEnvelope::genesis([0x01; 16], fiber1, b"batch-f1-e1".to_vec()).expect("env1 genesis");
-    let env2 =
-        EventEnvelope::chain(&env1, [0x02; 16], b"batch-f1-e2".to_vec()).expect("env2 chain");
-    let env3 =
-        EventEnvelope::genesis([0x03; 16], fiber2, b"batch-f2-e1".to_vec()).expect("env3 genesis");
-
-    writer_a.append_envelope(&env1).expect("single append 1");
-    writer_a.append_envelope(&env2).expect("single append 2");
-    writer_a.append_envelope(&env3).expect("single append 3");
-
-    let batch_count = writer_b
-        .append_batch_envelopes(&[env1.clone(), env2.clone(), env3.clone()])
-        .expect("batch append");
-
-    assert_eq!(batch_count, 3);
-    assert_eq!(
-        writer_b.rolling_commitment().frame_count(),
-        writer_a.rolling_commitment().frame_count()
-    );
-    assert_eq!(
-        writer_b.rolling_commitment().current_commitment(),
-        writer_a.rolling_commitment().current_commitment()
-    );
-
-    let pgno_a = fs::read(adapter_a.pgno_path()).expect("read pgno a");
-    let pgno_b = fs::read(adapter_b.pgno_path()).expect("read pgno b");
-    assert_eq!(pgno_a, pgno_b);
-
-    let mut reader_b = adapter_b.open_read().expect("open reader b");
-    let envelopes_b = reader_b.read_all_envelopes().expect("read all envelopes b");
-    assert_eq!(envelopes_b.len(), 3);
-    assert_eq!(envelopes_b[0], env1);
-    assert_eq!(envelopes_b[1], env2);
-    assert_eq!(envelopes_b[2], env3);
-    assert_eq!(
-        reader_b.rolling_commitment().current_commitment(),
-        writer_a.rolling_commitment().current_commitment()
-    );
-}
-
-#[test]
-fn test_m4_append_batch_detailed_partial_landing_undetermined_and_failure() {
-    let dir = TestDir::new("batch_detailed_partial");
-    let store_path_undetermined = dir.path().join("store_undetermined");
-    let adapter_undetermined = FileStorageAdapter::new(&store_path_undetermined);
-    let claim1 = sample_claim(1);
-
-    let mut writer_undetermined = adapter_undetermined
-        .create(&claim1)
-        .expect("create writer")
-        .with_undetermined_after_n_blocks(2);
-
-    let fiber1 = [0x71; 16];
-    let env1 =
-        EventEnvelope::genesis([0x01; 16], fiber1, b"f1-genesis".to_vec()).expect("env1 genesis");
-    let env2 = EventEnvelope::chain(&env1, [0x02; 16], b"f1-event2".to_vec()).expect("env2 chain");
-    let env3 = EventEnvelope::chain(&env2, [0x03; 16], b"f1-event3".to_vec()).expect("env3 chain");
-    let env4 = EventEnvelope::chain(&env3, [0x04; 16], b"f1-event4".to_vec()).expect("env4 chain");
-
-    let verdict = writer_undetermined
-        .append_batch_envelopes_detailed(&[env1.clone(), env2.clone(), env3.clone(), env4.clone()])
-        .expect("append batch detailed returns verdict");
-
-    match &verdict {
-        BatchLandingVerdict::PartialProgress {
-            landed_count,
-            next_attempt,
-            unattempted_count,
-        } => {
-            assert_eq!(*landed_count, 2);
-            assert_eq!(
-                *next_attempt,
-                NextAttemptStatus::Undetermined { carried_epoch: 1 }
-            );
-            assert_eq!(*unattempted_count, 1);
-        }
-        other => panic!("expected PartialProgress, got {other:?}"),
-    }
-    assert_eq!(verdict.landed_count(), 2);
-    assert_eq!(verdict.unresolved_count(), 1);
-    assert_eq!(verdict.unattempted_count(), 1);
-    assert_eq!(verdict.total_count(), 4);
-    assert_eq!(writer_undetermined.rolling_commitment().frame_count(), 2);
-    let h = writer_undetermined
-        .session_index()
-        .expect("session index")
-        .fiber(fiber1)
-        .expect("fiber1 handle");
-    assert_eq!(h.event_count(), 2);
-    let latest = writer_undetermined
-        .session_index()
-        .expect("session index")
-        .get_latest(&fiber1)
-        .expect("latest")
-        .expect("env");
-    assert_eq!(latest.header.event_id, env2.header.event_id);
-
-    let mut reader_undetermined = adapter_undetermined.open_read().expect("open reader");
-    let read_envs = reader_undetermined
-        .read_all_envelopes()
-        .expect("read all envelopes");
-    assert_eq!(read_envs.len(), 2);
-    assert_eq!(read_envs[0], env1);
-    assert_eq!(read_envs[1], env2);
-
-    let store_path_fail = dir.path().join("store_fail");
-    let adapter_fail = FileStorageAdapter::new(&store_path_fail);
-    let mut writer_fail = adapter_fail
-        .create(&claim1)
-        .expect("create writer fail")
-        .with_fail_after_n_blocks(1);
-
-    let verdict_fail = writer_fail
-        .append_batch_envelopes_detailed(&[env1.clone(), env2.clone(), env3.clone()])
-        .expect("returns partial failure verdict");
-
-    match &verdict_fail {
-        BatchLandingVerdict::PartialProgress {
-            landed_count,
-            next_attempt,
-            unattempted_count,
-        } => {
-            assert_eq!(*landed_count, 1);
-            match next_attempt {
-                NextAttemptStatus::Rejected(error) => {
-                    assert_eq!(
-                        *error.condition(),
-                        FailureCondition::PrecursorChainBroken(None)
-                    );
-                }
-                other => panic!("expected Rejected, got {other:?}"),
-            }
-            assert_eq!(*unattempted_count, 1);
-        }
-        other => panic!("expected PartialProgress, got {other:?}"),
-    }
-    assert_eq!(verdict_fail.landed_count(), 1);
-    assert_eq!(verdict_fail.rejected_count(), 1);
-    assert_eq!(verdict_fail.unattempted_count(), 1);
-    assert_eq!(verdict_fail.total_count(), 3);
-
-    assert_eq!(writer_fail.rolling_commitment().frame_count(), 1);
-    let h_fail = writer_fail.fiber(fiber1).expect("fiber1 handle");
-    assert_eq!(h_fail.event_count(), 1);
-
-    let mut reader_fail = adapter_fail.open_read().expect("open reader fail");
-    let read_envs_fail = reader_fail
-        .read_all_envelopes()
-        .expect("read envelopes fail");
-    assert_eq!(read_envs_fail.len(), 1);
-    assert_eq!(read_envs_fail[0], env1);
-    assert_eq!(
-        reader_fail.rolling_commitment().current_commitment(),
-        writer_fail.rolling_commitment().current_commitment()
-    );
-}
-
-#[test]
-fn test_m4_append_batch_sync_error_stops_before_subsequent_blocks() {
-    let dir = TestDir::new("batch_sync_error");
-    let store_path = dir.path().join("store_sync_err");
-    let adapter = FileStorageAdapter::new(&store_path);
-    let claim = sample_claim(1);
-
-    let mut writer = adapter
-        .create(&claim)
-        .expect("create writer")
-        .with_simulate_sync_error(true);
-    let fiber1 = [0x88; 16];
-    let env1 = EventEnvelope::genesis([0x01; 16], fiber1, b"f1-genesis".to_vec()).expect("genesis");
-    let env2 = EventEnvelope::chain(&env1, [0x02; 16], b"f1-event2".to_vec()).expect("chain");
-
-    let verdict = writer
-        .append_batch_envelopes_detailed(&[env1.clone(), env2.clone()])
-        .expect("returns verdict");
-
-    match &verdict {
-        BatchLandingVerdict::PartialProgress {
-            landed_count,
-            next_attempt,
-            unattempted_count,
-        } => {
-            assert_eq!(*landed_count, 0);
-            assert_eq!(
-                *next_attempt,
-                NextAttemptStatus::Undetermined { carried_epoch: 1 }
-            );
-            assert_eq!(*unattempted_count, 1);
-        }
-        other => panic!("expected PartialProgress with Undetermined, got {other:?}"),
-    }
-    assert_eq!(verdict.landed_count(), 0);
-    assert_eq!(verdict.unresolved_count(), 1);
-    assert_eq!(verdict.unattempted_count(), 1);
-    assert_eq!(verdict.total_count(), 2);
-    assert!(verdict.has_unresolved());
-
-    assert_eq!(writer.rolling_commitment().frame_count(), 0);
-
-    let mut reader = adapter.open_read().expect("open reader");
-    let read_envs = reader.read_all_envelopes().expect("read");
-    assert!(
-        read_envs.len() <= 1,
-        "env2 was never attempted and must not be in file"
-    );
-}
-
-#[test]
 fn test_m4_incremental_recovery_open_writer_and_reader_identical_state() {
     let dir = TestDir::new("m4_incremental_recovery");
     let stem = dir.path().join("store");
     let adapter = FileStorageAdapter::new(&stem);
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create writer");
 
     let fiber1 = [0x11; 16];
     let fiber2 = [0x22; 16];
@@ -889,7 +742,9 @@ fn test_m4_fold_and_for_each_envelopes_borrowed_views() {
     let base_path = dir.path().join("fold_views");
     let adapter = FileStorageAdapter::new(&base_path);
     let claim = sample_claim(1);
-    let mut writer = adapter.create(&claim).expect("create writer");
+    let mut writer = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create writer");
 
     let fiber = [0x77; 16];
     let mut expected_envelopes = Vec::new();
@@ -935,4 +790,425 @@ fn test_m4_fold_and_for_each_envelopes_borrowed_views() {
         })
         .expect("for_each_envelope");
     assert_eq!(visited_count, 20);
+}
+
+#[test]
+fn test_file_reopen_same_stream_append_continuation_matches_batch() {
+    let dir = TestDir::new("reopen_continuation");
+    let stem_a = dir.path().join("store_a");
+    let stem_b = dir.path().join("store_b");
+
+    let adapter_a = FileStorageAdapter::new(&stem_a);
+    let adapter_b = FileStorageAdapter::new(&stem_b);
+    let claim = sample_claim(1);
+
+    let fiber1 = [0x11; 16];
+    let fiber2 = [0x22; 16];
+    let fiber3 = [0x33; 16];
+
+    let mut events_n = Vec::new();
+    let mut event_num = 1u8;
+    for _round in 0..4 {
+        events_n.push((
+            fiber1,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
+        event_num += 1;
+        events_n.push((
+            fiber2,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
+        event_num += 1;
+        events_n.push((
+            fiber3,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
+        event_num += 1;
+    }
+    assert_eq!(events_n.len(), 12);
+
+    let mut events_m = Vec::new();
+    for _round in 0..3 {
+        events_m.push((
+            fiber1,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
+        event_num += 1;
+        events_m.push((
+            fiber2,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
+        event_num += 1;
+        events_m.push((
+            fiber3,
+            [event_num; 16],
+            format!("payload-{event_num}").into_bytes(),
+        ));
+        event_num += 1;
+    }
+    assert_eq!(events_m.len(), 9);
+
+    let mut writer_a = adapter_a
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create writer a");
+    for (fiber_id, event_id, payload) in &events_n {
+        writer_a
+            .append_to_fiber(*fiber_id, *event_id, payload.clone())
+            .expect("append to writer a");
+    }
+    drop(writer_a);
+
+    let mut reader_a = adapter_a.open_read().expect("open reader a mid");
+    let mid_envelopes = reader_a.read_all_envelopes().expect("read all mid");
+    assert_eq!(mid_envelopes.len(), 12);
+    drop(reader_a);
+
+    let mut writer_a = adapter_a.open_write(1).expect("reopen writer a");
+    for (fiber_id, event_id, payload) in &events_m {
+        writer_a
+            .append_to_fiber(*fiber_id, *event_id, payload.clone())
+            .expect("append continuation to writer a");
+    }
+    drop(writer_a);
+
+    let mut writer_b = adapter_b
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create writer b");
+    for (fiber_id, event_id, payload) in &events_n {
+        writer_b
+            .append_to_fiber(*fiber_id, *event_id, payload.clone())
+            .expect("batch append n to writer b");
+    }
+    for (fiber_id, event_id, payload) in &events_m {
+        writer_b
+            .append_to_fiber(*fiber_id, *event_id, payload.clone())
+            .expect("batch append m to writer b");
+    }
+    drop(writer_b);
+
+    let final_writer_a = adapter_a.open_write(1).expect("final open write a");
+    let final_writer_b = adapter_b.open_write(1).expect("final open write b");
+
+    assert_eq!(
+        final_writer_a.rolling_commitment().current_commitment(),
+        final_writer_b.rolling_commitment().current_commitment()
+    );
+    assert_eq!(
+        final_writer_a.rolling_commitment().frame_count(),
+        final_writer_b.rolling_commitment().frame_count()
+    );
+    assert_eq!(final_writer_a.rolling_commitment().frame_count(), 21);
+
+    for fiber_id in [fiber1, fiber2, fiber3] {
+        let handle_a = final_writer_a.fiber(fiber_id).expect("fiber handle a");
+        let handle_b = final_writer_b.fiber(fiber_id).expect("fiber handle b");
+        assert_eq!(handle_a.event_count(), handle_b.event_count());
+        assert_eq!(handle_a.precursor(), handle_b.precursor());
+        assert_eq!(handle_a.state(), handle_b.state());
+
+        let latest_a = final_writer_a
+            .get_latest(fiber_id)
+            .expect("latest a")
+            .unwrap();
+        let latest_b = final_writer_b
+            .get_latest(fiber_id)
+            .expect("latest b")
+            .unwrap();
+        assert_eq!(latest_a.header.event_id, latest_b.header.event_id);
+        assert_eq!(latest_a.header.precursor, latest_b.header.precursor);
+        assert_eq!(latest_a.header.fiber_id, latest_b.header.fiber_id);
+        assert_eq!(latest_a.payload, latest_b.payload);
+    }
+    drop(final_writer_a);
+    drop(final_writer_b);
+
+    let mut final_reader_a = adapter_a.open_read().expect("final open read a");
+    let mut final_reader_b = adapter_b.open_read().expect("final open read b");
+    let envs_a = final_reader_a.read_all_envelopes().expect("read all a");
+    let envs_b = final_reader_b.read_all_envelopes().expect("read all b");
+    assert_eq!(envs_a.len(), 21);
+    assert_eq!(envs_b.len(), 21);
+
+    for (ea, eb) in envs_a.iter().zip(envs_b.iter()) {
+        assert_eq!(ea.header.event_id, eb.header.event_id);
+        assert_eq!(ea.header.fiber_id, eb.header.fiber_id);
+        assert_eq!(ea.header.precursor, eb.header.precursor);
+        assert_eq!(ea.header.precursor_hash, eb.header.precursor_hash);
+        assert_eq!(ea.header.detached, eb.header.detached);
+        assert_eq!(ea.payload, eb.payload);
+    }
+}
+
+#[test]
+fn test_file_read_meta_records_missing_seq1_fails_closed() {
+    let dir = TestDir::new("meta_missing_seq1");
+    let meta_path = dir.path().join("corrupted.meta");
+    fs::write(&meta_path, b"not_a_header").expect("write invalid header");
+
+    let err = pardosa::file::read_meta_records(&meta_path).expect_err("must fail closed");
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::OwnershipRecordUnreadable
+    );
+
+    let empty_meta_path = dir.path().join("empty.meta");
+    fs::write(&empty_meta_path, b"").expect("write empty meta");
+    let err_empty =
+        pardosa::file::read_meta_records(&empty_meta_path).expect_err("must fail closed on empty");
+    assert_eq!(
+        *err_empty.condition(),
+        FailureCondition::OwnershipRecordUnreadable
+    );
+}
+
+#[test]
+fn test_file_open_write_concurrent_writer_rejected_while_holding_lock() {
+    let dir = TestDir::new("open_write_concurrent");
+    let base_path = dir.path().join("store");
+    let adapter = FileStorageAdapter::new(&base_path);
+    let claim = sample_claim(1);
+
+    let writer = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create");
+    drop(writer);
+
+    let writer1 = adapter
+        .open_write(1)
+        .expect("first open write holds exclusion");
+    let err = adapter
+        .open_write(1)
+        .expect_err("concurrent open write must be rejected");
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::AnotherOwnerHoldsExclusion
+    );
+
+    drop(writer1);
+
+    let writer2 = adapter
+        .open_write(1)
+        .expect("open write succeeds after lock released");
+    drop(writer2);
+}
+
+#[test]
+fn test_file_open_write_acquires_lock_before_authority_metadata_read() {
+    let dir = TestDir::new("lock_before_authority_read");
+    let base_path = dir.path().join("store");
+    let adapter = FileStorageAdapter::new(&base_path);
+    let claim = sample_claim(1);
+
+    let writer = adapter
+        .create(&claim, &AdmittedDescriptor::default_for_test())
+        .expect("create");
+    drop(writer);
+
+    let writer1 = adapter
+        .open_write(1)
+        .expect("first open write holds exclusion");
+
+    let meta_path = dir.path().join("store.meta");
+    std::fs::write(&meta_path, b"corrupted-metadata-payload").expect("corrupt meta");
+
+    let err = adapter
+        .open_write(1)
+        .expect_err("open_write must acquire lock before reading authority metadata");
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::AnotherOwnerHoldsExclusion
+    );
+
+    drop(writer1);
+}
+
+#[test]
+fn test_file_complete_creation_missing_descriptor_fails_closed() {
+    use std::io::Write;
+
+    let dir = TestDir::new("file_complete_creation_missing_desc");
+    let base_path = dir.path().join("store");
+    let adapter = FileStorageAdapter::new(&base_path);
+    let claim = sample_claim(1);
+
+    let mut meta_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(adapter.meta_path())
+        .expect("create meta");
+    meta_file
+        .write_all(&ContainerHeader::new().to_bytes())
+        .expect("write meta header");
+    let mut claim_bytes = Vec::new();
+    OwnershipRecord::OwnershipClaim(claim.clone()).encode(&mut claim_bytes);
+    let mut claim_frame = Vec::new();
+    ContainerFrame::encode_payload(&claim_bytes, &mut claim_frame).unwrap();
+    meta_file
+        .write_all(&claim_frame)
+        .expect("write claim frame");
+    drop(meta_file);
+
+    assert_eq!(
+        adapter.try_presence().unwrap(),
+        ArtefactPresence::OwnershipRecordOnly
+    );
+
+    let err = adapter
+        .complete_creation(&claim)
+        .expect_err("complete_creation must fail when descriptor missing");
+    assert_eq!(*err.condition(), FailureCondition::MissingSchemaDescriptor);
+}
+
+#[test]
+fn test_file_complete_creation_persisted_invalid_descriptor_fails_closed() {
+    use std::io::Write;
+
+    let dir = TestDir::new("file_complete_creation_invalid_desc");
+    let base_path = dir.path().join("store");
+    let adapter = FileStorageAdapter::new(&base_path);
+    let claim = sample_claim(1);
+
+    let mut meta_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(adapter.meta_path())
+        .expect("create meta");
+    meta_file
+        .write_all(&ContainerHeader::new().to_bytes())
+        .expect("write meta header");
+    let mut claim_bytes = Vec::new();
+    OwnershipRecord::OwnershipClaim(claim.clone()).encode(&mut claim_bytes);
+    let mut claim_frame = Vec::new();
+    ContainerFrame::encode_payload(&claim_bytes, &mut claim_frame).unwrap();
+    meta_file
+        .write_all(&claim_frame)
+        .expect("write claim frame");
+
+    let mut desc_bytes = Vec::new();
+    OwnershipRecord::SchemaDescriptor {
+        schema_version: 0,
+        descriptor_bytes: vec![1],
+    }
+    .encode(&mut desc_bytes);
+    let mut desc_frame = Vec::new();
+    ContainerFrame::encode_payload(&desc_bytes, &mut desc_frame).unwrap();
+    meta_file
+        .write_all(&desc_frame)
+        .expect("write invalid descriptor frame");
+    drop(meta_file);
+
+    assert_eq!(
+        adapter.try_presence().unwrap(),
+        ArtefactPresence::OwnershipRecordOnly
+    );
+
+    let err = adapter
+        .complete_creation(&claim)
+        .expect_err("complete_creation must fail when descriptor has invalid version 0");
+    assert_eq!(*err.condition(), FailureCondition::MissingSchemaDescriptor);
+}
+
+#[test]
+fn test_file_open_write_both_missing_descriptor_fails_closed() {
+    use std::io::Write;
+
+    let dir = TestDir::new("file_open_write_both_missing_desc");
+    let base_path = dir.path().join("store");
+    let adapter = FileStorageAdapter::new(&base_path);
+    let claim = sample_claim(1);
+
+    let mut meta_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(adapter.meta_path())
+        .expect("create meta");
+    meta_file
+        .write_all(&ContainerHeader::new().to_bytes())
+        .expect("write meta header");
+    let mut claim_bytes = Vec::new();
+    OwnershipRecord::OwnershipClaim(claim.clone()).encode(&mut claim_bytes);
+    let mut claim_frame = Vec::new();
+    ContainerFrame::encode_payload(&claim_bytes, &mut claim_frame).unwrap();
+    meta_file
+        .write_all(&claim_frame)
+        .expect("write claim frame");
+    drop(meta_file);
+
+    let mut pgno_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(adapter.pgno_path())
+        .expect("create pgno");
+    pgno_file
+        .write_all(&ContainerHeader::new().to_bytes())
+        .expect("write pgno header");
+    drop(pgno_file);
+
+    assert_eq!(adapter.try_presence().unwrap(), ArtefactPresence::Both);
+
+    let err = adapter
+        .open_write(1)
+        .expect_err("open_write must fail when descriptor missing in Both presence");
+    assert_eq!(*err.condition(), FailureCondition::MissingSchemaDescriptor);
+}
+
+#[test]
+fn test_file_open_write_both_persisted_invalid_descriptor_fails_closed() {
+    use std::io::Write;
+
+    let dir = TestDir::new("file_open_write_both_invalid_desc");
+    let base_path = dir.path().join("store");
+    let adapter = FileStorageAdapter::new(&base_path);
+    let claim = sample_claim(1);
+
+    let mut meta_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(adapter.meta_path())
+        .expect("create meta");
+    meta_file
+        .write_all(&ContainerHeader::new().to_bytes())
+        .expect("write meta header");
+    let mut claim_bytes = Vec::new();
+    OwnershipRecord::OwnershipClaim(claim.clone()).encode(&mut claim_bytes);
+    let mut claim_frame = Vec::new();
+    ContainerFrame::encode_payload(&claim_bytes, &mut claim_frame).unwrap();
+    meta_file
+        .write_all(&claim_frame)
+        .expect("write claim frame");
+
+    let mut desc_bytes = Vec::new();
+    OwnershipRecord::SchemaDescriptor {
+        schema_version: 0,
+        descriptor_bytes: vec![1],
+    }
+    .encode(&mut desc_bytes);
+    let mut desc_frame = Vec::new();
+    ContainerFrame::encode_payload(&desc_bytes, &mut desc_frame).unwrap();
+    meta_file
+        .write_all(&desc_frame)
+        .expect("write invalid descriptor frame");
+    drop(meta_file);
+
+    let mut pgno_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(adapter.pgno_path())
+        .expect("create pgno");
+    pgno_file
+        .write_all(&ContainerHeader::new().to_bytes())
+        .expect("write pgno header");
+    drop(pgno_file);
+
+    assert_eq!(adapter.try_presence().unwrap(), ArtefactPresence::Both);
+
+    let err = adapter
+        .open_write(1)
+        .expect_err("open_write must fail when descriptor has invalid version 0 in Both presence");
+    assert_eq!(*err.condition(), FailureCondition::MissingSchemaDescriptor);
 }

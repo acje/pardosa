@@ -32,14 +32,14 @@ fn test_readme_derived_order_event_compiles() {
         Cancelled = 3,
     }
 
-    assert_eq!(OrderEvent::schema_version(), 1);
+    assert_eq!(OrderEvent::SCHEMA_VERSION, 1);
     let identity = OrderEvent::schema_identity();
     assert_ne!(identity.as_bytes(), &[0u8; 32]);
 }
 
 #[test]
 fn test_user_event_schema_version_and_identity() {
-    assert_eq!(UserEvent::schema_version(), 1);
+    assert_eq!(UserEvent::SCHEMA_VERSION, 1);
     let desc = UserEvent::schema_descriptor();
     match desc {
         DescriptorNode::Enum {
@@ -113,6 +113,31 @@ fn test_user_event_unknown_discriminant_rejection() {
 #[test]
 fn test_user_event_truncated_rejection() {
     let err = UserEvent::decode_payload(&[]).unwrap_err();
+    assert_eq!(err.error_kind(), "TruncatedPayload");
+}
+
+#[test]
+fn test_derived_payload_trailing_bytes_rejection() {
+    let tombstone_trailing = [0x00, 0xFF];
+    let err = UserEvent::decode_payload(&tombstone_trailing).unwrap_err();
+    assert_eq!(err.error_kind(), "TruncatedPayload");
+
+    let created_trailing = [0x01, 0x2a, 0x00, 0x00, 0x00, 0xAA];
+    let err = UserEvent::decode_payload(&created_trailing).unwrap_err();
+    assert_eq!(err.error_kind(), "TruncatedPayload");
+
+    let mut updated_trailing = Vec::new();
+    let updated = UserEvent::UserUpdated {
+        id: 99,
+        name: EventString::new("Alice").unwrap(),
+    };
+    updated.encode_payload(&mut updated_trailing).unwrap();
+    updated_trailing.push(0xBB);
+    let err = UserEvent::decode_payload(&updated_trailing).unwrap_err();
+    assert_eq!(err.error_kind(), "TruncatedPayload");
+
+    let detached_trailing = [0x03, 0xCC];
+    let err = UserEvent::decode_payload(&detached_trailing).unwrap_err();
     assert_eq!(err.error_kind(), "TruncatedPayload");
 }
 
@@ -202,13 +227,13 @@ fn test_f64_derived_payload_schema_identity_and_admission_mismatch() {
     assert_eq!(schema_desc_b.identity(), id_b);
 
     let mut enc_a = Vec::new();
-    schema_desc_a.encode(&mut enc_a);
+    schema_desc_a.encode(&mut enc_a).unwrap();
     let (dec_desc_a, len_a) = SchemaDescriptor::decode(&enc_a).unwrap();
     assert_eq!(len_a, enc_a.len());
     assert_eq!(dec_desc_a, schema_desc_a);
 
     let mut enc_b = Vec::new();
-    schema_desc_b.encode(&mut enc_b);
+    schema_desc_b.encode(&mut enc_b).unwrap();
     let (dec_desc_b, len_b) = SchemaDescriptor::decode(&enc_b).unwrap();
     assert_eq!(len_b, enc_b.len());
     assert_eq!(dec_desc_b, schema_desc_b);
@@ -282,13 +307,13 @@ fn test_f32_derived_payload_schema_identity_and_admission_mismatch() {
     assert_eq!(schema_desc_b.identity(), id_b);
 
     let mut enc_a = Vec::new();
-    schema_desc_a.encode(&mut enc_a);
+    schema_desc_a.encode(&mut enc_a).unwrap();
     let (dec_desc_a, len_a) = SchemaDescriptor::decode(&enc_a).unwrap();
     assert_eq!(len_a, enc_a.len());
     assert_eq!(dec_desc_a, schema_desc_a);
 
     let mut enc_b = Vec::new();
-    schema_desc_b.encode(&mut enc_b);
+    schema_desc_b.encode(&mut enc_b).unwrap();
     let (dec_desc_b, len_b) = SchemaDescriptor::decode(&enc_b).unwrap();
     assert_eq!(len_b, enc_b.len());
     assert_eq!(dec_desc_b, schema_desc_b);
@@ -342,4 +367,768 @@ fn test_f32_derived_payload_schema_identity_and_admission_mismatch() {
     };
     let err = admit_event(&admission_mismatch).unwrap_err();
     assert_eq!(err.condition(), &FailureCondition::SchemaMismatch);
+}
+
+#[test]
+fn test_v21_schema_descriptor_golden_wire_bytes_and_persistence() {
+    let v21_descriptor = SchemaDescriptor::new(
+        21,
+        DescriptorNode::Enum {
+            name: "EvidenceEvent".to_string(),
+            discriminant_width: 1,
+            variants: vec![
+                VariantDescriptor {
+                    discriminant: 0,
+                    name: "Tombstone".to_string(),
+                    payload: None,
+                },
+                VariantDescriptor {
+                    discriminant: 1,
+                    name: "Observed".to_string(),
+                    payload: Some(DescriptorNode::Struct {
+                        name: "EvidencePayload".to_string(),
+                        fields: vec![
+                            FieldDescriptor {
+                                name: "entity_id".to_string(),
+                                node: DescriptorNode::Uuid,
+                            },
+                            FieldDescriptor {
+                                name: "timestamp".to_string(),
+                                node: DescriptorNode::Timestamp,
+                            },
+                            FieldDescriptor {
+                                name: "label".to_string(),
+                                node: DescriptorNode::EventString { max_bytes: 64 },
+                            },
+                            FieldDescriptor {
+                                name: "count".to_string(),
+                                node: DescriptorNode::U64,
+                            },
+                        ],
+                    }),
+                },
+            ],
+        },
+    );
+
+    let admitted = AdmittedDescriptor::try_from_descriptor(v21_descriptor.clone()).unwrap();
+    assert_eq!(admitted.version(), 21);
+
+    let mut wire_bytes = Vec::new();
+    v21_descriptor.encode(&mut wire_bytes).unwrap();
+
+    let expected_golden_bytes: [u8; 131] = [
+        21, 0, 0, 0, 16, 13, 0, 0, 0, 69, 118, 105, 100, 101, 110, 99, 101, 69, 118, 101, 110, 116,
+        1, 2, 0, 0, 0, 0, 9, 0, 0, 0, 84, 111, 109, 98, 115, 116, 111, 110, 101, 0, 1, 8, 0, 0, 0,
+        79, 98, 115, 101, 114, 118, 101, 100, 15, 15, 0, 0, 0, 69, 118, 105, 100, 101, 110, 99,
+        101, 80, 97, 121, 108, 111, 97, 100, 4, 0, 0, 0, 9, 0, 0, 0, 101, 110, 116, 105, 116, 121,
+        95, 105, 100, 18, 9, 0, 0, 0, 116, 105, 109, 101, 115, 116, 97, 109, 112, 17, 5, 0, 0, 0,
+        108, 97, 98, 101, 108, 10, 64, 0, 0, 0, 5, 0, 0, 0, 99, 111, 117, 110, 116, 4,
+    ];
+
+    assert_eq!(wire_bytes.as_slice(), &expected_golden_bytes);
+
+    let (decoded, consumed) = SchemaDescriptor::decode(&expected_golden_bytes).unwrap();
+    assert_eq!(consumed, expected_golden_bytes.len());
+    assert_eq!(decoded, v21_descriptor);
+    assert_eq!(decoded.identity(), v21_descriptor.identity());
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let stem = temp_dir.path().join("v21_golden");
+    let adapter = FileStorageAdapter::new(&stem);
+    let claim = OwnershipClaimRecord {
+        epoch: 1,
+        machine_id: [1u8; 16],
+        boot_id: [2u8; 16],
+        process_id: 12345,
+        process_start_time_ns: 1_000_000,
+        claim_time_ns: 2_000_000,
+        operator_label: "test-operator".to_string(),
+    };
+    let admitted_v21 = AdmittedDescriptor::try_from_descriptor(v21_descriptor.clone()).unwrap();
+    let writer = adapter
+        .create(&claim, &admitted_v21)
+        .expect("create writer");
+    assert_eq!(writer.schema_descriptor(), Some(&v21_descriptor));
+    drop(writer);
+
+    let reader = adapter.open_read().expect("open reader");
+    assert_eq!(reader.schema_descriptor(), Some(&v21_descriptor));
+}
+
+fn run_rustc(code: &str) -> (bool, String) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::sync::OnceLock;
+    static ARTIFACT: OnceLock<std::path::PathBuf> = OnceLock::new();
+    let artifact = ARTIFACT.get_or_init(|| {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let mut command = Command::new(env!("CARGO"));
+        command
+            .args([
+                "build",
+                "--locked",
+                "--lib",
+                "--message-format=json",
+                "--manifest-path",
+            ])
+            .arg(&manifest)
+            .args(["-p", env!("CARGO_PKG_NAME")]);
+        if cfg!(not(debug_assertions)) {
+            command.arg("--release");
+        }
+        let output = command.output().expect("build package proof artifact");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let records: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("Cargo JSON"))
+            .collect();
+        let matches: Vec<_> = records
+            .iter()
+            .filter(|r| {
+                r["reason"] == "compiler-artifact"
+                    && r["manifest_path"].as_str() == manifest.to_str()
+                    && r["target"]["name"] == "pardosa"
+                    && r["target"]["kind"] == serde_json::json!(["lib"])
+                    && r["features"] == serde_json::json!(["default", "uuid"])
+            })
+            .collect();
+        assert_eq!(matches.len(), 1, "exact package/target/features");
+        let paths: Vec<_> = matches[0]["filenames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.as_str())
+            .filter(|p| p.ends_with(".rlib"))
+            .collect();
+        assert_eq!(paths.len(), 1);
+        paths[0].into()
+    });
+    let mut child = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+        .args(["--edition=2021", "--crate-type=lib", "--emit=mir=-", "-"])
+        .arg("--extern")
+        .arg(format!("pardosa={}", artifact.display()))
+        .arg("-L")
+        .arg(format!(
+            "dependency={}",
+            artifact.parent().unwrap().join("deps").display()
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rustc");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(code.as_bytes())
+        .expect("write source");
+    let output = child.wait_with_output().expect("wait rustc");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn test_event_vec_negative_compile_on_non_pardosa() {
+    let code = r#"
+        use pardosa::prelude::*;
+        struct NonPardosa;
+        pub fn test_invalid() {
+            let _ = EventVec::<NonPardosa, 10>::new(vec![]);
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(
+        !ok,
+        "EventVec<NonPardosa, 10> must fail compilation without PardosaType bound"
+    );
+    assert!(
+        stderr.contains("PardosaType")
+            || stderr.contains("the trait `PardosaType` is not implemented"),
+        "stderr should cite PardosaType trait requirement: {stderr}"
+    );
+}
+
+#[test]
+fn test_event_vec_positive_controls_roundtrip() {
+    let empty = EventVec::<u32, 10>::new(vec![]).unwrap();
+    let mut buf = Vec::new();
+    empty.encode_type(&mut buf).unwrap();
+    assert_eq!(buf, vec![0, 0, 0, 0]);
+    let (decoded_empty, consumed) = EventVec::<u32, 10>::decode_type(&buf).unwrap();
+    assert_eq!(consumed, 4);
+    assert_eq!(decoded_empty, empty);
+
+    let populated = EventVec::<u32, 10>::new(vec![10, 20, 30]).unwrap();
+    buf.clear();
+    populated.encode_type(&mut buf).unwrap();
+    assert_eq!(buf.len(), 4 + 3 * 4);
+    let (decoded_pop, consumed) = EventVec::<u32, 10>::decode_type(&buf).unwrap();
+    assert_eq!(consumed, buf.len());
+    assert_eq!(decoded_pop, populated);
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, PardosaType)]
+struct Address {
+    street: EventString<32>,
+    zip_code: u32,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, PardosaType)]
+struct Marker;
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy, PardosaType)]
+#[repr(u8)]
+enum AccountState {
+    Active = 0,
+    Suspended = 1,
+    Closed = 2,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, PardosaType)]
+#[repr(u8)]
+enum TransactionPayload {
+    None = 0,
+    Transfer(u64) = 1,
+    Adjustment { reason: EventString<16>, delta: i64 } = 2,
+}
+
+#[test]
+fn test_derived_pardosa_type_named_struct_roundtrip() {
+    let addr = Address {
+        street: EventString::new("Main St").unwrap(),
+        zip_code: 12345,
+    };
+
+    match Address::descriptor_node() {
+        DescriptorNode::Struct { name, fields } => {
+            assert_eq!(name, "Address");
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].name, "street");
+            assert_eq!(
+                fields[0].node,
+                DescriptorNode::EventString { max_bytes: 32 }
+            );
+            assert_eq!(fields[1].name, "zip_code");
+            assert_eq!(fields[1].node, DescriptorNode::U32);
+        }
+        other => panic!("expected Struct descriptor node, found {:?}", other),
+    }
+
+    let mut buf = Vec::new();
+    addr.encode_type(&mut buf).unwrap();
+
+    let (decoded, consumed) = Address::decode_type(&buf).unwrap();
+    assert_eq!(consumed, buf.len());
+    assert_eq!(decoded, addr);
+
+    buf.push(0xFF);
+    let (decoded_prefix, consumed_prefix) = Address::decode_type(&buf).unwrap();
+    assert_eq!(consumed_prefix, buf.len() - 1);
+    assert_eq!(decoded_prefix, addr);
+}
+
+#[test]
+fn test_derived_pardosa_type_unit_struct_roundtrip() {
+    let marker = Marker;
+
+    match Marker::descriptor_node() {
+        DescriptorNode::Struct { name, fields } => {
+            assert_eq!(name, "Marker");
+            assert_eq!(fields.len(), 0);
+        }
+        other => panic!("expected Struct descriptor node, found {:?}", other),
+    }
+
+    let mut buf = Vec::new();
+    marker.encode_type(&mut buf).unwrap();
+    assert!(buf.is_empty());
+
+    let (decoded, consumed) = Marker::decode_type(&buf).unwrap();
+    assert_eq!(consumed, 0);
+    assert_eq!(decoded, marker);
+}
+
+#[test]
+fn test_derived_pardosa_type_scalar_enum_roundtrip() {
+    match AccountState::descriptor_node() {
+        DescriptorNode::Enum {
+            name,
+            discriminant_width,
+            variants,
+        } => {
+            assert_eq!(name, "AccountState");
+            assert_eq!(discriminant_width, 1);
+            assert_eq!(variants.len(), 3);
+            assert_eq!(variants[0].name, "Active");
+            assert_eq!(variants[0].discriminant, 0);
+            assert_eq!(variants[0].payload, None);
+            assert_eq!(variants[1].name, "Suspended");
+            assert_eq!(variants[1].discriminant, 1);
+            assert_eq!(variants[2].name, "Closed");
+            assert_eq!(variants[2].discriminant, 2);
+        }
+        other => panic!("expected Enum descriptor node, found {:?}", other),
+    }
+
+    for state in [
+        AccountState::Active,
+        AccountState::Suspended,
+        AccountState::Closed,
+    ] {
+        let mut buf = Vec::new();
+        state.encode_type(&mut buf).unwrap();
+        assert_eq!(buf.len(), 1);
+
+        let (decoded, consumed) = AccountState::decode_type(&buf).unwrap();
+        assert_eq!(consumed, 1);
+        assert_eq!(decoded, state);
+    }
+
+    let err = AccountState::decode_type(&[99]).unwrap_err();
+    assert!(matches!(
+        err,
+        DecodeError::UnknownVariantDiscriminant { discriminant: 99 }
+    ));
+}
+
+#[test]
+fn test_derived_pardosa_type_composite_enum_roundtrip() {
+    match TransactionPayload::descriptor_node() {
+        DescriptorNode::Enum {
+            name,
+            discriminant_width,
+            variants,
+        } => {
+            assert_eq!(name, "TransactionPayload");
+            assert_eq!(discriminant_width, 1);
+            assert_eq!(variants.len(), 3);
+            assert_eq!(variants[0].name, "None");
+            assert_eq!(variants[0].payload, None);
+            assert_eq!(variants[1].name, "Transfer");
+            assert_eq!(variants[1].payload, Some(DescriptorNode::U64));
+            assert_eq!(variants[2].name, "Adjustment");
+            assert!(matches!(
+                variants[2].payload,
+                Some(DescriptorNode::Struct { .. })
+            ));
+        }
+        other => panic!("expected Enum descriptor node, found {:?}", other),
+    }
+
+    let cases = vec![
+        TransactionPayload::None,
+        TransactionPayload::Transfer(1_000_000),
+        TransactionPayload::Adjustment {
+            reason: EventString::new("Refund").unwrap(),
+            delta: -500,
+        },
+    ];
+
+    for case in cases {
+        let mut buf = Vec::new();
+        case.encode_type(&mut buf).unwrap();
+
+        let (decoded, consumed) = TransactionPayload::decode_type(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(decoded, case);
+    }
+}
+
+#[test]
+fn test_compile_fail_missing_schema_version_attribute() {
+    let code = r#"
+        use pardosa::prelude::*;
+
+        #[derive(Debug, PartialEq, Eq, PardosaSchema)]
+        #[repr(u8)]
+        enum MissingVersionEvent {
+            #[pardosa(tombstone)]
+            Tombstone = 0,
+            Action = 1,
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(
+        !ok,
+        "omitting #[pardosa(version = N)] must fail compilation"
+    );
+    assert!(
+        stderr.contains(
+            "missing mandatory `#[pardosa(version = N)]` attribute on PardosaSchema root"
+        ),
+        "stderr must cite missing mandatory version attribute:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_compile_fail_override_schema_version() {
+    let code = r#"
+        use pardosa::prelude::*;
+
+        #[derive(Debug, PartialEq, Eq)]
+        enum ManualSchemaEvent {
+            Tombstone,
+        }
+
+        impl PardosaSchema for ManualSchemaEvent {
+            const SCHEMA_VERSION: u32 = 1;
+            fn schema_version() -> u32 { 1 }
+            fn schema_descriptor() -> DescriptorNode { DescriptorNode::U8 }
+            fn encode_payload(&self, _buf: &mut Vec<u8>) -> Result<(), EncodeError> { Ok(()) }
+            fn decode_payload(_buf: &[u8]) -> Result<Self, DecodeError> { Ok(Self::Tombstone) }
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(
+        !ok,
+        "overriding schema_version in PardosaSchema impl must fail compilation"
+    );
+    assert!(
+        stderr.contains("E0407") || stderr.contains("is not a member of trait `PardosaSchema`"),
+        "stderr must cite E0407:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_m1_hygiene_reserved_field_names() {
+    #[derive(Debug, PartialEq, Eq, Clone, PardosaType)]
+    struct ReservedFieldsStruct {
+        consumed: u32,
+        cursor: u32,
+        buf: u32,
+        value: u32,
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, PardosaType)]
+    #[repr(u8)]
+    enum ReservedFieldsEnum {
+        Data {
+            consumed: u32,
+            cursor: u32,
+            buf: u32,
+            value: u32,
+        } = 0,
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, PardosaSchema)]
+    #[repr(u8)]
+    #[pardosa(version = 1)]
+    enum ReservedFieldsSchema {
+        #[pardosa(tombstone)]
+        Tombstone = 0,
+        Data {
+            consumed: u32,
+            cursor: u32,
+            buf: u32,
+            value: u32,
+        } = 1,
+    }
+
+    let s = ReservedFieldsStruct {
+        consumed: 1,
+        cursor: 2,
+        buf: 3,
+        value: 4,
+    };
+    let mut s_buf = Vec::new();
+    s.encode_type(&mut s_buf).unwrap();
+    let (s_decoded, s_consumed) = ReservedFieldsStruct::decode_type(&s_buf).unwrap();
+    assert_eq!(s_consumed, s_buf.len());
+    assert_eq!(s_decoded, s);
+
+    let e = ReservedFieldsEnum::Data {
+        consumed: 10,
+        cursor: 20,
+        buf: 30,
+        value: 40,
+    };
+    let mut e_buf = Vec::new();
+    e.encode_type(&mut e_buf).unwrap();
+    let (e_decoded, e_consumed) = ReservedFieldsEnum::decode_type(&e_buf).unwrap();
+    assert_eq!(e_consumed, e_buf.len());
+    assert_eq!(e_decoded, e);
+
+    let schema_event = ReservedFieldsSchema::Data {
+        consumed: 100,
+        cursor: 200,
+        buf: 300,
+        value: 400,
+    };
+    let mut schema_buf = Vec::new();
+    schema_event.encode_payload(&mut schema_buf).unwrap();
+    let schema_decoded = ReservedFieldsSchema::decode_payload(&schema_buf).unwrap();
+    assert_eq!(schema_decoded, schema_event);
+}
+
+#[test]
+fn test_m2_macro_qualification_shadowing_vec() {
+    #[allow(unused_macros)]
+    macro_rules! vec {
+        ($($t:tt)*) => {
+            ::std::vec::Vec::new()
+        };
+    }
+
+    #[derive(Debug, PartialEq, Eq, PardosaType)]
+    struct ShadowedStruct {
+        value: u32,
+    }
+
+    #[derive(Debug, PartialEq, Eq, PardosaType)]
+    #[repr(u8)]
+    enum ShadowedEnum {
+        Variant { code: u16 } = 0,
+    }
+
+    #[derive(Debug, PartialEq, Eq, PardosaSchema)]
+    #[repr(u8)]
+    #[pardosa(version = 1)]
+    enum ShadowedSchema {
+        #[pardosa(tombstone)]
+        Tombstone = 0,
+        Event {
+            tag: u8,
+        } = 1,
+    }
+
+    let node = ShadowedStruct::descriptor_node();
+    match node {
+        DescriptorNode::Struct { fields, .. } => {
+            assert_eq!(
+                fields.len(),
+                1,
+                "fields must be populated despite local vec! macro"
+            );
+            assert_eq!(fields[0].name, "value");
+        }
+        other => panic!("expected Struct descriptor node, got {other:?}"),
+    }
+
+    let enum_node = ShadowedEnum::descriptor_node();
+    match enum_node {
+        DescriptorNode::Enum { variants, .. } => {
+            assert_eq!(
+                variants.len(),
+                1,
+                "variants must be populated despite local vec! macro"
+            );
+        }
+        other => panic!("expected Enum descriptor node, got {other:?}"),
+    }
+
+    let schema_node = ShadowedSchema::schema_descriptor();
+    match schema_node {
+        DescriptorNode::Enum { variants, .. } => {
+            assert_eq!(
+                variants.len(),
+                2,
+                "schema variants must be populated despite local vec! macro"
+            );
+        }
+        other => panic!("expected Enum descriptor node, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_m3_checked_cursor_advancement_composition() {
+    #[derive(Debug, PartialEq, Eq, Clone)]
+    struct BadConsumedType;
+
+    impl PardosaType for BadConsumedType {
+        const TYPE_DEPTH: usize = 0;
+        fn descriptor_node() -> DescriptorNode {
+            DescriptorNode::U8
+        }
+        fn encode_type(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
+            buf.push(0);
+            Ok(())
+        }
+        fn decode_type(_buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+            Ok((Self, usize::MAX))
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, PardosaType)]
+    struct ComposedStruct {
+        bad: BadConsumedType,
+        after: u8,
+    }
+
+    assert_eq!(
+        Option::<BadConsumedType>::decode_type(&[1, 0]).unwrap_err(),
+        DecodeError::TruncatedPayload {
+            expected: usize::MAX,
+            available: 2
+        }
+    );
+    let err = ComposedStruct::decode_type(&[0u8; 10]).unwrap_err();
+    assert_eq!(
+        err,
+        DecodeError::TruncatedPayload {
+            expected: usize::MAX,
+            available: 10,
+        }
+    );
+}
+
+#[test]
+fn test_h1_type_depth_const_values() {
+    assert_eq!(u32::TYPE_DEPTH, 0);
+    assert_eq!(Option::<u32>::TYPE_DEPTH, 1);
+    assert_eq!(EventVec::<u32, 10>::TYPE_DEPTH, 1);
+    assert_eq!(Option::<Option<u32>>::TYPE_DEPTH, 2);
+    assert_eq!(EventVec::<Option<u32>, 10>::TYPE_DEPTH, 2);
+    assert_eq!(EventF32::TYPE_DEPTH, 1);
+    assert_eq!(EventF64::TYPE_DEPTH, 1);
+
+    #[derive(PardosaType)]
+    struct LeafStruct {
+        a: u32,
+    }
+    assert_eq!(LeafStruct::TYPE_DEPTH, 1);
+
+    #[derive(PardosaType)]
+    struct NestedStruct {
+        inner: LeafStruct,
+    }
+    assert_eq!(NestedStruct::TYPE_DEPTH, 2);
+}
+
+#[test]
+fn test_depth_boundary_float_composition() {
+    for leaf in ["EventF32", "EventF64"] {
+        for depth in [16, 17] {
+            let ty = format!(
+                "{}{}{}",
+                "Option<".repeat(depth - 2),
+                leaf,
+                ">".repeat(depth - 2)
+            );
+            let code = format!(
+                "use pardosa::prelude::*; #[derive(PardosaType)] struct Outer {{ value: {ty} }}"
+            );
+            let (ok, stderr) = run_rustc(&code);
+            assert_eq!(ok, depth == 16, "{leaf} depth {depth}: {stderr}");
+            if !ok {
+                assert!(stderr.contains("E0080"), "{stderr}");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_depth_boundary_root_variants() {
+    for shape in [0, 1, 2] {
+        for depth in [16, 17] {
+            let wrappers = depth - if shape == 0 { 1 } else { 2 };
+            let ty = format!("{}u8{}", "Option<".repeat(wrappers), ">".repeat(wrappers));
+            let variant = match shape {
+                0 => format!("Data({ty}) = 1"),
+                1 => format!("Data {{ value: {ty} }} = 1"),
+                _ => format!("Data({ty}, u8) = 1"),
+            };
+            let code = format!("use pardosa::prelude::*; #[derive(PardosaSchema)] #[repr(u8)] #[pardosa(version = 1)] enum Root {{ #[pardosa(tombstone)] Tombstone = 0, {variant} }}");
+            let (ok, stderr) = run_rustc(&code);
+            assert_eq!(ok, depth == 16, "shape {shape} depth {depth}: {stderr}");
+            if !ok {
+                assert!(stderr.contains("E0080"), "{stderr}");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_compile_fail_h1_mutual_recursion() {
+    let code = r#"
+        use pardosa::prelude::*;
+
+        #[derive(PardosaType)]
+        struct A {
+            b: EventVec<B, 1>,
+        }
+
+        #[derive(PardosaType)]
+        struct B {
+            a: EventVec<A, 1>,
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(!ok, "mutual recursion cycle must fail compilation");
+    assert!(
+        stderr.contains("cycle detected") || stderr.contains("recursion limit"),
+        "stderr must cite cycle or recursion limit:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_compile_fail_h1_type_alias_recursion() {
+    let code = r#"
+        use pardosa::prelude::*;
+
+        type NodeAlias = Node;
+
+        #[derive(PardosaType)]
+        struct Node {
+            next: EventVec<NodeAlias, 1>,
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(!ok, "type alias cycle must fail compilation");
+    assert!(
+        stderr.contains("cycle detected") || stderr.contains("recursion limit"),
+        "stderr must cite cycle or recursion limit:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_compile_fail_version_zero() {
+    let code = r#"
+        use pardosa::prelude::*;
+
+        #[derive(Debug, PartialEq, Eq, PardosaSchema)]
+        #[repr(u8)]
+        #[pardosa(version = 0)]
+        enum ZeroVersionEvent {
+            #[pardosa(tombstone)]
+            Tombstone = 0,
+            Action = 1,
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(!ok, "version = 0 must fail compilation");
+    assert!(
+        stderr.contains("schema version must be non-zero"),
+        "stderr must cite non-zero version:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_compile_fail_duplicate_version() {
+    let code = r#"
+        use pardosa::prelude::*;
+
+        #[derive(Debug, PartialEq, Eq, PardosaSchema)]
+        #[repr(u8)]
+        #[pardosa(version = 1, version = 2)]
+        enum DuplicateVersionEvent {
+            #[pardosa(tombstone)]
+            Tombstone = 0,
+            Action = 1,
+        }
+    "#;
+    let (ok, stderr) = run_rustc(code);
+    assert!(!ok, "duplicate version must fail compilation");
+    assert!(
+        stderr.contains("duplicate `version` attribute"),
+        "stderr must cite duplicate version attribute:\n{stderr}"
+    );
 }

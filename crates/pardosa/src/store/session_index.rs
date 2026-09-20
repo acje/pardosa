@@ -497,7 +497,7 @@ mod tests {
     fn test_session_index_build_from_frames_zero_error_swallowing() {
         let mut env_buf = Vec::new();
         let env1 = EventEnvelope::genesis([0x01; 16], [0x10; 16], b"first").expect("genesis");
-        env1.encode(&mut env_buf);
+        env1.encode(&mut env_buf).unwrap();
 
         let corrupt_short = b"short_frame";
         let err_short = SessionIndex::build_from_frames([corrupt_short.as_slice()]).unwrap_err();
@@ -544,7 +544,7 @@ mod tests {
             payload: vec![],
         };
         let mut broken_buf = Vec::new();
-        broken_env.encode(&mut broken_buf);
+        broken_env.encode(&mut broken_buf).unwrap();
 
         let index_broken =
             SessionIndex::build_from_frames([env_buf.as_slice(), broken_buf.as_slice()]).unwrap();
@@ -676,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_from_frames_broken_envelope_event_id_tracked_for_uniqueness() {
+    fn test_session_index_build_from_frames_broken_envelope_event_id_tracked_for_uniqueness() {
         let f1 = [0x71; 16];
         let f2 = [0x72; 16];
         let shared_event_id = [0x88; 16];
@@ -693,7 +693,7 @@ mod tests {
         };
 
         let mut frame1 = Vec::new();
-        broken_env.encode(&mut frame1);
+        broken_env.encode(&mut frame1).unwrap();
 
         let index = SessionIndex::build_from_frames([frame1.as_slice()])
             .expect("rebuild succeeds with broken fiber");
@@ -890,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_fiber_broken_reason_truncation_and_capacity_refusal() {
+    fn test_session_index_mark_fiber_broken_reason_truncation_and_capacity_refusal() {
         let mut index = SessionIndex::new();
         let fiber_id = [0x77; 16];
         let mut huge_capacity_string = String::with_capacity(1024 * 1024);
@@ -930,7 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_fiber_broken_unicode_scalar_bound() {
+    fn test_session_index_mark_fiber_broken_unicode_scalar_bound() {
         let mut index = SessionIndex::new();
         let fiber_id = [0x99; 16];
         let emoji_reason = "🦀".repeat(300);
@@ -946,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_index_bounded_reservations_limit_1024() {
+    fn test_session_index_active_fibers_capacity_limit() {
         let mut index = SessionIndex::new();
         for i in 0..MAX_ACTIVE_FIBERS as u32 {
             let mut fiber_id = [0u8; 16];
@@ -967,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_index_pending_reservation_bytes_capacity_and_drop_release() {
+    fn test_session_index_multiple_commits_on_fiber() {
         let mut index = SessionIndex::new();
         let fiber_id = [0x99; 16];
         let env1 = EventEnvelope::genesis([0x01; 16], fiber_id, vec![0xaa; 100]).unwrap();
@@ -990,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_fiber_broken_respects_pending_reservation_bytes() {
+    fn test_session_index_mark_fiber_broken_transitions_fiber_to_broken() {
         let mut index = SessionIndex::new();
         let fiber_id = [0x99; 16];
         let env1 = EventEnvelope::genesis([0x01; 16], fiber_id, vec![0xaa; 100]).unwrap();
@@ -1004,7 +1004,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_fiber_broken_active_replacement_capacity_refusal() {
+    fn test_session_index_mark_fiber_broken_active_replacement_capacity_refusal() {
         let mut index = SessionIndex::new();
         for i in 0..MAX_ACTIVE_FIBERS as u32 {
             let mut fid = [0u8; 16];
@@ -1022,7 +1022,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_fiber_broken_broken_replacement_capacity_refusal() {
+    fn test_session_index_mark_fiber_broken_broken_replacement_capacity_refusal() {
         let mut index = SessionIndex::new();
         for i in 0..MAX_ACTIVE_FIBERS as u32 {
             let mut fid = [0u8; 16];
@@ -1047,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_has_raw_frames_revokes_prepare_append_and_outstanding_reservation() {
+    fn test_session_index_mark_has_raw_frames_revokes_validate_append() {
         let mut index = SessionIndex::new();
         let fiber_id = [0x88; 16];
         let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"payload").unwrap();
@@ -1066,7 +1066,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_from_frames_broken_event_id_capacity_accounting_and_refusal() {
+    fn test_session_index_build_from_frames_broken_event_id_capacity_accounting_and_refusal() {
         let f1 = [0x71; 16];
         let broken_env1 = EventEnvelope {
             header: crate::encoding::EnvelopeHeader {
@@ -1079,7 +1079,7 @@ mod tests {
             payload: b"first_broken".to_vec(),
         };
         let mut frame1 = Vec::new();
-        broken_env1.encode(&mut frame1);
+        broken_env1.encode(&mut frame1).unwrap();
 
         let index1 = SessionIndex::build_from_frames([frame1.as_slice()])
             .expect("build with single broken frame");
@@ -1096,7 +1096,7 @@ mod tests {
             payload: b"second_broken".to_vec(),
         };
         let mut frame2 = Vec::new();
-        broken_env2.encode(&mut frame2);
+        broken_env2.encode(&mut frame2).unwrap();
 
         let index2 = SessionIndex::build_from_frames([frame1.as_slice(), frame2.as_slice()])
             .expect("build with two broken frames");
@@ -1104,7 +1104,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_broken_event_id_capacity_exhaustion_refusal() {
+    fn test_session_index_record_broken_event_id_capacity_exhaustion_refusal() {
         let mut index = SessionIndex::new();
         let fiber_id = [0x88; 16];
         index
@@ -1124,7 +1124,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_from_frames_broken_fiber_event_count_limit_exhaustion() {
+    fn test_session_index_build_from_frames_broken_fiber_event_count_limit_exhaustion() {
         assert_eq!(MAX_EVENTS_PER_FIBER, 100_000);
         let fiber_id = [0x42; 16];
         let count = (MAX_EVENTS_PER_FIBER + 1) as usize;
@@ -1142,7 +1142,7 @@ mod tests {
                 },
                 payload: Vec::new(),
             };
-            env.encode(&mut frame_data);
+            env.encode(&mut frame_data).unwrap();
         }
 
         let frames: Vec<&[u8]> = frame_data

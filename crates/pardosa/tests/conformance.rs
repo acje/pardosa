@@ -49,7 +49,7 @@ fn test_container_header_conformance_vectors() {
                 assert_eq!(payload, expected_utf8.as_bytes());
 
                 let mut enc = Vec::new();
-                ContainerFrame::encode_payload(&payload, &mut enc);
+                ContainerFrame::encode_payload(&payload, &mut enc).unwrap();
                 assert_eq!(enc, bytes);
             }
             "corrupted_crc32c_checksum" => {
@@ -88,7 +88,7 @@ fn test_envelope_conformance_vectors() {
                 assert_eq!(env.payload, expected_utf8.as_bytes());
 
                 let mut enc = Vec::new();
-                env.encode(&mut enc);
+                env.encode(&mut enc).unwrap();
                 assert_eq!(enc, bytes);
             }
             "valid_detached_event" => {
@@ -102,7 +102,7 @@ fn test_envelope_conformance_vectors() {
                 assert_eq!(env.payload, expected_utf8.as_bytes());
 
                 let mut enc = Vec::new();
-                env.encode(&mut enc);
+                env.encode(&mut enc).unwrap();
                 assert_eq!(enc, bytes);
             }
             "invalid_boolean_discriminant_in_envelope" => {
@@ -118,7 +118,7 @@ fn test_envelope_conformance_vectors() {
                 assert_eq!(env.payload.len(), 0);
 
                 let mut enc = Vec::new();
-                env.encode(&mut enc);
+                env.encode(&mut enc).unwrap();
                 assert_eq!(enc, bytes);
             }
             "truncated_envelope_header" => {
@@ -613,7 +613,7 @@ fn test_descriptors_conformance_vectors() {
                                 assert_eq!(consumed, bytes.len());
                                 assert_eq!(node, EventF32::descriptor_node());
                                 let mut enc = Vec::new();
-                                node.encode(&mut enc);
+                                node.encode(&mut enc).unwrap();
                                 assert_eq!(enc, bytes);
                             } else {
                                 let err = DescriptorNode::decode(&bytes).unwrap_err();
@@ -626,7 +626,7 @@ fn test_descriptors_conformance_vectors() {
                                 assert_eq!(consumed, bytes.len());
                                 assert_eq!(node, EventF64::descriptor_node());
                                 let mut enc = Vec::new();
-                                node.encode(&mut enc);
+                                node.encode(&mut enc).unwrap();
                                 assert_eq!(enc, bytes);
                             } else {
                                 let err = DescriptorNode::decode(&bytes).unwrap_err();

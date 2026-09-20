@@ -2,8 +2,8 @@
 
 use crate::encoding::{
     EventEnvelope, EventEnvelopeRef, InboundPointerRecord, MigrationEndRecord,
-    MigrationStartRecord, OutboundPointerRecord, OwnershipClaimRecord, OwnershipRecord,
-    RescuePolicyChoiceRecord,
+    MigrationStartRecord, OutboundPointerRecord, OwnershipClaimRecord, RescuePolicyChoiceRecord,
+    ValueConstraint,
 };
 use crate::file::{ContainerFrame, RollingCommitment};
 use crate::schema::{derive_fiber_id, SchemaDescriptor};
@@ -13,14 +13,14 @@ use crate::store::session_index::SessionIndex;
 use crate::store::{FailureCondition, OpenAdmission, OperationFailure, WriteLandingVerdict};
 use std::fmt;
 
-pub use crate::store::{BatchLandingVerdict, NextAttemptStatus};
-
 /// Unified storage pipeline owning fiber handles, caching, and state verification per C5 and C6.
 pub struct Store<E: StorageEngine> {
     pub(crate) engine: E,
     pub(crate) rolling_commitment: RollingCommitment,
     pub(crate) fiber_index: SessionIndex,
     pub(crate) broken_reader_cause: Option<FailureCondition>,
+    pub(crate) uncertain: bool,
+    pub(crate) uncertain_diagnostic: Option<String>,
 }
 
 impl<E: StorageEngine + fmt::Debug> fmt::Debug for Store<E> {
@@ -30,6 +30,8 @@ impl<E: StorageEngine + fmt::Debug> fmt::Debug for Store<E> {
             .field("rolling_commitment", &self.rolling_commitment)
             .field("fiber_index", &self.fiber_index)
             .field("broken_reader_cause", &self.broken_reader_cause)
+            .field("uncertain", &self.uncertain)
+            .field("uncertain_diagnostic", &self.uncertain_diagnostic)
             .finish()
     }
 }
@@ -44,7 +46,12 @@ impl<E: StorageEngine> Store<E> {
         let mut fiber_index = SessionIndex::new();
         engine.recover_frames(64, &mut |_seq, frame| {
             let mut frame_buf = Vec::new();
-            ContainerFrame::encode_payload(frame, &mut frame_buf);
+            ContainerFrame::encode_payload(frame, &mut frame_buf).map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    format!("frame encoding failed: {err}"),
+                )
+            })?;
             rolling_commitment.update_frame(&frame_buf);
             fiber_index.process_frame(frame)
         })?;
@@ -53,6 +60,8 @@ impl<E: StorageEngine> Store<E> {
             rolling_commitment,
             fiber_index,
             broken_reader_cause: None,
+            uncertain: false,
+            uncertain_diagnostic: None,
         })
     }
 
@@ -65,7 +74,12 @@ impl<E: StorageEngine> Store<E> {
 
         let res = engine.recover_frames(64, &mut |_seq, frame| {
             let mut frame_buf = Vec::new();
-            ContainerFrame::encode_payload(frame, &mut frame_buf);
+            ContainerFrame::encode_payload(frame, &mut frame_buf).map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    format!("frame encoding failed: {err}"),
+                )
+            })?;
             rolling.update_frame(&frame_buf);
 
             if broken_cause.is_none() {
@@ -83,6 +97,8 @@ impl<E: StorageEngine> Store<E> {
                 rolling_commitment: rolling,
                 fiber_index: SessionIndex::new(),
                 broken_reader_cause: Some(cause),
+                uncertain: false,
+                uncertain_diagnostic: None,
             };
         }
 
@@ -92,6 +108,8 @@ impl<E: StorageEngine> Store<E> {
                 rolling_commitment: rolling,
                 fiber_index: SessionIndex::new(),
                 broken_reader_cause: Some(FailureCondition::PrecursorChainBroken(None)),
+                uncertain: false,
+                uncertain_diagnostic: None,
             };
         }
 
@@ -101,12 +119,16 @@ impl<E: StorageEngine> Store<E> {
                 rolling_commitment: rolling,
                 fiber_index,
                 broken_reader_cause: None,
+                uncertain: false,
+                uncertain_diagnostic: None,
             },
             Err(err) => Self {
                 engine,
                 rolling_commitment: RollingCommitment::new(),
                 fiber_index: SessionIndex::new(),
                 broken_reader_cause: Some(err.condition().clone()),
+                uncertain: false,
+                uncertain_diagnostic: None,
             },
         }
     }
@@ -136,7 +158,24 @@ impl<E: StorageEngine> Store<E> {
     /// Returns the diagnostic detail string if the engine entered an uncertain write state.
     #[must_use]
     pub fn uncertain_diagnostic(&self) -> Option<&str> {
-        self.engine.uncertain_diagnostic()
+        self.uncertain_diagnostic
+            .as_deref()
+            .or_else(|| self.engine.uncertain_diagnostic())
+    }
+
+    fn check_session_authority(&self) -> Result<(), OperationFailure> {
+        if self.uncertain || self.engine.uncertain_diagnostic().is_some() {
+            let detail = if let Some(diag) = self.uncertain_diagnostic() {
+                format!("writer session in uncertain state; reconciliation required: {diag}")
+            } else {
+                "writer session in uncertain state; reconciliation required".to_string()
+            };
+            return Err(OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                detail,
+            ));
+        }
+        self.engine.check_authority()
     }
 
     /// Returns the active ownership claim record, if established.
@@ -199,19 +238,6 @@ impl<E: StorageEngine> Store<E> {
         }
     }
 
-    /// Attaches and validates a schema descriptor to the artefact per C8.2.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if authority verification or storage write fails.
-    pub fn set_schema_descriptor(
-        &mut self,
-        descriptor: &SchemaDescriptor,
-    ) -> Result<(), OperationFailure> {
-        descriptor.validate_structural_completeness()?;
-        self.engine.check_authority()?;
-        self.engine.set_schema_descriptor(descriptor)
-    }
-
     /// Returns the outbound pointer record, if recorded.
     #[must_use]
     pub fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
@@ -242,70 +268,6 @@ impl<E: StorageEngine> Store<E> {
         self.engine.rescue_policy_choice()
     }
 
-    /// Records an arbitrary ownership record into metadata.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if authority verification or recording fails.
-    pub fn record_meta_record(&mut self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
-        self.engine.check_authority()?;
-        self.engine.record_meta_record(record)
-    }
-
-    /// Records an outbound pointer record into metadata.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if recording fails.
-    pub fn record_outbound_pointer(
-        &mut self,
-        pointer: &OutboundPointerRecord,
-    ) -> Result<(), OperationFailure> {
-        self.engine.record_outbound_pointer(pointer)
-    }
-
-    /// Records an inbound pointer record into metadata.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if recording fails.
-    pub fn record_inbound_pointer(
-        &mut self,
-        pointer: &InboundPointerRecord,
-    ) -> Result<(), OperationFailure> {
-        self.engine.record_inbound_pointer(pointer)
-    }
-
-    /// Records a migration start record into metadata.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if recording fails.
-    pub fn record_migration_start(
-        &mut self,
-        start: &MigrationStartRecord,
-    ) -> Result<(), OperationFailure> {
-        self.engine.record_migration_start(start)
-    }
-
-    /// Records a migration end record into metadata.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if recording fails.
-    pub fn record_migration_end(
-        &mut self,
-        end: &MigrationEndRecord,
-    ) -> Result<(), OperationFailure> {
-        self.engine.record_migration_end(end)
-    }
-
-    /// Records a rescue policy choice record into metadata.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if recording fails.
-    pub fn record_rescue_policy_choice(
-        &mut self,
-        choice: &RescuePolicyChoiceRecord,
-    ) -> Result<(), OperationFailure> {
-        self.engine.record_rescue_policy_choice(choice)
-    }
-
     /// Synchronizes storage buffers to durable medium.
     ///
     /// # Errors
@@ -319,10 +281,15 @@ impl<E: StorageEngine> Store<E> {
     /// # Errors
     /// Returns [`OperationFailure`] if reader has failed or fiber is broken.
     pub fn fiber(&self, fiber_id: [u8; 16]) -> Result<FiberHandle, OperationFailure> {
-        if self.engine.uncertain_diagnostic().is_some() {
+        if self.uncertain || self.engine.uncertain_diagnostic().is_some() {
+            let detail = if let Some(diag) = self.uncertain_diagnostic() {
+                format!("writer session in uncertain state; reconciliation required: {diag}")
+            } else {
+                "writer session in uncertain state; reconciliation required".to_string()
+            };
             return Err(OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
-                "writer session in uncertain state; reconciliation required",
+                detail,
             ));
         }
         if let Some(ref cause) = self.broken_reader_cause {
@@ -350,10 +317,15 @@ impl<E: StorageEngine> Store<E> {
         &self,
         fiber_id: [u8; 16],
     ) -> Result<Option<&EventEnvelope>, OperationFailure> {
-        if self.engine.uncertain_diagnostic().is_some() {
+        if self.uncertain || self.engine.uncertain_diagnostic().is_some() {
+            let detail = if let Some(diag) = self.uncertain_diagnostic() {
+                format!("writer session in uncertain state; reconciliation required: {diag}")
+            } else {
+                "writer session in uncertain state; reconciliation required".to_string()
+            };
             return Err(OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
-                "writer session in uncertain state; reconciliation required",
+                detail,
             ));
         }
         if let Some(ref cause) = self.broken_reader_cause {
@@ -376,55 +348,6 @@ impl<E: StorageEngine> Store<E> {
         self.get_latest(derive_fiber_id(domain_key))
     }
 
-    fn append_frame_raw(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
-        let mut frame_buf = Vec::new();
-        ContainerFrame::encode_payload(payload, &mut frame_buf);
-        let verdict = self.engine.append_block(&frame_buf)?;
-        match verdict {
-            WriteLandingVerdict::Landed(_) => {
-                self.rolling_commitment.update_frame(&frame_buf);
-                Ok(self.rolling_commitment.frame_count())
-            }
-            WriteLandingVerdict::Undetermined { .. } => Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                "write landing undetermined",
-            )),
-        }
-    }
-
-    /// Appends a raw frame payload without session index pre-admission validation.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if write or sync fails.
-    pub fn append_raw_frame(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
-        self.engine.check_authority()?;
-        if payload.len() >= 85 {
-            if let Ok((env, consumed)) = EventEnvelope::decode(payload) {
-                if consumed == payload.len() {
-                    self.fiber_index.validate_append(&env)?;
-                    let count = self.append_frame_raw(payload)?;
-                    self.fiber_index.commit_envelope_unchecked(env);
-                    return Ok(count);
-                }
-            }
-        }
-        let count = self.append_frame_raw(payload)?;
-        self.fiber_index.mark_has_raw_frames();
-        Ok(count)
-    }
-
-    /// Appends an unvalidated raw frame directly to the container for testing or migration recovery.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if authority verification or storage write fails.
-    #[doc(hidden)]
-    pub fn append_unvalidated_frame(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
-        self.engine.check_authority()?;
-        let count = self.append_frame_raw(payload)?;
-        self.fiber_index.mark_has_raw_frames();
-        Ok(count)
-    }
-
     /// Appends a framed payload byte slice, returning a [`WriteLandingVerdict`].
     ///
     /// # Errors
@@ -433,7 +356,15 @@ impl<E: StorageEngine> Store<E> {
         &mut self,
         payload: &[u8],
     ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-        self.engine.check_authority()?;
+        if payload.len() > u32::MAX as usize {
+            return Err(OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                },
+                "payload exceeds maximum container frame length (u32::MAX)",
+            ));
+        }
+        self.check_session_authority()?;
         if payload.len() < 85 {
             return Err(OperationFailure::new(
                 FailureCondition::EnvelopeMismatch,
@@ -462,7 +393,14 @@ impl<E: StorageEngine> Store<E> {
         self.fiber_index.validate_append(&env)?;
 
         let mut frame_buf = Vec::new();
-        ContainerFrame::encode_payload(payload, &mut frame_buf);
+        ContainerFrame::encode_payload(payload, &mut frame_buf).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                },
+                format!("frame encoding failed: {err}"),
+            )
+        })?;
 
         let verdict = self.engine.append_block(&frame_buf)?;
         match verdict {
@@ -474,22 +412,17 @@ impl<E: StorageEngine> Store<E> {
                 ))
             }
             WriteLandingVerdict::Undetermined { carried_epoch } => {
+                self.uncertain = true;
+                let diag = self
+                    .engine
+                    .uncertain_diagnostic()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| {
+                        format!("writer session in uncertain state; reconciliation required: write landing undetermined for carried epoch {carried_epoch} per C5.16")
+                    });
+                self.uncertain_diagnostic = Some(diag);
                 Ok(WriteLandingVerdict::Undetermined { carried_epoch })
             }
-        }
-    }
-
-    /// Appends a framed payload byte slice, unwrapping the landing verdict.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if validation, storage write, or landing fails.
-    pub fn append_frame(&mut self, payload: &[u8]) -> Result<u64, OperationFailure> {
-        match self.append_frame_verdict(payload)? {
-            WriteLandingVerdict::Landed(count) => Ok(count),
-            WriteLandingVerdict::Undetermined { .. } => Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                "write landing undetermined: operation may or may not have landed",
-            )),
         }
     }
 
@@ -501,250 +434,18 @@ impl<E: StorageEngine> Store<E> {
         &mut self,
         envelope: &EventEnvelope,
     ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
+        let wire = crate::encoding::WireEnvelope::try_from(envelope).map_err(|err| {
+            OperationFailure::with_source(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: crate::encoding::ValueConstraint::TooLong,
+                },
+                "event envelope exceeds frame wire limit",
+                err,
+            )
+        })?;
         let mut env_buf = Vec::new();
-        envelope.encode(&mut env_buf);
+        wire.encode(&mut env_buf);
         self.append_frame_verdict(&env_buf)
-    }
-
-    /// Appends an event envelope to the container after pre-landing validation.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if validation, storage write, or landing fails.
-    pub fn append_envelope(&mut self, envelope: &EventEnvelope) -> Result<u64, OperationFailure> {
-        match self.append_envelope_verdict(envelope)? {
-            WriteLandingVerdict::Landed(count) => Ok(count),
-            WriteLandingVerdict::Undetermined { .. } => Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                "write landing undetermined: operation may or may not have landed",
-            )),
-        }
-    }
-
-    /// Appends a batch of framed payload byte slices, returning detailed landing progress.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if authority verification or pre-landing payload validation fails.
-    pub fn append_batch_detailed(
-        &mut self,
-        payloads: &[&[u8]],
-    ) -> Result<BatchLandingVerdict<u64>, OperationFailure> {
-        self.engine.check_authority()?;
-        if payloads.is_empty() {
-            return Ok(BatchLandingVerdict::LandedAll {
-                final_position: self.rolling_commitment.frame_count(),
-                landed_count: 0,
-            });
-        }
-
-        let mut scratch_index = self.fiber_index.clone();
-        let mut frame_buffers = Vec::with_capacity(payloads.len());
-        let mut decoded_envelopes = Vec::with_capacity(payloads.len());
-
-        for payload in payloads {
-            if payload.len() < 85 {
-                return Err(OperationFailure::new(
-                    FailureCondition::EnvelopeMismatch,
-                    format!("payload too short for event envelope: {}", payload.len()),
-                ));
-            }
-            let (env, consumed) = EventEnvelope::decode(payload).map_err(|err| {
-                OperationFailure::new(
-                    FailureCondition::EnvelopeMismatch,
-                    format!("failed to decode envelope: {err}"),
-                )
-            })?;
-            if consumed != payload.len() {
-                return Err(OperationFailure::new(
-                    FailureCondition::EnvelopeMismatch,
-                    format!(
-                        "frame decode error: {}",
-                        crate::encoding::DecodeError::TruncatedPayload {
-                            expected: payload.len(),
-                            available: consumed,
-                        }
-                    ),
-                ));
-            }
-
-            scratch_index.validate_append(&env)?;
-            scratch_index.commit_envelope_unchecked(env.clone());
-
-            let mut frame_buf = Vec::new();
-            ContainerFrame::encode_payload(payload, &mut frame_buf);
-            frame_buffers.push(frame_buf);
-            decoded_envelopes.push(env);
-        }
-
-        let block_refs: Vec<&[u8]> = frame_buffers.iter().map(|f| f.as_slice()).collect();
-        let verdict = self.engine.append_batch_detailed(&block_refs);
-
-        match verdict {
-            BatchLandingVerdict::LandedAll {
-                final_position: _,
-                landed_count,
-            } => {
-                if landed_count != payloads.len() {
-                    return Err(OperationFailure::new(
-                        FailureCondition::PrecursorChainBroken(None),
-                        format!(
-                            "engine reported inconsistent LandedAll count: landed {landed_count} != batch length {}",
-                            payloads.len()
-                        ),
-                    ));
-                }
-                for frame_buf in &frame_buffers {
-                    self.rolling_commitment.update_frame(frame_buf);
-                }
-                self.fiber_index = scratch_index;
-                Ok(BatchLandingVerdict::LandedAll {
-                    final_position: self.rolling_commitment.frame_count(),
-                    landed_count,
-                })
-            }
-            BatchLandingVerdict::PreAttemptRefusal {
-                error,
-                unattempted_count,
-            } => {
-                if unattempted_count != payloads.len() {
-                    return Err(OperationFailure::new(
-                        FailureCondition::PrecursorChainBroken(None),
-                        format!(
-                            "engine reported inconsistent PreAttemptRefusal count: unattempted {unattempted_count} != batch length {}",
-                            payloads.len()
-                        ),
-                    ));
-                }
-                Ok(BatchLandingVerdict::PreAttemptRefusal {
-                    error,
-                    unattempted_count,
-                })
-            }
-            BatchLandingVerdict::PartialProgress {
-                landed_count,
-                next_attempt,
-                unattempted_count,
-            } => {
-                let total_accounted = landed_count
-                    .checked_add(1)
-                    .and_then(|sum| sum.checked_add(unattempted_count));
-                if total_accounted != Some(payloads.len()) {
-                    return Err(OperationFailure::new(
-                        FailureCondition::PrecursorChainBroken(None),
-                        format!(
-                            "engine reported inconsistent batch partition: landed {landed_count} + next 1 + unattempted {unattempted_count} != batch length {}",
-                            payloads.len()
-                        ),
-                    ));
-                }
-                for i in 0..landed_count {
-                    self.rolling_commitment.update_frame(&frame_buffers[i]);
-                    self.fiber_index
-                        .commit_envelope_unchecked(decoded_envelopes[i].clone());
-                }
-                Ok(BatchLandingVerdict::PartialProgress {
-                    landed_count,
-                    next_attempt,
-                    unattempted_count,
-                })
-            }
-        }
-    }
-
-    /// Appends a batch of event envelopes returning detailed landing progress.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if authority verification or pre-landing validation fails.
-    pub fn append_batch_envelopes_detailed(
-        &mut self,
-        envelopes: &[EventEnvelope],
-    ) -> Result<BatchLandingVerdict<u64>, OperationFailure> {
-        let mut encoded_payloads = Vec::with_capacity(envelopes.len());
-        for env in envelopes {
-            let mut env_buf = Vec::new();
-            env.encode(&mut env_buf);
-            encoded_payloads.push(env_buf);
-        }
-        let payload_refs: Vec<&[u8]> = encoded_payloads.iter().map(|p| p.as_slice()).collect();
-        self.append_batch_detailed(&payload_refs)
-    }
-
-    /// Appends a batch of framed payload byte slices, returning a [`WriteLandingVerdict`].
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if validation or storage write fails.
-    pub fn append_batch_verdict(
-        &mut self,
-        payloads: &[&[u8]],
-    ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-        match self.append_batch_detailed(payloads)? {
-            BatchLandingVerdict::LandedAll { final_position, .. } => {
-                Ok(WriteLandingVerdict::Landed(final_position))
-            }
-            BatchLandingVerdict::PreAttemptRefusal { error, .. } => Err(error),
-            BatchLandingVerdict::PartialProgress {
-                next_attempt: NextAttemptStatus::Undetermined { carried_epoch },
-                ..
-            } => Ok(WriteLandingVerdict::Undetermined { carried_epoch }),
-            BatchLandingVerdict::PartialProgress {
-                next_attempt: NextAttemptStatus::Rejected(err),
-                ..
-            } => Err(err),
-        }
-    }
-
-    /// Appends a batch of framed payload byte slices, unwrapping the landing verdict.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if validation, storage write, or landing fails.
-    pub fn append_batch(&mut self, payloads: &[&[u8]]) -> Result<u64, OperationFailure> {
-        match self.append_batch_verdict(payloads)? {
-            WriteLandingVerdict::Landed(count) => Ok(count),
-            WriteLandingVerdict::Undetermined { .. } => Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                "write landing undetermined: operation may or may not have landed",
-            )),
-        }
-    }
-
-    /// Appends a batch of event envelopes returning a [`WriteLandingVerdict`].
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if validation or storage write fails.
-    pub fn append_batch_envelopes_verdict(
-        &mut self,
-        envelopes: &[EventEnvelope],
-    ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-        match self.append_batch_envelopes_detailed(envelopes)? {
-            BatchLandingVerdict::LandedAll { final_position, .. } => {
-                Ok(WriteLandingVerdict::Landed(final_position))
-            }
-            BatchLandingVerdict::PreAttemptRefusal { error, .. } => Err(error),
-            BatchLandingVerdict::PartialProgress {
-                next_attempt: NextAttemptStatus::Undetermined { carried_epoch },
-                ..
-            } => Ok(WriteLandingVerdict::Undetermined { carried_epoch }),
-            BatchLandingVerdict::PartialProgress {
-                next_attempt: NextAttemptStatus::Rejected(err),
-                ..
-            } => Err(err),
-        }
-    }
-
-    /// Appends a batch of event envelopes to the container after pre-landing validation.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] if validation, storage write, or landing fails.
-    pub fn append_batch_envelopes(
-        &mut self,
-        envelopes: &[EventEnvelope],
-    ) -> Result<u64, OperationFailure> {
-        match self.append_batch_envelopes_verdict(envelopes)? {
-            WriteLandingVerdict::Landed(count) => Ok(count),
-            WriteLandingVerdict::Undetermined { .. } => Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                "write landing undetermined: operation may or may not have landed",
-            )),
-        }
     }
 
     /// Appends an event to the specified fiber.
@@ -757,11 +458,10 @@ impl<E: StorageEngine> Store<E> {
         event_id: [u8; 16],
         payload: impl Into<Vec<u8>>,
     ) -> Result<WriteLandingVerdict<EventEnvelope>, OperationFailure> {
+        self.check_session_authority()?;
         let mut handle = self.fiber(fiber_id)?;
         let envelope = handle.append(event_id, payload)?;
-        let mut env_buf = Vec::new();
-        envelope.encode(&mut env_buf);
-        let verdict = self.append_frame_verdict(&env_buf)?;
+        let verdict = self.append_envelope_verdict(&envelope)?;
         match verdict {
             WriteLandingVerdict::Landed(_) => Ok(WriteLandingVerdict::Landed(envelope)),
             WriteLandingVerdict::Undetermined { carried_epoch } => {
@@ -780,11 +480,10 @@ impl<E: StorageEngine> Store<E> {
         event_id: [u8; 16],
         payload: impl Into<Vec<u8>>,
     ) -> Result<WriteLandingVerdict<EventEnvelope>, OperationFailure> {
+        self.check_session_authority()?;
         let mut handle = self.fiber(fiber_id)?;
         let envelope = handle.detach(event_id, payload)?;
-        let mut env_buf = Vec::new();
-        envelope.encode(&mut env_buf);
-        let verdict = self.append_frame_verdict(&env_buf)?;
+        let verdict = self.append_envelope_verdict(&envelope)?;
         match verdict {
             WriteLandingVerdict::Landed(_) => Ok(WriteLandingVerdict::Landed(envelope)),
             WriteLandingVerdict::Undetermined { carried_epoch } => {
@@ -803,11 +502,10 @@ impl<E: StorageEngine> Store<E> {
         event_id: [u8; 16],
         payload: impl Into<Vec<u8>>,
     ) -> Result<WriteLandingVerdict<EventEnvelope>, OperationFailure> {
+        self.check_session_authority()?;
         let mut handle = self.fiber(fiber_id)?;
         let envelope = handle.rescue(event_id, payload)?;
-        let mut env_buf = Vec::new();
-        envelope.encode(&mut env_buf);
-        let verdict = self.append_frame_verdict(&env_buf)?;
+        let verdict = self.append_envelope_verdict(&envelope)?;
         match verdict {
             WriteLandingVerdict::Landed(_) => Ok(WriteLandingVerdict::Landed(envelope)),
             WriteLandingVerdict::Undetermined { carried_epoch } => {
@@ -841,7 +539,12 @@ impl<E: StorageEngine> Store<E> {
         let mut rolling = RollingCommitment::new();
         for frame in &frames {
             let mut frame_buf = Vec::new();
-            ContainerFrame::encode_payload(frame, &mut frame_buf);
+            ContainerFrame::encode_payload(frame, &mut frame_buf).map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    format!("frame encoding failed: {err}"),
+                )
+            })?;
             rolling.update_frame(&frame_buf);
         }
         self.rolling_commitment = rolling;
@@ -981,7 +684,12 @@ impl<E: StorageEngine> Store<E> {
             validation_index.commit_envelope_unchecked(owned_env);
 
             let mut frame_buf = Vec::new();
-            ContainerFrame::encode_payload(frame, &mut frame_buf);
+            ContainerFrame::encode_payload(frame, &mut frame_buf).map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    format!("frame encoding failed: {err}"),
+                )
+            })?;
             rolling.update_frame(&frame_buf);
 
             match f(env_ref) {
@@ -1043,6 +751,7 @@ impl<E: StorageEngine> Store<E> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::store::FiberState;
@@ -1161,28 +870,6 @@ mod tests {
             self.meta_records.schema_descriptor.as_ref()
         }
 
-        fn set_schema_descriptor(
-            &mut self,
-            descriptor: &SchemaDescriptor,
-        ) -> Result<(), OperationFailure> {
-            self.meta_records.schema_descriptor = Some(descriptor.clone());
-            Ok(())
-        }
-
-        fn record_meta_record(&mut self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
-            match record {
-                OwnershipRecord::OwnershipClaim(claim) => {
-                    self.meta_records.latest_claim = Some(claim.clone());
-                }
-                OwnershipRecord::OutboundPointer(pointer) => {
-                    self.meta_records.outbound_pointer = Some(pointer.clone());
-                    self.retired = true;
-                }
-                _ => {}
-            }
-            Ok(())
-        }
-
         fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
             self.meta_records.outbound_pointer.as_ref()
         }
@@ -1290,6 +977,46 @@ mod tests {
     }
 
     #[test]
+    fn test_store_session_marks_permanently_uncertain_on_undetermined_outcome() {
+        let engine = InMemoryEngine {
+            epoch: 1,
+            undetermined_after_n_blocks: Some(0),
+            ..Default::default()
+        };
+        let mut store = Store::open_writer(engine).expect("open writer");
+        let fiber_id = [0x11; 16];
+        let event_id1 = [0x01; 16];
+        let verdict = store
+            .append_to_fiber(fiber_id, event_id1, b"first-event")
+            .expect("call succeeds returning verdict");
+        assert!(matches!(verdict, WriteLandingVerdict::Undetermined { .. }));
+
+        let event_id2 = [0x02; 16];
+        let err = store
+            .append_to_fiber(fiber_id, event_id2, b"second-event")
+            .unwrap_err();
+        assert_eq!(
+            *err.condition(),
+            FailureCondition::OwnershipRecordUnreadable
+        );
+        assert!(err
+            .to_string()
+            .contains("writer session in uncertain state; reconciliation required"));
+
+        let err_fiber = store.fiber(fiber_id).unwrap_err();
+        assert_eq!(
+            *err_fiber.condition(),
+            FailureCondition::OwnershipRecordUnreadable
+        );
+
+        let err_latest = store.get_latest(fiber_id).unwrap_err();
+        assert_eq!(
+            *err_latest.condition(),
+            FailureCondition::OwnershipRecordUnreadable
+        );
+    }
+
+    #[test]
     fn test_store_in_memory_engine_retirement_rejection() {
         let engine = InMemoryEngine {
             epoch: 1,
@@ -1384,23 +1111,10 @@ mod tests {
         engine.retired = true;
         let mut store = Store::open_writer(engine).expect("open writer");
 
-        let err_meta = store
-            .record_meta_record(&OwnershipRecord::RescuePolicyChoice(
-                RescuePolicyChoiceRecord {
-                    policy_tag: 0,
-                    parameter_payload: vec![],
-                },
-            ))
-            .unwrap_err();
+        let genesis = EventEnvelope::genesis([0x01; 16], [0x11; 16], b"payload").unwrap();
+        let err_append = store.append_envelope_verdict(&genesis).unwrap_err();
         assert_eq!(
-            *err_meta.condition(),
-            FailureCondition::RetiredMigrationSource
-        );
-
-        let descriptor = SchemaDescriptor::new(1, crate::schema::DescriptorNode::U64);
-        let err_schema = store.set_schema_descriptor(&descriptor).unwrap_err();
-        assert_eq!(
-            *err_schema.condition(),
+            *err_append.condition(),
             FailureCondition::RetiredMigrationSource
         );
 
@@ -1410,219 +1124,6 @@ mod tests {
             *err_point.condition(),
             FailureCondition::PrecursorChainBroken(None)
         );
-    }
-
-    #[test]
-    fn test_store_append_batch_rolling_commitment_matches_single_append() {
-        let fiber1 = [0x11; 16];
-        let fiber2 = [0x22; 16];
-        let env1 = EventEnvelope::genesis([0x01; 16], fiber1, b"f1-genesis".to_vec())
-            .expect("env1 genesis");
-        let env2 =
-            EventEnvelope::chain(&env1, [0x02; 16], b"f1-event2".to_vec()).expect("env2 chain");
-        let env3 = EventEnvelope::genesis([0x03; 16], fiber2, b"f2-genesis".to_vec())
-            .expect("env3 genesis");
-
-        let mut store_single = Store::open_writer(InMemoryEngine {
-            epoch: 1,
-            ..Default::default()
-        })
-        .expect("open single store");
-
-        store_single.append_envelope(&env1).expect("append env1");
-        store_single.append_envelope(&env2).expect("append env2");
-        store_single.append_envelope(&env3).expect("append env3");
-
-        let mut store_batch = Store::open_writer(InMemoryEngine {
-            epoch: 1,
-            ..Default::default()
-        })
-        .expect("open batch store");
-
-        let batch_count = store_batch
-            .append_batch_envelopes(&[env1, env2, env3])
-            .expect("append batch envelopes");
-
-        assert_eq!(batch_count, 3);
-        assert_eq!(
-            store_batch.rolling_commitment().frame_count(),
-            store_single.rolling_commitment().frame_count()
-        );
-        assert_eq!(
-            store_batch.rolling_commitment().current_commitment(),
-            store_single.rolling_commitment().current_commitment()
-        );
-
-        let h1 = store_batch.fiber(fiber1).expect("fiber1");
-        assert_eq!(h1.event_count(), 2);
-        let h2 = store_batch.fiber(fiber2).expect("fiber2");
-        assert_eq!(h2.event_count(), 1);
-    }
-
-    #[test]
-    fn test_store_append_batch_detailed_partial_landing_and_undetermined() {
-        let fiber1 = [0x51; 16];
-        let env1 = EventEnvelope::genesis([0x01; 16], fiber1, b"f1-genesis".to_vec())
-            .expect("env1 genesis");
-        let env2 =
-            EventEnvelope::chain(&env1, [0x02; 16], b"f1-event2".to_vec()).expect("env2 chain");
-        let env3 =
-            EventEnvelope::chain(&env2, [0x03; 16], b"f1-event3".to_vec()).expect("env3 chain");
-        let env4 =
-            EventEnvelope::chain(&env3, [0x04; 16], b"f1-event4".to_vec()).expect("env4 chain");
-
-        let mut store = Store::open_writer(InMemoryEngine {
-            epoch: 1,
-            undetermined_after_n_blocks: Some(2),
-            ..Default::default()
-        })
-        .expect("open store");
-
-        let verdict = store
-            .append_batch_envelopes_detailed(&[
-                env1.clone(),
-                env2.clone(),
-                env3.clone(),
-                env4.clone(),
-            ])
-            .expect("batch detailed returns verdict");
-        match &verdict {
-            BatchLandingVerdict::PartialProgress {
-                landed_count,
-                next_attempt,
-                unattempted_count,
-            } => {
-                assert_eq!(*landed_count, 2);
-                assert_eq!(
-                    *next_attempt,
-                    NextAttemptStatus::Undetermined { carried_epoch: 1 }
-                );
-                assert_eq!(*unattempted_count, 1);
-            }
-            other => panic!("expected PartialProgress, got {other:?}"),
-        }
-        assert_eq!(verdict.landed_count(), 2);
-        assert_eq!(verdict.unresolved_count(), 1);
-        assert_eq!(verdict.unattempted_count(), 1);
-        assert_eq!(verdict.total_count(), 4);
-        assert_eq!(store.rolling_commitment().frame_count(), 2);
-        let h = store.fiber(fiber1).expect("fiber1");
-        assert_eq!(h.event_count(), 2);
-        let latest = store.get_latest(fiber1).expect("latest").expect("env");
-        assert_eq!(latest.header.event_id, env2.header.event_id);
-
-        let mut store_ok = Store::open_writer(InMemoryEngine {
-            epoch: 1,
-            ..Default::default()
-        })
-        .expect("open store ok");
-
-        let verdict_all = store_ok
-            .append_batch_envelopes_detailed(&[env1.clone(), env2.clone(), env3.clone()])
-            .expect("batch detailed succeeds");
-        assert_eq!(
-            verdict_all,
-            BatchLandingVerdict::LandedAll {
-                final_position: 3,
-                landed_count: 3,
-            }
-        );
-        assert_eq!(verdict_all.landed_count(), 3);
-        assert_eq!(verdict_all.unattempted_count(), 0);
-        assert_eq!(verdict_all.total_count(), 3);
-        assert_eq!(store_ok.rolling_commitment().frame_count(), 3);
-        let h_ok = store_ok.fiber(fiber1).expect("fiber1");
-        assert_eq!(h_ok.event_count(), 3);
-    }
-
-    #[test]
-    fn test_store_append_batch_detailed_partial_landing_failure() {
-        let fiber1 = [0x52; 16];
-        let env1 = EventEnvelope::genesis([0x01; 16], fiber1, b"f1-genesis".to_vec())
-            .expect("env1 genesis");
-        let env2 =
-            EventEnvelope::chain(&env1, [0x02; 16], b"f1-event2".to_vec()).expect("env2 chain");
-        let env3 =
-            EventEnvelope::chain(&env2, [0x03; 16], b"f1-event3".to_vec()).expect("env3 chain");
-        let env4 =
-            EventEnvelope::chain(&env3, [0x04; 16], b"f1-event4".to_vec()).expect("env4 chain");
-        let env5 =
-            EventEnvelope::chain(&env4, [0x05; 16], b"f1-event5".to_vec()).expect("env5 chain");
-
-        let mut store = Store::open_writer(InMemoryEngine {
-            epoch: 1,
-            fail_after_n_blocks: Some(2),
-            ..Default::default()
-        })
-        .expect("open store");
-
-        let verdict = store
-            .append_batch_envelopes_detailed(&[
-                env1.clone(),
-                env2.clone(),
-                env3.clone(),
-                env4.clone(),
-                env5.clone(),
-            ])
-            .expect("batch detailed returns partial failure verdict");
-
-        match &verdict {
-            BatchLandingVerdict::PartialProgress {
-                landed_count,
-                next_attempt,
-                unattempted_count,
-            } => {
-                assert_eq!(*landed_count, 2);
-                match next_attempt {
-                    NextAttemptStatus::Rejected(error) => {
-                        assert_eq!(
-                            *error.condition(),
-                            FailureCondition::PrecursorChainBroken(None)
-                        );
-                    }
-                    other => panic!("expected Rejected, got {other:?}"),
-                }
-                assert_eq!(*unattempted_count, 2);
-            }
-            other => panic!("expected PartialProgress, got {other:?}"),
-        }
-        assert_eq!(verdict.landed_count(), 2);
-        assert_eq!(verdict.rejected_count(), 1);
-        assert_eq!(verdict.unattempted_count(), 2);
-        assert_eq!(verdict.total_count(), 5);
-
-        assert_eq!(store.rolling_commitment().frame_count(), 2);
-        let h = store.fiber(fiber1).expect("fiber1");
-        assert_eq!(h.event_count(), 2);
-        let latest = store.get_latest(fiber1).expect("latest").expect("env");
-        assert_eq!(latest.header.event_id, env2.header.event_id);
-    }
-
-    #[test]
-    fn test_store_append_batch_detailed_empty_and_prevalidation() {
-        let mut store = Store::open_writer(InMemoryEngine {
-            epoch: 1,
-            ..Default::default()
-        })
-        .expect("open store");
-
-        let empty_res = store
-            .append_batch_detailed(&[])
-            .expect("empty batch succeeds");
-        assert_eq!(
-            empty_res,
-            BatchLandingVerdict::LandedAll {
-                final_position: 0,
-                landed_count: 0,
-            }
-        );
-        assert_eq!(empty_res.landed_count(), 0);
-        assert_eq!(empty_res.unattempted_count(), 0);
-        assert_eq!(empty_res.total_count(), 0);
-
-        let short_payload = [0u8; 10];
-        let short_err = store.append_batch_detailed(&[&short_payload]).unwrap_err();
-        assert_eq!(*short_err.condition(), FailureCondition::EnvelopeMismatch);
     }
 
     #[derive(Debug, Default)]
@@ -1693,17 +1194,6 @@ mod tests {
             self.inner.schema_descriptor()
         }
 
-        fn set_schema_descriptor(
-            &mut self,
-            descriptor: &SchemaDescriptor,
-        ) -> Result<(), OperationFailure> {
-            self.inner.set_schema_descriptor(descriptor)
-        }
-
-        fn record_meta_record(&mut self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
-            self.inner.record_meta_record(record)
-        }
-
         fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
             self.inner.outbound_pointer()
         }
@@ -1744,7 +1234,7 @@ mod tests {
         let fiber1 = [0x11; 16];
         let gen1_env = EventEnvelope::genesis([0x01; 16], fiber1, b"fiber1-msg1").unwrap();
         let mut gen1 = Vec::new();
-        gen1_env.encode(&mut gen1);
+        gen1_env.encode(&mut gen1).unwrap();
         let mut child1 = Vec::new();
         EventEnvelope {
             header: crate::encoding::EnvelopeHeader {
@@ -1756,10 +1246,11 @@ mod tests {
             },
             payload: b"fiber1-msg2".to_vec(),
         }
-        .encode(&mut child1);
+        .encode(&mut child1)
+        .unwrap();
 
-        store.append_frame(&gen1).expect("append gen1");
-        store.append_frame(&child1).expect("append child1");
+        store.append_frame_verdict(&gen1).expect("append gen1");
+        store.append_frame_verdict(&child1).expect("append child1");
 
         let original_digest = store.rolling_commitment().current_commitment();
         let original_frame_count = store.rolling_commitment().frame_count();
@@ -1852,7 +1343,7 @@ mod tests {
             let count = engine
                 .recover_frames(chunk_size, &mut |_seq, frame| {
                     let mut frame_buf = Vec::new();
-                    ContainerFrame::encode_payload(frame, &mut frame_buf);
+                    ContainerFrame::encode_payload(frame, &mut frame_buf).expect("encode frame");
                     rolling.update_frame(&frame_buf);
                     index.process_frame(frame)
                 })

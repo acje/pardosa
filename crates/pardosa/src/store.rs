@@ -1074,146 +1074,6 @@ pub enum WriteLandingVerdict<T> {
     },
 }
 
-/// Status of the attempt that interrupted a sequential batch append.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NextAttemptStatus {
-    /// Landing of the next item following the landed prefix is undetermined per C5.16.
-    /// The item may or may not have landed on storage.
-    Undetermined {
-        /// Monotonic epoch carried by the write whose landing is undetermined.
-        carried_epoch: u64,
-    },
-    /// The next item was positively rejected by the storage engine or pre-validation with a deterministic error.
-    Rejected(OperationFailure),
-}
-
-/// Outcome of a bounded sequential batch-write operation per C5.12 and C5.16.
-///
-/// Progress is structurally bound to the submitted batch: either all items landed,
-/// the batch was refused before submission, or execution halted after a confirmed
-/// contiguous landed prefix with an explicit next attempt status and unattempted suffix.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BatchLandingVerdict<T> {
-    /// All items in the batch successfully landed durably.
-    LandedAll {
-        /// Position or sequence of the final landed item.
-        final_position: T,
-        /// Number of items confirmed landed.
-        landed_count: usize,
-    },
-    /// The batch was refused before any item was submitted to storage (e.g. invalid authority or empty batch).
-    PreAttemptRefusal {
-        /// Deterministic operation failure preventing attempt.
-        error: OperationFailure,
-        /// Number of unattempted items in the refused batch.
-        unattempted_count: usize,
-    },
-    /// Sequential execution landed a contiguous prefix before being interrupted.
-    PartialProgress {
-        /// Number of contiguous prefix items confirmed to have landed durably.
-        landed_count: usize,
-        /// Status of the specific attempt following the landed prefix.
-        next_attempt: NextAttemptStatus,
-        /// Number of items remaining in the batch that were never attempted.
-        unattempted_count: usize,
-    },
-}
-
-impl<T> BatchLandingVerdict<T> {
-    /// Returns true if all items in the batch successfully landed.
-    #[must_use]
-    pub fn is_all_landed(&self) -> bool {
-        matches!(self, Self::LandedAll { .. })
-    }
-
-    /// Returns the number of items verified to have landed from the submitted batch.
-    #[must_use]
-    pub fn landed_count(&self) -> usize {
-        match self {
-            Self::LandedAll { landed_count, .. } | Self::PartialProgress { landed_count, .. } => {
-                *landed_count
-            }
-            Self::PreAttemptRefusal { .. } => 0,
-        }
-    }
-
-    /// Returns the number of items whose durability is ambiguous/undetermined.
-    #[must_use]
-    pub fn unresolved_count(&self) -> usize {
-        match self {
-            Self::LandedAll { .. } | Self::PreAttemptRefusal { .. } => 0,
-            Self::PartialProgress { next_attempt, .. } => {
-                if matches!(next_attempt, NextAttemptStatus::Undetermined { .. }) {
-                    1
-                } else {
-                    0
-                }
-            }
-        }
-    }
-
-    /// Returns the number of items that were positively rejected with a deterministic error.
-    #[must_use]
-    pub fn rejected_count(&self) -> usize {
-        match self {
-            Self::LandedAll { .. } | Self::PreAttemptRefusal { .. } => 0,
-            Self::PartialProgress { next_attempt, .. } => {
-                if matches!(next_attempt, NextAttemptStatus::Rejected(_)) {
-                    1
-                } else {
-                    0
-                }
-            }
-        }
-    }
-
-    /// Returns the number of items that remained unattempted in the submitted batch.
-    #[must_use]
-    pub fn unattempted_count(&self) -> usize {
-        match self {
-            Self::LandedAll { .. } => 0,
-            Self::PreAttemptRefusal {
-                unattempted_count, ..
-            }
-            | Self::PartialProgress {
-                unattempted_count, ..
-            } => *unattempted_count,
-        }
-    }
-
-    /// Returns the total number of items accounted for in this batch outcome.
-    ///
-    /// Uses saturating addition to prevent arithmetic overflow on untrusted external values.
-    #[must_use]
-    pub fn total_count(&self) -> usize {
-        self.landed_count()
-            .saturating_add(self.unresolved_count())
-            .saturating_add(self.rejected_count())
-            .saturating_add(self.unattempted_count())
-    }
-
-    /// Checked total item count. Returns `None` if counts overflow `usize`.
-    #[must_use]
-    pub fn checked_total_count(&self) -> Option<usize> {
-        self.landed_count()
-            .checked_add(self.unresolved_count())
-            .and_then(|sum| sum.checked_add(self.rejected_count()))
-            .and_then(|sum| sum.checked_add(self.unattempted_count()))
-    }
-
-    /// Returns true if any item in the batch has an ambiguous/undetermined outcome.
-    #[must_use]
-    pub fn has_unresolved(&self) -> bool {
-        matches!(
-            self,
-            Self::PartialProgress {
-                next_attempt: NextAttemptStatus::Undetermined { .. },
-                ..
-            }
-        )
-    }
-}
-
 /// Diagnostic detail reported with an operation failure per C6.9 and C6.11.
 ///
 /// Holds Pardosa-owned contextual information about the failure without
@@ -1473,11 +1333,20 @@ impl fmt::Display for FailureCondition {
 }
 
 /// Closed failure type carrying a named condition and Pardosa-owned diagnostic detail per C6.7, C6.9, and C6.11.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct OperationFailure {
     condition: FailureCondition,
     diagnostic_detail: DiagnosticDetail,
+    source: Option<std::sync::Arc<dyn std::error::Error + Send + Sync>>,
 }
+
+impl PartialEq for OperationFailure {
+    fn eq(&self, other: &Self) -> bool {
+        self.condition == other.condition && self.diagnostic_detail == other.diagnostic_detail
+    }
+}
+
+impl Eq for OperationFailure {}
 
 impl OperationFailure {
     /// Creates a new operation failure with a condition and diagnostic detail.
@@ -1486,6 +1355,22 @@ impl OperationFailure {
         Self {
             condition,
             diagnostic_detail: detail.into(),
+            source: None,
+        }
+    }
+
+    /// Creates a failure retaining its typed backend source across clones.
+    /// Equality compares condition and diagnostic detail, excluding the source.
+    #[must_use]
+    pub fn with_source(
+        condition: FailureCondition,
+        detail: impl Into<DiagnosticDetail>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            condition,
+            diagnostic_detail: detail.into(),
+            source: Some(std::sync::Arc::new(source)),
         }
     }
 
@@ -1539,8 +1424,9 @@ impl fmt::Display for OperationFailure {
 
 impl std::error::Error for OperationFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match &self.condition {
-            FailureCondition::PrecursorChainBroken(Some(err)) => Some(err),
+        match (&self.source, &self.condition) {
+            (Some(source), _) => Some(source.as_ref()),
+            (None, FailureCondition::PrecursorChainBroken(Some(err))) => Some(err),
             _ => None,
         }
     }
@@ -2836,7 +2722,7 @@ mod tests {
             payload: vec![1, 2, 3],
         };
         let mut env_bytes = Vec::new();
-        genesis_env.encode(&mut env_bytes);
+        genesis_env.encode(&mut env_bytes).unwrap();
         let frame = crate::file::ContainerFrame::new(env_bytes);
 
         let res = ArtefactReader::with_frames("frame-reader", vec![frame], |reader| {
@@ -2864,7 +2750,7 @@ mod tests {
             payload: vec![1, 2, 3],
         };
         let mut env_bytes = Vec::new();
-        genesis_env.encode(&mut env_bytes);
+        genesis_env.encode(&mut env_bytes).unwrap();
         let mut frame = crate::file::ContainerFrame::new(env_bytes);
         frame.checksum ^= 0xffff_ffff;
 
@@ -2890,7 +2776,7 @@ mod tests {
             payload: vec![1, 2, 3],
         };
         let mut env_bytes = Vec::new();
-        genesis_env.encode(&mut env_bytes);
+        genesis_env.encode(&mut env_bytes).unwrap();
         env_bytes.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
         let frame = crate::file::ContainerFrame::new(env_bytes.clone());
 
@@ -3918,7 +3804,7 @@ mod tests {
                 payload: vec![],
             };
             let mut buf = Vec::new();
-            env.encode(&mut buf);
+            env.encode(&mut buf).unwrap();
             crate::file::ContainerFrame::new(buf)
         });
         let at_limit_res =
@@ -3939,7 +3825,7 @@ mod tests {
                 payload: vec![],
             };
             let mut buf = Vec::new();
-            env.encode(&mut buf);
+            env.encode(&mut buf).unwrap();
             crate::file::ContainerFrame::new(buf)
         });
         let mut invoked = false;
@@ -4185,7 +4071,7 @@ mod tests {
             payload: vec![0u8; MAX_STREAM_BYTES - 85],
         };
         let mut encoded = Vec::with_capacity(MAX_STREAM_BYTES);
-        env.encode(&mut encoded);
+        env.encode(&mut encoded).unwrap();
         assert_eq!(encoded.len(), MAX_STREAM_BYTES);
         let frame = crate::file::ContainerFrame::new(encoded);
         let res = ArtefactReader::with_frames("exact-64mib-frame", vec![frame], |reader| {
@@ -4239,7 +4125,7 @@ mod tests {
         };
         let c1 = env1.commitment();
         let mut enc1 = Vec::new();
-        env1.encode(&mut enc1);
+        env1.encode(&mut enc1).unwrap();
         assert_eq!(enc1.len(), 85 + p1_len);
         let frame1 = crate::file::ContainerFrame::new(enc1);
 
@@ -4255,7 +4141,7 @@ mod tests {
             payload: vec![0u8; p2_len],
         };
         let mut enc2 = Vec::new();
-        env2.encode(&mut enc2);
+        env2.encode(&mut enc2).unwrap();
         assert_eq!(enc2.len(), 85 + p2_len);
         let frame2 = crate::file::ContainerFrame::new(enc2);
 

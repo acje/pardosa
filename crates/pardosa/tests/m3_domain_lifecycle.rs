@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use pardosa::prelude::*;
 use std::process::Command;
 
@@ -687,6 +689,40 @@ fn test_c5_5_through_16_ownership_and_domain_admissions() {
     );
 }
 
+#[test]
+fn wire_envelope_borrow_and_private_construction() {
+    let positive = r#"
+        use pardosa::encoding::{EventEnvelope, WireEnvelope};
+        fn check(mut raw: EventEnvelope) {
+            WireEnvelope::try_from(&raw).unwrap().encode(&mut Vec::new());
+            raw.payload.push(1);
+            raw.encode(&mut Vec::new()).unwrap();
+        }
+    "#;
+    let (ok, error) = run_rustc(positive);
+    assert!(ok, "{error}");
+    let (ok, error) = run_rustc(
+        r#"
+        use pardosa::encoding::{EventEnvelope, WireEnvelope};
+        fn check(mut raw: EventEnvelope) {
+            let wire = WireEnvelope::try_from(&raw).unwrap();
+            raw.payload.push(1);
+            wire.encode(&mut Vec::new());
+        }
+    "#,
+    );
+    assert!(!ok && error.contains("E0502"), "{error}");
+    let (ok, error) = run_rustc(
+        r#"
+        use pardosa::encoding::{EventEnvelope, WireEnvelope};
+        fn check(raw: &EventEnvelope) {
+            let _ = WireEnvelope { envelope: raw, wire_len: 0 };
+        }
+    "#,
+    );
+    assert!(!ok && error.contains("E0451"), "{error}");
+}
+
 fn run_rustc(code: &str) -> (bool, String) {
     use std::io::Write;
 
@@ -696,34 +732,59 @@ fn run_rustc(code: &str) -> (bool, String) {
         .expect("parent deps directory")
         .to_path_buf();
 
-    let entries = std::fs::read_dir(&deps_dir)
-        .unwrap_or_else(|e| panic!("failed to read deps dir {}: {e}", deps_dir.display()));
-    let mut rlibs = Vec::new();
-    for entry in entries {
-        let entry =
-            entry.unwrap_or_else(|e| panic!("failed to read entry in {}: {e}", deps_dir.display()));
-        let p = entry.path();
-        if let Some(s) = p.file_name().and_then(|n| n.to_str()) {
-            if s.starts_with("libpardosa-") && s.ends_with(".rlib") {
-                rlibs.push(p.clone());
+    let cargo_cmd = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let mut cargo_args = vec!["build", "-p", "pardosa", "--lib", "--message-format=json"];
+    if deps_dir.iter().any(|c| c == "release") || cfg!(not(debug_assertions)) {
+        cargo_args.push("--release");
+    }
+    let output = Command::new(&cargo_cmd)
+        .args(&cargo_args)
+        .output()
+        .expect("invoke cargo build for pardosa");
+    if !output.status.success() {
+        panic!(
+            "cargo build failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let mut rlib_path: Option<std::path::PathBuf> = None;
+    for line in stdout_str.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if val.get("reason").and_then(|r| r.as_str()) == Some("compiler-artifact") {
+                let target = val.get("target");
+                let name = target.and_then(|t| t.get("name")).and_then(|n| n.as_str());
+                let kind = target
+                    .and_then(|t| t.get("kind"))
+                    .and_then(|k| k.as_array());
+                let is_lib = kind.is_some_and(|arr| arr.iter().any(|k| k.as_str() == Some("lib")));
+                if name == Some("pardosa") && is_lib {
+                    if let Some(filenames) = val.get("filenames").and_then(|f| f.as_array()) {
+                        for fname in filenames {
+                            if let Some(s) = fname.as_str() {
+                                if s.ends_with(".rlib") {
+                                    rlib_path = Some(std::path::PathBuf::from(s));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
-    let rlib = match rlibs.len() {
-        0 => panic!(
-            "could not locate libpardosa rlib in deps directory: {}",
-            deps_dir.display()
-        ),
-        1 => rlibs.remove(0),
-        _ => {
-            rlibs.sort_by_key(|p| {
-                std::fs::metadata(p)
-                    .and_then(|m| m.modified())
-                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-            });
-            rlibs.pop().unwrap()
-        }
-    };
+
+    let rlib = rlib_path.unwrap_or_else(|| {
+        panic!(
+            "could not locate pardosa rlib in cargo build output: {}",
+            stdout_str
+        )
+    });
 
     let rustc_cmd = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
     let mut cmd = Command::new(&rustc_cmd);
@@ -1055,7 +1116,7 @@ fn test_compile_fail_and_positive_controls_external_boundary() {
 
     let file_reader_set_schema_code = r#"
         use pardosa::prelude::*;
-        pub fn run_invalid(mut reader: FileReaderSession, desc: &SchemaDescriptor) {
+        pub fn run_invalid(mut reader: FileReaderSession, desc: &AdmittedDescriptor) {
             let _ = reader.set_schema_descriptor(desc);
         }
     "#;
@@ -1091,20 +1152,192 @@ fn test_compile_fail_and_positive_controls_external_boundary() {
         "rejection must be missing DerefMut or missing method: {reader_meta_stderr}"
     );
 
+    let file_writer_append_envelope_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_invalid(mut writer: FileWriterSession, env: &EventEnvelope) {
+            let _ = writer.append_envelope(env);
+        }
+    "#;
+    let (writer_env_ok, writer_env_stderr) = run_rustc(file_writer_append_envelope_code);
+    assert!(
+        !writer_env_ok,
+        "FileWriterSession must not expose lossy append_envelope"
+    );
+    assert!(
+        writer_env_stderr.contains("no method named `append_envelope`")
+            || writer_env_stderr.contains("E0599"),
+        "rejection must be missing append_envelope: {writer_env_stderr}"
+    );
+
+    let file_writer_append_frame_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_invalid(mut writer: FileWriterSession) {
+            let _ = writer.append_frame(b"payload");
+        }
+    "#;
+    let (writer_frame_ok, writer_frame_stderr) = run_rustc(file_writer_append_frame_code);
+    assert!(
+        !writer_frame_ok,
+        "FileWriterSession must not expose lossy append_frame"
+    );
+    assert!(
+        writer_frame_stderr.contains("no method named `append_frame`")
+            || writer_frame_stderr.contains("E0599"),
+        "rejection must be missing append_frame: {writer_frame_stderr}"
+    );
+
+    let file_writer_append_frame_raw_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_invalid(mut writer: FileWriterSession) {
+            let _ = writer.append_frame_raw(b"payload");
+        }
+    "#;
+    let (writer_raw_ok, writer_raw_stderr) = run_rustc(file_writer_append_frame_raw_code);
+    assert!(
+        !writer_raw_ok,
+        "FileWriterSession must not expose lossy append_frame_raw"
+    );
+    assert!(
+        writer_raw_stderr.contains("no method named `append_frame_raw`")
+            || writer_raw_stderr.contains("E0599"),
+        "rejection must be missing append_frame_raw: {writer_raw_stderr}"
+    );
+
+    let file_writer_meta_record_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_invalid(mut writer: FileWriterSession, record: &OwnershipRecord) {
+            let _ = writer.record_meta_record(record);
+        }
+    "#;
+    let (writer_meta_ok, writer_meta_stderr) = run_rustc(file_writer_meta_record_code);
+    assert!(
+        !writer_meta_ok,
+        "FileWriterSession must not expose runtime record_meta_record in production"
+    );
+    assert!(
+        writer_meta_stderr.contains("no method named `record_meta_record`")
+            || writer_meta_stderr.contains("E0599"),
+        "rejection must be missing record_meta_record: {writer_meta_stderr}"
+    );
+
+    let file_adapter_meta_record_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_invalid(adapter: &FileStorageAdapter, record: &OwnershipRecord) {
+            let _ = adapter.record_meta_record(record);
+        }
+    "#;
+    let (adapter_meta_ok, adapter_meta_stderr) = run_rustc(file_adapter_meta_record_code);
+    assert!(
+        !adapter_meta_ok,
+        "FileStorageAdapter must not expose public record_meta_record in production"
+    );
+    assert!(
+        adapter_meta_stderr.contains("no method named `record_meta_record`")
+            || adapter_meta_stderr.contains("E0599"),
+        "rejection must be missing record_meta_record: {adapter_meta_stderr}"
+    );
+
+    let file_adapter_presence_lossy_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_invalid(adapter: &FileStorageAdapter) {
+            let _ = adapter.presence();
+        }
+    "#;
+    let (adapter_pres_ok, adapter_pres_stderr) = run_rustc(file_adapter_presence_lossy_code);
+    assert!(
+        !adapter_pres_ok,
+        "FileStorageAdapter must not expose lossy presence() method"
+    );
+    assert!(
+        adapter_pres_stderr.contains("no method named `presence`")
+            || adapter_pres_stderr.contains("E0599"),
+        "rejection must be missing presence: {adapter_pres_stderr}"
+    );
+
     let file_writer_mutation_positive_code = r#"
         use pardosa::prelude::*;
-        pub fn run_valid(mut writer: FileWriterSession, env: &EventEnvelope, desc: &SchemaDescriptor, record: &OwnershipRecord) {
-            let _ = writer.append_envelope(env);
-            let _ = writer.set_schema_descriptor(desc);
-            let _ = writer.record_meta_record(record);
+        pub fn run_valid(mut writer: FileWriterSession, env: &EventEnvelope, adapter: &FileStorageAdapter) {
+            let _ = writer.append_envelope_verdict(env);
             let _claim: &OwnershipClaimRecord = writer.claim();
             let _ = writer.release_exclusion();
+            let _ = adapter.try_presence();
         }
     "#;
     let (writer_mut_ok, writer_mut_stderr) = run_rustc(file_writer_mutation_positive_code);
     assert!(
         writer_mut_ok,
         "FileWriterSession must expose valid writer controls (H2):\n{writer_mut_stderr}"
+    );
+
+    let file_writer_set_schema_code = r#"
+        use pardosa::prelude::*;
+        pub fn run_invalid(mut writer: FileWriterSession, desc: &AdmittedDescriptor) {
+            let _ = writer.set_schema_descriptor(desc);
+        }
+    "#;
+    let (writer_schema_ok, writer_schema_stderr) = run_rustc(file_writer_set_schema_code);
+    assert!(
+        !writer_schema_ok,
+        "FileWriterSession must not expose set_schema_descriptor"
+    );
+    assert!(
+        writer_schema_stderr.contains("no method named `set_schema_descriptor`")
+            || writer_schema_stderr.contains("E0599"),
+        "rejection must cite missing method: {writer_schema_stderr}"
+    );
+
+    let migration_source_record_meta_code = r#"
+        use pardosa::prelude::*;
+        use pardosa::migration::MigrationSource;
+        pub fn run_invalid<S: MigrationSource>(source: &S, record: &OwnershipRecord) {
+            let _ = source.record_meta(record);
+        }
+    "#;
+    let (source_meta_ok, source_meta_stderr) = run_rustc(migration_source_record_meta_code);
+    assert!(
+        !source_meta_ok,
+        "MigrationSource must not expose record_meta"
+    );
+    assert!(
+        source_meta_stderr.contains("no method named `record_meta`")
+            || source_meta_stderr.contains("E0599"),
+        "rejection must cite missing method: {source_meta_stderr}"
+    );
+
+    let migration_target_record_meta_code = r#"
+        use pardosa::prelude::*;
+        use pardosa::migration::MigrationTarget;
+        pub fn run_invalid<T: MigrationTarget>(target: &T, record: &OwnershipRecord) {
+            let _ = target.record_meta(record);
+        }
+    "#;
+    let (target_meta_ok, target_meta_stderr) = run_rustc(migration_target_record_meta_code);
+    assert!(
+        !target_meta_ok,
+        "MigrationTarget must not expose record_meta"
+    );
+    assert!(
+        target_meta_stderr.contains("no method named `record_meta`")
+            || target_meta_stderr.contains("E0599"),
+        "rejection must cite missing method: {target_meta_stderr}"
+    );
+
+    let storage_engine_record_meta_code = r#"
+        use pardosa::prelude::*;
+        use pardosa::store::StorageEngine;
+        pub fn run_invalid<E: StorageEngine>(engine: &mut E, record: &OwnershipRecord) {
+            let _ = engine.record_meta_record(record);
+        }
+    "#;
+    let (engine_meta_ok, engine_meta_stderr) = run_rustc(storage_engine_record_meta_code);
+    assert!(
+        !engine_meta_ok,
+        "StorageEngine must not expose record_meta_record"
+    );
+    assert!(
+        engine_meta_stderr.contains("no method named `record_meta_record`")
+            || engine_meta_stderr.contains("E0599"),
+        "rejection must cite missing method: {engine_meta_stderr}"
     );
 
     let store_from_parts_code = r#"
@@ -1157,9 +1390,9 @@ fn test_compile_fail_and_positive_controls_external_boundary() {
 
     let file_writer_reuse_after_release_code = r#"
         use pardosa::prelude::*;
-        pub fn run_invalid(writer: FileWriterSession, env: &EventEnvelope) {
+        pub fn run_invalid(mut writer: FileWriterSession, env: &EventEnvelope) {
             let _ = writer.release_exclusion();
-            let _ = writer.append_envelope(env);
+            let _ = writer.append_envelope_verdict(env);
         }
     "#;
     let (fw_reuse_ok, fw_reuse_stderr) = run_rustc(file_writer_reuse_after_release_code);
@@ -1170,6 +1403,61 @@ fn test_compile_fail_and_positive_controls_external_boundary() {
     assert!(
         fw_reuse_stderr.contains("use of moved value") || fw_reuse_stderr.contains("E0382"),
         "rejection must be use of moved value: {fw_reuse_stderr}"
+    );
+
+    let file_adapter_incomplete_meta_code = r#"
+        use pardosa::prelude::*;
+        use pardosa::file::FileStorageAdapter;
+        pub fn run_invalid(adapter: &FileStorageAdapter, claim: &OwnershipClaimRecord) {
+            let _ = adapter.create_incomplete_meta_only(claim);
+        }
+    "#;
+    let (incomplete_meta_ok, incomplete_meta_stderr) = run_rustc(file_adapter_incomplete_meta_code);
+    assert!(
+        !incomplete_meta_ok,
+        "FileStorageAdapter::create_incomplete_meta_only must not be accessible without test features"
+    );
+    assert!(
+        incomplete_meta_stderr.contains("no method named `create_incomplete_meta_only`")
+            || incomplete_meta_stderr.contains("E0599"),
+        "rejection must cite missing method: {incomplete_meta_stderr}"
+    );
+
+    let migration_target_record_inbound_code = r#"
+        use pardosa::prelude::*;
+        use pardosa::migration::MigrationTarget;
+        pub fn run_invalid<T: MigrationTarget>(target: &T, pointer: &InboundPointerRecord) {
+            let _ = target.record_inbound_pointer(pointer);
+        }
+    "#;
+    let (target_inbound_ok, target_inbound_stderr) =
+        run_rustc(migration_target_record_inbound_code);
+    assert!(
+        !target_inbound_ok,
+        "MigrationTarget must not expose record_inbound_pointer"
+    );
+    assert!(
+        target_inbound_stderr.contains("no method named `record_inbound_pointer`")
+            || target_inbound_stderr.contains("E0599"),
+        "rejection must cite missing method: {target_inbound_stderr}"
+    );
+
+    let file_adapter_record_inbound_code = r#"
+        use pardosa::prelude::*;
+        use pardosa::file::FileStorageAdapter;
+        pub fn run_invalid(adapter: &FileStorageAdapter, pointer: &InboundPointerRecord) {
+            let _ = adapter.record_inbound_pointer(pointer);
+        }
+    "#;
+    let (adapter_inbound_ok, adapter_inbound_stderr) = run_rustc(file_adapter_record_inbound_code);
+    assert!(
+        !adapter_inbound_ok,
+        "FileStorageAdapter::record_inbound_pointer must not be accessible without test features"
+    );
+    assert!(
+        adapter_inbound_stderr.contains("no method named `record_inbound_pointer`")
+            || adapter_inbound_stderr.contains("E0599"),
+        "rejection must cite missing method: {adapter_inbound_stderr}"
     );
 }
 
@@ -1353,7 +1641,7 @@ fn test_m1_integration_with_frames_exact_limit_accepted() {
         payload: vec![0u8; MAX_STREAM_BYTES - 85],
     };
     let mut encoded = Vec::with_capacity(MAX_STREAM_BYTES);
-    env.encode(&mut encoded);
+    env.encode(&mut encoded).unwrap();
     assert_eq!(encoded.len(), MAX_STREAM_BYTES);
     let frame = ContainerFrame::new(encoded);
     let res = ArtefactReader::with_frames("integration-exact-64mib", vec![frame], |reader| {
@@ -1541,6 +1829,10 @@ impl StorageEngine for MockEngine {
         42
     }
 
+    fn check_authority(&self) -> Result<(), OperationFailure> {
+        Ok(())
+    }
+
     fn append_block(&mut self, block: &[u8]) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
         let idx = self.blocks.len();
         if self.undetermined_at_block == Some(idx) {
@@ -1592,17 +1884,6 @@ impl StorageEngine for MockEngine {
         None
     }
 
-    fn set_schema_descriptor(
-        &mut self,
-        _descriptor: &SchemaDescriptor,
-    ) -> Result<(), OperationFailure> {
-        Ok(())
-    }
-
-    fn record_meta_record(&mut self, _record: &OwnershipRecord) -> Result<(), OperationFailure> {
-        Ok(())
-    }
-
     fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
         None
     }
@@ -1625,135 +1906,51 @@ impl StorageEngine for MockEngine {
 }
 
 #[test]
-fn test_c5_12_and_c5_16_bounded_batch_landing_verdicts() {
+fn test_c5_12_and_c5_16_landing_verdicts() {
     let fiber = [0x99; 16];
     let e1 = EventEnvelope::genesis([0x01; 16], fiber, b"event-1".to_vec()).expect("genesis");
-    let e2 = EventEnvelope::chain(&e1, [0x02; 16], b"event-2".to_vec()).expect("chain 2");
-    let e3 = EventEnvelope::chain(&e2, [0x03; 16], b"event-3".to_vec()).expect("chain 3");
-    let e4 = EventEnvelope::chain(&e3, [0x04; 16], b"event-4".to_vec()).expect("chain 4");
-    let batch = [e1.clone(), e2.clone(), e3.clone(), e4.clone()];
 
     let mut store_all = Store::open_writer(MockEngine::default()).expect("store open");
-    let v_all = store_all
-        .append_batch_envelopes_detailed(&batch)
-        .expect("verdict all");
-    assert_eq!(
-        v_all,
-        BatchLandingVerdict::LandedAll {
-            final_position: 4,
-            landed_count: 4,
-        }
-    );
-    assert_eq!(v_all.landed_count(), 4);
-    assert_eq!(v_all.unattempted_count(), 0);
-    assert_eq!(v_all.total_count(), 4);
-    assert_eq!(store_all.rolling_commitment().frame_count(), 4);
-    assert_eq!(
-        store_all
-            .session_index()
-            .expect("idx")
-            .event_count(&fiber)
-            .unwrap(),
-        4
-    );
+    let v_all = store_all.append_envelope_verdict(&e1).expect("verdict all");
+    assert_eq!(v_all, WriteLandingVerdict::Landed(1));
+    assert_eq!(store_all.rolling_commitment().frame_count(), 1);
 
     let mut store_undet = Store::open_writer(MockEngine {
-        undetermined_at_block: Some(2),
+        undetermined_at_block: Some(0),
         ..Default::default()
     })
     .expect("store open");
     let v_undet = store_undet
-        .append_batch_envelopes_detailed(&batch)
+        .append_envelope_verdict(&e1)
         .expect("verdict undet");
-    match &v_undet {
-        BatchLandingVerdict::PartialProgress {
-            landed_count,
-            next_attempt,
-            unattempted_count,
-        } => {
-            assert_eq!(*landed_count, 2);
-            assert_eq!(
-                *next_attempt,
-                NextAttemptStatus::Undetermined { carried_epoch: 42 }
-            );
-            assert_eq!(*unattempted_count, 1);
-        }
-        other => panic!("expected PartialProgress, got {other:?}"),
-    }
-    assert_eq!(v_undet.landed_count(), 2);
-    assert_eq!(v_undet.unresolved_count(), 1);
-    assert_eq!(v_undet.unattempted_count(), 1);
-    assert_eq!(v_undet.total_count(), 4);
-    assert_eq!(store_undet.rolling_commitment().frame_count(), 2);
     assert_eq!(
-        store_undet
-            .session_index()
-            .expect("idx")
-            .event_count(&fiber)
-            .unwrap(),
-        2
+        v_undet,
+        WriteLandingVerdict::Undetermined { carried_epoch: 42 }
     );
-    assert_eq!(
-        store_undet
-            .session_index()
-            .expect("idx")
-            .get_latest(&fiber)
-            .unwrap()
-            .unwrap()
-            .header
-            .event_id,
-        e2.header.event_id
-    );
+    assert_eq!(store_undet.rolling_commitment().frame_count(), 0);
 
-    let mut store_fail = Store::open_writer(MockEngine {
-        fail_at_block: Some(1),
+    let mut store_undet_env = Store::open_writer(MockEngine {
+        undetermined_at_block: Some(0),
         ..Default::default()
     })
     .expect("store open");
-    let v_fail = store_fail
-        .append_batch_envelopes_detailed(&batch)
-        .expect("verdict fail");
-    match &v_fail {
-        BatchLandingVerdict::PartialProgress {
-            landed_count,
-            next_attempt,
-            unattempted_count,
-        } => {
-            assert_eq!(*landed_count, 1);
-            match next_attempt {
-                NextAttemptStatus::Rejected(error) => {
-                    assert_eq!(*error.condition(), FailureCondition::ConcurrencyConflict);
-                }
-                other => panic!("expected Rejected, got {other:?}"),
-            }
-            assert_eq!(*unattempted_count, 2);
-        }
-        other => panic!("expected PartialProgress, got {other:?}"),
-    }
-    assert_eq!(v_fail.landed_count(), 1);
-    assert_eq!(v_fail.rejected_count(), 1);
-    assert_eq!(v_fail.unattempted_count(), 2);
-    assert_eq!(v_fail.total_count(), 4);
-    assert_eq!(store_fail.rolling_commitment().frame_count(), 1);
+    let v_undet_env = store_undet_env
+        .append_envelope_verdict(&e1)
+        .expect("verdict undet");
     assert_eq!(
-        store_fail
-            .session_index()
-            .expect("idx")
-            .event_count(&fiber)
-            .unwrap(),
-        1
+        v_undet_env,
+        WriteLandingVerdict::Undetermined { carried_epoch: 42 }
     );
-    assert_eq!(
-        store_fail
-            .session_index()
-            .expect("idx")
-            .get_latest(&fiber)
-            .unwrap()
-            .unwrap()
-            .header
-            .event_id,
-        e1.header.event_id
-    );
+    assert!(store_undet_env.uncertain_diagnostic().is_some());
+
+    let mut store_fail = Store::open_writer(MockEngine {
+        fail_at_block: Some(0),
+        ..Default::default()
+    })
+    .expect("store open");
+    let err = store_fail.append_envelope_verdict(&e1).unwrap_err();
+    assert_eq!(*err.condition(), FailureCondition::ConcurrencyConflict);
+    assert_eq!(store_fail.rolling_commitment().frame_count(), 0);
 }
 
 #[test]
@@ -1765,10 +1962,10 @@ fn test_for_each_envelope_refuses_broken_chain_and_stops_delivery() {
     e2_broken.header.precursor = [99u8; 16];
 
     let mut env1_bytes = Vec::new();
-    e1.encode(&mut env1_bytes);
+    e1.encode(&mut env1_bytes).unwrap();
 
     let mut env2_bytes = Vec::new();
-    e2_broken.encode(&mut env2_bytes);
+    e2_broken.encode(&mut env2_bytes).unwrap();
 
     engine.append_block(&env1_bytes).unwrap();
     engine.append_block(&env2_bytes).unwrap();
@@ -1797,9 +1994,9 @@ fn test_for_each_envelope_consumer_callback_error_does_not_poison_reader_session
     let e2 = EventEnvelope::chain(&e1, [2u8; 16], b"payload-2").unwrap();
 
     let mut env1_bytes = Vec::new();
-    e1.encode(&mut env1_bytes);
+    e1.encode(&mut env1_bytes).unwrap();
     let mut env2_bytes = Vec::new();
-    e2.encode(&mut env2_bytes);
+    e2.encode(&mut env2_bytes).unwrap();
 
     engine.append_block(&env1_bytes).unwrap();
     engine.append_block(&env2_bytes).unwrap();
@@ -1849,7 +2046,7 @@ fn test_for_each_envelope_transport_unavailable_does_not_poison_reader_session()
     let fiber = [0x77; 16];
     let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"payload-1").unwrap();
     let mut env1_bytes = Vec::new();
-    e1.encode(&mut env1_bytes);
+    e1.encode(&mut env1_bytes).unwrap();
     engine.append_block(&env1_bytes).unwrap();
 
     let mut store = Store::open_reader(engine);
@@ -1882,7 +2079,7 @@ fn test_for_each_envelope_positive_corruption_poisons_reader_session_terminally(
     let fiber = [0x66; 16];
     let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"payload-1").unwrap();
     let mut env1_bytes = Vec::new();
-    e1.encode(&mut env1_bytes);
+    e1.encode(&mut env1_bytes).unwrap();
     engine.append_block(&env1_bytes).unwrap();
     engine.append_block(b"short-corrupt-frame").unwrap();
 
@@ -1913,175 +2110,12 @@ fn test_for_each_envelope_positive_corruption_poisons_reader_session_terminally(
 }
 
 #[test]
-fn test_m4_impossible_engine_batch_count_is_refused_by_store() {
-    #[derive(Debug, Default)]
-    struct RogueBatchEngine {
-        epoch: u64,
-    }
-    impl StorageEngine for RogueBatchEngine {
-        fn carried_epoch(&self) -> u64 {
-            self.epoch
-        }
-        fn append_block(
-            &mut self,
-            _b: &[u8],
-        ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-            Ok(WriteLandingVerdict::Landed(1))
-        }
-        fn append_batch_detailed(&mut self, _blocks: &[&[u8]]) -> BatchLandingVerdict<u64> {
-            BatchLandingVerdict::PartialProgress {
-                landed_count: 5,
-                next_attempt: NextAttemptStatus::Undetermined {
-                    carried_epoch: self.epoch,
-                },
-                unattempted_count: 0,
-            }
-        }
-        fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
-            Ok(Vec::new())
-        }
-        fn is_retired(&self) -> Result<bool, OperationFailure> {
-            Ok(false)
-        }
-        fn sync(&mut self) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn uncertain_diagnostic(&self) -> Option<&str> {
-            None
-        }
-        fn claim(&self) -> Option<&OwnershipClaimRecord> {
-            None
-        }
-        fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
-            None
-        }
-        fn set_schema_descriptor(&mut self, _d: &SchemaDescriptor) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn record_meta_record(&mut self, _r: &OwnershipRecord) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
-            None
-        }
-        fn inbound_pointer(&self) -> Option<&InboundPointerRecord> {
-            None
-        }
-        fn migration_start(&self) -> Option<&MigrationStartRecord> {
-            None
-        }
-        fn migration_end(&self) -> Option<&MigrationEndRecord> {
-            None
-        }
-        fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
-            None
-        }
-    }
-
-    let fiber = [0x55; 16];
-    let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"valid-1").unwrap();
-    let mut e1_buf = Vec::new();
-    e1.encode(&mut e1_buf);
-
-    let mut store = Store::open_writer(RogueBatchEngine { epoch: 1 }).unwrap();
-    let err = store.append_batch_detailed(&[&e1_buf]).unwrap_err();
-    assert_eq!(
-        *err.condition(),
-        FailureCondition::PrecursorChainBroken(None)
-    );
-    assert!(err.diagnostic_detail().message().contains(
-        "inconsistent batch partition: landed 5 + next 1 + unattempted 0 != batch length 1"
-    ));
-}
-
-#[test]
-fn test_m4_inconsistent_suffix_partition_rejected() {
-    struct SuffixRogueEngine {
-        epoch: u64,
-    }
-    impl StorageEngine for SuffixRogueEngine {
-        fn carried_epoch(&self) -> u64 {
-            self.epoch
-        }
-        fn append_block(
-            &mut self,
-            _b: &[u8],
-        ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-            Ok(WriteLandingVerdict::Landed(1))
-        }
-        fn append_batch_detailed(&mut self, _blocks: &[&[u8]]) -> BatchLandingVerdict<u64> {
-            BatchLandingVerdict::PartialProgress {
-                landed_count: 0,
-                next_attempt: NextAttemptStatus::Undetermined {
-                    carried_epoch: self.epoch,
-                },
-                unattempted_count: 99,
-            }
-        }
-        fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
-            Ok(Vec::new())
-        }
-        fn is_retired(&self) -> Result<bool, OperationFailure> {
-            Ok(false)
-        }
-        fn sync(&mut self) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn uncertain_diagnostic(&self) -> Option<&str> {
-            None
-        }
-        fn claim(&self) -> Option<&OwnershipClaimRecord> {
-            None
-        }
-        fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
-            None
-        }
-        fn set_schema_descriptor(&mut self, _d: &SchemaDescriptor) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn record_meta_record(&mut self, _r: &OwnershipRecord) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
-            None
-        }
-        fn inbound_pointer(&self) -> Option<&InboundPointerRecord> {
-            None
-        }
-        fn migration_start(&self) -> Option<&MigrationStartRecord> {
-            None
-        }
-        fn migration_end(&self) -> Option<&MigrationEndRecord> {
-            None
-        }
-        fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
-            None
-        }
-    }
-
-    let fiber = [0x55; 16];
-    let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"valid-1").unwrap();
-    let mut e1_buf = Vec::new();
-    e1.encode(&mut e1_buf);
-
-    let mut store = Store::open_writer(SuffixRogueEngine { epoch: 1 }).unwrap();
-    let err = store.append_batch_detailed(&[&e1_buf]).unwrap_err();
-    assert_eq!(
-        *err.condition(),
-        FailureCondition::PrecursorChainBroken(None)
-    );
-    assert!(err.diagnostic_detail().message().contains(
-        "inconsistent batch partition: landed 0 + next 1 + unattempted 99 != batch length 1"
-    ));
-}
-
-#[test]
 fn test_m3_consumer_callback_returning_precursor_chain_broken_does_not_poison_reader() {
     let mut engine = MockEngine::default();
     let fiber = [0x44; 16];
     let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"payload-1").unwrap();
     let mut env1_bytes = Vec::new();
-    e1.encode(&mut env1_bytes);
+    e1.encode(&mut env1_bytes).unwrap();
     engine.append_block(&env1_bytes).unwrap();
 
     let mut store = Store::open_reader(engine);
@@ -2111,7 +2145,7 @@ fn test_m14_session_index_refuses_when_reader_retains_broken_state() {
     let fiber = [0x33; 16];
     let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"payload-1").unwrap();
     let mut env1_bytes = Vec::new();
-    e1.encode(&mut env1_bytes);
+    e1.encode(&mut env1_bytes).unwrap();
     engine.append_block(&env1_bytes).unwrap();
     engine.append_block(b"broken-frame").unwrap();
 
@@ -2134,7 +2168,7 @@ fn test_h1_open_reader_with_transport_unavailable_refuses_point_lookups_and_reco
     let fiber = [0x22; 16];
     let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"payload-h1").unwrap();
     let mut env1_bytes = Vec::new();
-    e1.encode(&mut env1_bytes);
+    e1.encode(&mut env1_bytes).unwrap();
 
     let engine = MockEngine {
         blocks: vec![env1_bytes],
@@ -2184,201 +2218,59 @@ fn test_h1_open_reader_with_transport_unavailable_refuses_point_lookups_and_reco
 }
 
 #[test]
-fn test_m4_inconsistent_landed_all_count_is_refused_and_preserves_projection() {
-    use pardosa::encoding::{
-        EventEnvelope, InboundPointerRecord, MigrationEndRecord, MigrationStartRecord,
-        OutboundPointerRecord, OwnershipClaimRecord, OwnershipRecord, RescuePolicyChoiceRecord,
-    };
-    use pardosa::schema::SchemaDescriptor;
-    use pardosa::store::{
-        BatchLandingVerdict, FailureCondition, OperationFailure, StorageEngine, Store,
-        WriteLandingVerdict,
-    };
-
-    struct LandedAllRogueEngine {
-        epoch: u64,
-    }
-    impl StorageEngine for LandedAllRogueEngine {
-        fn carried_epoch(&self) -> u64 {
-            self.epoch
+fn test_compile_fail_batch_api_removed() {
+    let code_batch_detailed = r#"
+        use pardosa::prelude::*;
+        pub fn run_test<E: StorageEngine>(mut store: Store<E>) {
+            let _ = store.append_batch_detailed(&[]);
         }
-        fn append_block(
-            &mut self,
-            _b: &[u8],
-        ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-            Ok(WriteLandingVerdict::Landed(1))
-        }
-        fn append_batch_detailed(&mut self, _blocks: &[&[u8]]) -> BatchLandingVerdict<u64> {
-            BatchLandingVerdict::LandedAll {
-                final_position: 1,
-                landed_count: 0,
-            }
-        }
-        fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
-            Ok(Vec::new())
-        }
-        fn is_retired(&self) -> Result<bool, OperationFailure> {
-            Ok(false)
-        }
-        fn sync(&mut self) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn uncertain_diagnostic(&self) -> Option<&str> {
-            None
-        }
-        fn claim(&self) -> Option<&OwnershipClaimRecord> {
-            None
-        }
-        fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
-            None
-        }
-        fn set_schema_descriptor(&mut self, _d: &SchemaDescriptor) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn record_meta_record(&mut self, _r: &OwnershipRecord) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
-            None
-        }
-        fn inbound_pointer(&self) -> Option<&InboundPointerRecord> {
-            None
-        }
-        fn migration_start(&self) -> Option<&MigrationStartRecord> {
-            None
-        }
-        fn migration_end(&self) -> Option<&MigrationEndRecord> {
-            None
-        }
-        fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
-            None
-        }
-    }
-
-    let fiber = [0x55; 16];
-    let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"valid-1").unwrap();
-    let mut e1_buf = Vec::new();
-    e1.encode(&mut e1_buf);
-
-    let mut store = Store::open_writer(LandedAllRogueEngine { epoch: 1 }).unwrap();
-    let initial_frame_count = store.rolling_commitment().frame_count();
-    let err = store.append_batch_detailed(&[&e1_buf]).unwrap_err();
-    assert_eq!(
-        *err.condition(),
-        FailureCondition::PrecursorChainBroken(None)
+    "#;
+    let (ok, stderr) = run_rustc(code_batch_detailed);
+    assert!(!ok, "Store::append_batch_detailed must not exist on Store");
+    assert!(
+        stderr.contains("no method named `append_batch_detailed`"),
+        "error must cite missing method:\n{stderr}"
     );
-    assert!(err
-        .diagnostic_detail()
-        .message()
-        .contains("engine reported inconsistent LandedAll count: landed 0 != batch length 1"));
-    assert_eq!(
-        store.rolling_commitment().frame_count(),
-        initial_frame_count
+
+    let code_append_batch = r#"
+        use pardosa::prelude::*;
+        pub fn run_test<E: StorageEngine>(mut store: Store<E>) {
+            let _ = store.append_batch(&[]);
+        }
+    "#;
+    let (ok_batch, stderr_batch) = run_rustc(code_append_batch);
+    assert!(!ok_batch, "Store::append_batch must not exist on Store");
+    assert!(
+        stderr_batch.contains("no method named `append_batch`"),
+        "error must cite missing method:\n{stderr_batch}"
     );
-    let idx = store.session_index().expect("session index must be valid");
-    assert_eq!(idx.len(), 0);
-}
 
-#[test]
-fn test_m4_inconsistent_refusal_count_is_refused() {
-    use pardosa::encoding::{
-        EventEnvelope, InboundPointerRecord, MigrationEndRecord, MigrationStartRecord,
-        OutboundPointerRecord, OwnershipClaimRecord, OwnershipRecord, RescuePolicyChoiceRecord,
-    };
-    use pardosa::schema::SchemaDescriptor;
-    use pardosa::store::{
-        BatchLandingVerdict, FailureCondition, OperationFailure, StorageEngine, Store,
-        WriteLandingVerdict,
-    };
-
-    struct RefusalRogueEngine {
-        epoch: u64,
-    }
-    impl StorageEngine for RefusalRogueEngine {
-        fn carried_epoch(&self) -> u64 {
-            self.epoch
+    let code_batch_envelopes = r#"
+        use pardosa::prelude::*;
+        pub fn run_test<E: StorageEngine>(mut store: Store<E>) {
+            let _ = store.append_batch_envelopes_detailed(&[]);
         }
-        fn append_block(
-            &mut self,
-            _b: &[u8],
-        ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
-            Ok(WriteLandingVerdict::Landed(1))
-        }
-        fn append_batch_detailed(&mut self, _blocks: &[&[u8]]) -> BatchLandingVerdict<u64> {
-            BatchLandingVerdict::PreAttemptRefusal {
-                error: OperationFailure::new(
-                    FailureCondition::TransportUnavailable,
-                    "mock refusal",
-                ),
-                unattempted_count: 99,
-            }
-        }
-        fn read_all(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
-            Ok(Vec::new())
-        }
-        fn is_retired(&self) -> Result<bool, OperationFailure> {
-            Ok(false)
-        }
-        fn sync(&mut self) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn uncertain_diagnostic(&self) -> Option<&str> {
-            None
-        }
-        fn claim(&self) -> Option<&OwnershipClaimRecord> {
-            None
-        }
-        fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
-            None
-        }
-        fn set_schema_descriptor(&mut self, _d: &SchemaDescriptor) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn record_meta_record(&mut self, _r: &OwnershipRecord) -> Result<(), OperationFailure> {
-            Ok(())
-        }
-        fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
-            None
-        }
-        fn inbound_pointer(&self) -> Option<&InboundPointerRecord> {
-            None
-        }
-        fn migration_start(&self) -> Option<&MigrationStartRecord> {
-            None
-        }
-        fn migration_end(&self) -> Option<&MigrationEndRecord> {
-            None
-        }
-        fn rescue_policy_choice(&self) -> Option<&RescuePolicyChoiceRecord> {
-            None
-        }
-    }
-
-    let fiber = [0x55; 16];
-    let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"valid-1").unwrap();
-    let mut e1_buf = Vec::new();
-    e1.encode(&mut e1_buf);
-
-    let mut store = Store::open_writer(RefusalRogueEngine { epoch: 1 }).unwrap();
-    let err = store.append_batch_detailed(&[&e1_buf]).unwrap_err();
-    assert_eq!(
-        *err.condition(),
-        FailureCondition::PrecursorChainBroken(None)
+    "#;
+    let (ok_env, stderr_env) = run_rustc(code_batch_envelopes);
+    assert!(
+        !ok_env,
+        "Store::append_batch_envelopes_detailed must not exist on Store"
     );
-    assert!(err.diagnostic_detail().message().contains(
-        "engine reported inconsistent PreAttemptRefusal count: unattempted 99 != batch length 1"
-    ));
-}
+    assert!(
+        stderr_env.contains("no method named `append_batch_envelopes_detailed`"),
+        "error must cite missing method:\n{stderr_env}"
+    );
 
-#[test]
-fn test_m4_batch_landing_verdict_total_count_checked_arithmetic_overflow() {
-    use pardosa::store::{BatchLandingVerdict, NextAttemptStatus};
-
-    let verdict: BatchLandingVerdict<u64> = BatchLandingVerdict::PartialProgress {
-        landed_count: usize::MAX,
-        next_attempt: NextAttemptStatus::Undetermined { carried_epoch: 1 },
-        unattempted_count: 0,
-    };
-    assert_eq!(verdict.total_count(), usize::MAX);
-    assert_eq!(verdict.checked_total_count(), None);
+    let code_batch_type = r#"
+        use pardosa::prelude::*;
+        pub fn run_test() {
+            let _ = BatchLandingVerdict::LandedAll { final_position: 1, landed_count: 1 };
+        }
+    "#;
+    let (ok2, stderr2) = run_rustc(code_batch_type);
+    assert!(!ok2, "BatchLandingVerdict must not exist in prelude");
+    assert!(
+        stderr2.contains("cannot find") || stderr2.contains("E0425"),
+        "error must cite unresolved type:\n{stderr2}"
+    );
 }

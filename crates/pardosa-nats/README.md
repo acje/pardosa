@@ -9,8 +9,8 @@ NATS JetStream storage adapter for [Pardosa](https://crates.io/crates/pardosa).
 - **Dual Stream Topology**: Maps each artefact stem to:
   - `{stem}_meta`: Key-value and message stream for ownership claims, monotonic epochs, and generation cutover pointers.
   - `{stem}_data`: Ordered, append-only event stream recording Pardosa container frames.
-- **Single-Writer Fencing & OCC**: Enforces linearizable single-writer ownership using JetStream sequence expectations and monotonic epoch fences. Stale writes and concurrent writers are rejected deterministically via optimistic concurrency control (OCC).
-- **Subject Namespaces**: Supports custom publish and routing subjects via `.with_subjects(meta_subject, data_subject)`, enabling flexible subject hierarchies, cluster partitions, and wildcard routing independent of stream names.
+- **Externally Enforced Single Writer & OCC**: Deployment must maintain one writer per artefact. The adapter checks the metadata epoch separately from the data-subject sequence compare-and-set. Sequence conflicts reject competing appends, but these two operations are not an atomic ownership-and-write fence; concurrent takeover requires external coordination.
+- **Deterministic Subject Routing**: Stream and subject names are derived deterministically from the stem: `{stem}_meta` and `{stem}_data` streams binding `{stem}_meta` and `{stem}_data` subjects, with server expected-stream verification.
 - **Synchronous Session Facade**: Bridges asynchronous JetStream operations into Pardosa's synchronous pipeline contracts via `NatsWriterSession` and `NatsReaderSession`.
 
 ## Usage Example
@@ -19,11 +19,10 @@ NATS JetStream storage adapter for [Pardosa](https://crates.io/crates/pardosa).
 use pardosa::prelude::*;
 use pardosa_nats::NatsStorageAdapter;
 
-// Connect to NATS JetStream with custom subject routing
-let adapter = NatsStorageAdapter::new("nats://127.0.0.1:4222", "tenant_orders")?
-    .with_subjects("tenant.orders.meta", "tenant.orders.data");
+// Connect to NATS JetStream with deterministic stream and subject routing
+let adapter = NatsStorageAdapter::new("nats://127.0.0.1:4222", "tenant_orders")?;
 
-// Create writer session with single-writer fencing epoch
+// Create writer session under externally enforced single-writer ownership
 let claim = OwnershipClaimRecord {
     epoch: 1,
     machine_id: [1u8; 16],
@@ -33,7 +32,10 @@ let claim = OwnershipClaimRecord {
     claim_time_ns: 2_000_000,
     operator_label: "service-worker".to_string(),
 };
-let mut writer = adapter.create(&claim)?;
+let descriptor = AdmittedDescriptor::try_from_descriptor(
+    SchemaDescriptor::new(1, DescriptorNode::U64)
+)?;
+let mut writer = adapter.create(&claim, &descriptor)?;
 
 // Derive deterministic fiber ID and append event
 let fiber_id = derive_fiber_id("order-9876");

@@ -1,11 +1,11 @@
 //! Container format and framing for Pardosa artefacts.
 
 use crate::encoding::{
-    DecodeError, EventEnvelope, EventEnvelopeRef, InboundPointerRecord, MigrationEndRecord,
-    MigrationStartRecord, OutboundPointerRecord, OwnershipClaimRecord, OwnershipRecord,
-    RescuePolicyChoiceRecord,
+    DecodeError, EncodeError, EventEnvelope, EventEnvelopeRef, InboundPointerRecord,
+    MigrationEndRecord, MigrationStartRecord, OutboundPointerRecord, OwnershipClaimRecord,
+    OwnershipRecord, RescuePolicyChoiceRecord, ValueConstraint,
 };
-use crate::schema::{DescriptorNode, SchemaDescriptor};
+use crate::schema::{AdmittedDescriptor, DescriptorNode, SchemaDescriptor};
 use crate::store::{
     admit_create, admit_open, ArtefactPresence, FailureCondition, OpenAdmission, OperationFailure,
     StorageEngine, Store, WriteLandingVerdict,
@@ -108,12 +108,27 @@ impl ContainerFrame {
     }
 
     /// Encodes a payload into container framing format (length + payload + CRC32C).
-    pub fn encode_payload(payload: &[u8], buf: &mut Vec<u8>) {
-        let len = payload.len() as u32;
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::LengthExceeded`] if `payload.len()` exceeds `u32::MAX`.
+    pub fn encode_payload(payload: &[u8], buf: &mut Vec<u8>) -> Result<(), EncodeError> {
+        Self::try_encode_payload(payload, buf)
+    }
+
+    /// Tries to encode a payload into container framing format (length + payload + CRC32C).
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::LengthExceeded`] if `payload.len()` exceeds `u32::MAX`.
+    pub fn try_encode_payload(payload: &[u8], buf: &mut Vec<u8>) -> Result<(), EncodeError> {
+        let len = u32::try_from(payload.len()).map_err(|_| EncodeError::LengthExceeded {
+            length: payload.len(),
+            max: u32::MAX as usize,
+        })?;
         buf.extend_from_slice(&len.to_le_bytes());
         buf.extend_from_slice(payload);
         let crc = crc32c::crc32c(payload);
         buf.extend_from_slice(&crc.to_le_bytes());
+        Ok(())
     }
 
     /// Decodes a framed chunk from a byte slice.
@@ -131,7 +146,17 @@ impl ContainerFrame {
             });
         }
         let payload_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-        let total_frame_len = 4 + payload_len + 4;
+        let total_frame_len = match 4usize
+            .checked_add(payload_len)
+            .and_then(|l| l.checked_add(4))
+        {
+            Some(l) => l,
+            None => {
+                return Err(DecodeError::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                });
+            }
+        };
         if buf.len() < 4 + payload_len {
             return Err(DecodeError::TruncatedPayload {
                 expected: total_frame_len,
@@ -343,20 +368,35 @@ pub fn read_meta_records(meta_path: &Path) -> Result<MetaRecords, OperationFailu
             format!("failed to open .meta file: {err}"),
         )
     })?;
-    let (_, frames, _) = read_container_frames(&mut file).map_err(|err| {
+    let (header, frames, _) = read_container_frames(&mut file).map_err(|err| {
         OperationFailure::new(
             FailureCondition::OwnershipRecordUnreadable,
             format!("failed to read frames from .meta file: {err}"),
         )
     })?;
+    if header.format_version != CONTAINER_FORMAT_VERSION {
+        return Err(OperationFailure::new(
+            FailureCondition::OwnershipRecordUnreadable,
+            "container header in .meta has invalid format version",
+        ));
+    }
     let mut records = MetaRecords::default();
     for frame in frames {
-        let (record, _) = OwnershipRecord::decode(&frame).map_err(|err| {
+        let (record, consumed) = OwnershipRecord::decode(&frame).map_err(|err| {
             OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
                 format!("failed to decode ownership record from .meta: {err}"),
             )
         })?;
+        if consumed != frame.len() {
+            return Err(OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                format!(
+                    "unconsumed trailing bytes in ownership record from .meta: {} bytes remain",
+                    frame.len() - consumed
+                ),
+            ));
+        }
         match record {
             OwnershipRecord::OwnershipClaim(claim) => {
                 records.latest_claim = Some(claim);
@@ -365,13 +405,33 @@ pub fn read_meta_records(meta_path: &Path) -> Result<MetaRecords, OperationFailu
                 schema_version,
                 descriptor_bytes,
             } => {
-                let (root, _) = DescriptorNode::decode(&descriptor_bytes).map_err(|err| {
-                    OperationFailure::new(
+                let (root, consumed_desc) =
+                    DescriptorNode::decode(&descriptor_bytes).map_err(|err| {
+                        OperationFailure::new(
+                            FailureCondition::OwnershipRecordUnreadable,
+                            format!("failed to decode schema descriptor in .meta: {err}"),
+                        )
+                    })?;
+                if consumed_desc != descriptor_bytes.len() {
+                    return Err(OperationFailure::new(
                         FailureCondition::OwnershipRecordUnreadable,
-                        format!("failed to decode schema descriptor in .meta: {err}"),
-                    )
-                })?;
-                records.schema_descriptor = Some(SchemaDescriptor::new(schema_version, root));
+                        format!(
+                            "unconsumed trailing bytes in schema descriptor in .meta: {} bytes remain",
+                            descriptor_bytes.len() - consumed_desc
+                        ),
+                    ));
+                }
+                let new_desc = SchemaDescriptor::new(schema_version, root);
+                if let Some(existing) = &records.schema_descriptor {
+                    if existing != &new_desc {
+                        return Err(OperationFailure::new(
+                            FailureCondition::OwnershipRecordUnreadable,
+                            "conflicting schema descriptor in .meta metadata",
+                        ));
+                    }
+                } else {
+                    records.schema_descriptor = Some(new_desc);
+                }
             }
             OwnershipRecord::OutboundPointer(p) => {
                 records.outbound_pointer = Some(p);
@@ -430,7 +490,14 @@ fn append_meta_record_impl(
     let mut rec_buf = Vec::new();
     record.encode(&mut rec_buf);
     let mut frame_buf = Vec::new();
-    ContainerFrame::encode_payload(&rec_buf, &mut frame_buf);
+    ContainerFrame::encode_payload(&rec_buf, &mut frame_buf).map_err(|err| {
+        MetaWriteError::WriteOrSync(OperationFailure::new(
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            },
+            format!("failed to encode record frame: {err}"),
+        ))
+    })?;
     let write_res = if simulate_write_error {
         Err(std::io::Error::other("simulated write_all failure"))
     } else {
@@ -463,6 +530,52 @@ pub struct FileStorageAdapter {
     pgno_path: PathBuf,
     stem: String,
     exclusion_policy: FileExclusionPolicy,
+}
+
+/// Computes the serialized wire length of an ownership claim record bounded by a maximum wire length.
+///
+/// # Errors
+/// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] and
+/// [`ValueConstraint::TooLong`] if the wire length overflows `usize` or exceeds `max_wire_len` or `u32::MAX`.
+pub fn compute_claim_wire_len_bounded(
+    label_len: usize,
+    max_wire_len: usize,
+) -> Result<u32, OperationFailure> {
+    let base = 69usize;
+    let total = base.checked_add(label_len).ok_or_else(|| {
+        OperationFailure::new(
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            },
+            "claim wire length overflows usize",
+        )
+    })?;
+    if total > max_wire_len || total > u32::MAX as usize {
+        return Err(OperationFailure::new(
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            },
+            format!("claim wire length {total} exceeds maximum frame limit ({max_wire_len})"),
+        ));
+    }
+    Ok(total as u32)
+}
+
+/// Computes the serialized wire length of an ownership claim record from its operator label length.
+///
+/// # Errors
+/// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] and
+/// [`ValueConstraint::TooLong`] if the wire length overflows the host address space or exceeds `u32::MAX`.
+pub fn compute_claim_wire_len(label_len: usize) -> Result<u32, OperationFailure> {
+    compute_claim_wire_len_bounded(label_len, u32::MAX as usize)
+}
+
+fn map_completion_create_error(err: std::io::Error) -> OperationFailure {
+    let condition = match err.kind() {
+        std::io::ErrorKind::AlreadyExists => FailureCondition::StoreAlreadyExists,
+        _ => FailureCondition::TransportUnavailable,
+    };
+    OperationFailure::with_source(condition, "failed to create .pgno during completion", err)
 }
 
 impl FileStorageAdapter {
@@ -545,27 +658,44 @@ impl FileStorageAdapter {
     }
 
     /// Returns the presence of artefact components in storage per C5.10.
-    #[must_use]
-    pub fn presence(&self) -> ArtefactPresence {
-        match (self.meta_path.exists(), self.pgno_path.exists()) {
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if checking files fails.
+    pub fn try_presence(&self) -> Result<ArtefactPresence, OperationFailure> {
+        let meta_exists = self.meta_path.try_exists().map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                format!(
+                    "failed to check existence of meta file {}: {err}",
+                    self.meta_path.display()
+                ),
+            )
+        })?;
+        let pgno_exists = self.pgno_path.try_exists().map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                format!(
+                    "failed to check existence of pgno file {}: {err}",
+                    self.pgno_path.display()
+                ),
+            )
+        })?;
+        Ok(match (meta_exists, pgno_exists) {
             (false, false) => ArtefactPresence::None,
             (true, false) => ArtefactPresence::OwnershipRecordOnly,
             (false, true) => ArtefactPresence::EventDataOnly,
             (true, true) => ArtefactPresence::Both,
-        }
+        })
     }
 
-    /// Creates the artefact files exclusively with initial ownership claim per C5.10, C5.64, and C12.3.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::StoreAlreadyExists`] if artefact already exists.
-    /// Returns [`OperationFailure`] with [`FailureCondition::ExclusionUnavailable`] or
-    /// [`FailureCondition::AnotherOwnerHoldsExclusion`] if writer exclusion fails.
-    pub fn create(
+    fn create_with_limit(
         &self,
         initial_claim: &OwnershipClaimRecord,
+        descriptor: &AdmittedDescriptor,
+        max_wire_len: usize,
     ) -> Result<FileWriterSession, OperationFailure> {
-        admit_create(self.presence())?;
+        admit_create(self.try_presence()?)?;
+        let _ = compute_claim_wire_len_bounded(initial_claim.operator_label.len(), max_wire_len)?;
         let mut meta_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -594,13 +724,39 @@ impl FileStorageAdapter {
         let mut claim_bytes = Vec::new();
         OwnershipRecord::OwnershipClaim(initial_claim.clone()).encode(&mut claim_bytes);
         let mut frame_buf = Vec::new();
-        ContainerFrame::encode_payload(&claim_bytes, &mut frame_buf);
+        ContainerFrame::encode_payload(&claim_bytes, &mut frame_buf).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                },
+                format!("failed to encode claim frame: {err}"),
+            )
+        })?;
         meta_file.write_all(&frame_buf).map_err(|err| {
             OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
                 format!("failed to write claim frame to .meta: {err}"),
             )
         })?;
+
+        let mut desc_frame = Vec::new();
+        ContainerFrame::encode_payload(descriptor.encoded_record(), &mut desc_frame).map_err(
+            |err| {
+                OperationFailure::new(
+                    FailureCondition::ValueConstraintViolated {
+                        constraint: ValueConstraint::TooLong,
+                    },
+                    format!("failed to encode schema descriptor frame: {err}"),
+                )
+            },
+        )?;
+        meta_file.write_all(&desc_frame).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                format!("failed to write schema descriptor frame to .meta: {err}"),
+            )
+        })?;
+
         meta_file.sync_data().map_err(|err| {
             OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
@@ -650,6 +806,7 @@ impl FileStorageAdapter {
             admission: OpenAdmission::Ready,
             meta_records: MetaRecords {
                 latest_claim: Some(initial_claim.clone()),
+                schema_descriptor: Some(descriptor.descriptor().clone()),
                 ..Default::default()
             },
             exclusion_policy: self.exclusion_policy,
@@ -669,10 +826,93 @@ impl FileStorageAdapter {
         Ok(FileWriterSession { store })
     }
 
+    /// Creates the artefact files exclusively with initial ownership claim per C5.10, C5.64, and C12.3.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::StoreAlreadyExists`] if artefact already exists.
+    /// Returns [`OperationFailure`] with [`FailureCondition::ExclusionUnavailable`] or
+    /// [`FailureCondition::AnotherOwnerHoldsExclusion`] if writer exclusion fails.
+    /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] if initial claim exceeds `u32::MAX`.
+    /// All underlying presence, creation, write, sync, and exclusion failures propagate.
+    pub fn create(
+        &self,
+        initial_claim: &OwnershipClaimRecord,
+        descriptor: &AdmittedDescriptor,
+    ) -> Result<FileWriterSession, OperationFailure> {
+        self.create_with_limit(initial_claim, descriptor, u32::MAX as usize)
+    }
+
+    /// Creates the artefact files with an injected maximum wire length bound for testing.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] if claim wire length
+    /// overflows `usize` or exceeds `max_wire_len` or `u32::MAX`.
+    /// Propagates any creation failure documented on [`Self::create`].
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    pub fn create_with_claim_bound(
+        &self,
+        initial_claim: &OwnershipClaimRecord,
+        descriptor: &AdmittedDescriptor,
+        max_wire_len: usize,
+    ) -> Result<FileWriterSession, OperationFailure> {
+        self.create_with_limit(initial_claim, descriptor, max_wire_len)
+    }
+
+    /// Appends an unvalidated frame directly to the container file for testing.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] if opening or writing to the file fails.
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    pub fn append_unvalidated_frame_for_test(
+        &self,
+        payload: &[u8],
+    ) -> Result<u64, OperationFailure> {
+        let mut frame_buf = Vec::new();
+        ContainerFrame::encode_payload(payload, &mut frame_buf).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                },
+                format!("failed to encode frame: {err}"),
+            )
+        })?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.pgno_path)
+            .map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::NoArtefactExists,
+                    format!("failed to open .pgno: {err}"),
+                )
+            })?;
+        file.seek(SeekFrom::End(0)).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::TransportUnavailable,
+                format!("failed to seek to end of container: {err}"),
+            )
+        })?;
+        file.write_all(&frame_buf).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::TransportUnavailable,
+                format!("failed to write frame: {err}"),
+            )
+        })?;
+        file.sync_data().map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::TransportUnavailable,
+                format!("failed to sync frame: {err}"),
+            )
+        })?;
+        let (_, frames, _) = read_container_frames(&mut file)?;
+        Ok(frames.len() as u64)
+    }
+
     /// Creates only the .meta component of an artefact for testing incomplete creation per C5.10.
     ///
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::StoreAlreadyExists`] if .meta already exists.
+    #[cfg(any(test, feature = "unstable-test-support"))]
     pub fn create_incomplete_meta_only(
         &self,
         claim: &OwnershipClaimRecord,
@@ -705,7 +945,14 @@ impl FileStorageAdapter {
         let mut claim_bytes = Vec::new();
         OwnershipRecord::OwnershipClaim(claim.clone()).encode(&mut claim_bytes);
         let mut frame_buf = Vec::new();
-        ContainerFrame::encode_payload(&claim_bytes, &mut frame_buf);
+        ContainerFrame::encode_payload(&claim_bytes, &mut frame_buf).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                },
+                format!("failed to encode claim frame: {err}"),
+            )
+        })?;
         meta_file.write_all(&frame_buf).map_err(|err| {
             OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
@@ -724,20 +971,42 @@ impl FileStorageAdapter {
     /// Completes creation of an artefact where .meta exists without .pgno per C5.10.
     ///
     /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::MissingSchemaDescriptor`] if schema descriptor is missing or invalid.
     /// Returns [`OperationFailure`] if state is not incomplete creation or if creation fails.
     pub fn complete_creation(
         &self,
         claim: &OwnershipClaimRecord,
     ) -> Result<FileWriterSession, OperationFailure> {
-        let presence = self.presence();
-        if presence != ArtefactPresence::OwnershipRecordOnly {
-            return Err(OperationFailure::new(
-                FailureCondition::StoreAlreadyExists,
-                "artefact creation is not in incomplete state per C5.10",
-            ));
+        let presence = self.try_presence()?;
+        match presence {
+            ArtefactPresence::OwnershipRecordOnly => {}
+            ArtefactPresence::None => {
+                return Err(OperationFailure::new(
+                    FailureCondition::NoArtefactExists,
+                    "no ownership record exists for completion",
+                ))
+            }
+            ArtefactPresence::EventDataOnly | ArtefactPresence::Both => {
+                return Err(OperationFailure::new(
+                    FailureCondition::StoreAlreadyExists,
+                    "event data already exists during completion",
+                ))
+            }
         }
 
         let meta = read_meta_records(&self.meta_path)?;
+        let descriptor = meta.schema_descriptor.as_ref().ok_or_else(|| {
+            OperationFailure::new(
+                FailureCondition::MissingSchemaDescriptor,
+                "schema descriptor missing in .meta per C8.2",
+            )
+        })?;
+        AdmittedDescriptor::try_from_descriptor(descriptor.clone()).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::MissingSchemaDescriptor,
+                format!("schema descriptor in .meta is invalid per C8.2: {err}"),
+            )
+        })?;
         let durable_claim = meta.latest_claim.as_ref().ok_or_else(|| {
             OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
@@ -756,12 +1025,7 @@ impl FileStorageAdapter {
             .write(true)
             .create_new(true)
             .open(&self.pgno_path)
-            .map_err(|err| {
-                OperationFailure::new(
-                    FailureCondition::StoreAlreadyExists,
-                    format!("failed to create .pgno during completion: {err}"),
-                )
-            })?;
+            .map_err(map_completion_create_error)?;
         let header_bytes = ContainerHeader::new().to_bytes();
         pgno_file.write_all(&header_bytes).map_err(|err| {
             OperationFailure::new(
@@ -807,11 +1071,12 @@ impl FileStorageAdapter {
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::NoArtefactExists`] if artefact is missing.
     /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipUnestablished`] if opening orphan .pgno.
+    /// Returns [`OperationFailure`] with [`FailureCondition::MissingSchemaDescriptor`] if schema descriptor is missing or invalid.
     /// Returns [`OperationFailure`] with [`FailureCondition::StaleEpoch`] if carried epoch is superseded.
     /// Returns [`OperationFailure`] with [`FailureCondition::AnotherOwnerHoldsExclusion`] if lock is held.
     /// Returns [`OperationFailure`] with [`FailureCondition::ExclusionUnavailable`] if lock unsupported.
     pub fn open_write(&self, carried_epoch: u64) -> Result<FileWriterSession, OperationFailure> {
-        match self.presence() {
+        match self.try_presence()? {
             ArtefactPresence::None => {
                 return Err(OperationFailure::new(
                     FailureCondition::NoArtefactExists,
@@ -849,26 +1114,6 @@ impl FileStorageAdapter {
             ArtefactPresence::Both => {}
         }
 
-        let meta = read_meta_records(&self.meta_path)?;
-        if meta.outbound_pointer.is_some() {
-            return Err(OperationFailure::new(
-                FailureCondition::RetiredMigrationSource,
-                "artefact append authority permanently retired via outbound pointer per C5.63",
-            ));
-        }
-        let claim = meta.latest_claim.clone().ok_or_else(|| {
-            OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                "no ownership claim found in .meta per C5.12",
-            )
-        })?;
-        if claim.epoch != carried_epoch {
-            return Err(OperationFailure::new(
-                FailureCondition::StaleEpoch,
-                "carried epoch does not match recorded epoch in .meta per C5.5 and C12.4",
-            ));
-        }
-
         let mut pgno_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -881,6 +1126,40 @@ impl FileStorageAdapter {
             })?;
 
         acquire_file_exclusion(&pgno_file, self.exclusion_policy)?;
+
+        let meta = read_meta_records(&self.meta_path)?;
+        if meta.outbound_pointer.is_some() {
+            return Err(OperationFailure::new(
+                FailureCondition::RetiredMigrationSource,
+                "artefact append authority permanently retired via outbound pointer per C5.63",
+            ));
+        }
+
+        let descriptor = meta.schema_descriptor.as_ref().ok_or_else(|| {
+            OperationFailure::new(
+                FailureCondition::MissingSchemaDescriptor,
+                "schema descriptor missing in .meta per C8.2",
+            )
+        })?;
+        AdmittedDescriptor::try_from_descriptor(descriptor.clone()).map_err(|err| {
+            OperationFailure::new(
+                FailureCondition::MissingSchemaDescriptor,
+                format!("schema descriptor in .meta is invalid per C8.2: {err}"),
+            )
+        })?;
+
+        let claim = meta.latest_claim.clone().ok_or_else(|| {
+            OperationFailure::new(
+                FailureCondition::OwnershipRecordUnreadable,
+                "no ownership claim found in .meta per C5.12",
+            )
+        })?;
+        if claim.epoch != carried_epoch {
+            return Err(OperationFailure::new(
+                FailureCondition::StaleEpoch,
+                "carried epoch does not match recorded epoch in .meta per C5.5 and C12.4",
+            ));
+        }
 
         let (_, frames, _) = read_container_frames(&mut pgno_file)?;
         pgno_file.seek(SeekFrom::End(0)).map_err(|err| {
@@ -922,7 +1201,7 @@ impl FileStorageAdapter {
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::NoArtefactExists`] if artefact is missing.
     pub fn open_read(&self) -> Result<FileReaderSession, OperationFailure> {
-        let presence = self.presence();
+        let presence = self.try_presence()?;
         if presence == ArtefactPresence::None {
             return Err(OperationFailure::new(
                 FailureCondition::NoArtefactExists,
@@ -993,75 +1272,83 @@ impl FileStorageAdapter {
         read_meta_records(&self.meta_path)
     }
 
-    /// Appends an arbitrary ownership record to the .meta file.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_meta_record(&self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
+    pub(crate) fn record_meta_record_internal(
+        &self,
+        record: &OwnershipRecord,
+    ) -> Result<(), OperationFailure> {
         append_meta_record(&self.meta_path, record).map_err(MetaWriteError::into_failure)
     }
 
-    /// Appends an updated ownership claim record to the .meta file.
+    /// Appends an arbitrary ownership record to the .meta file for test support.
     ///
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_ownership_claim(
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    pub fn record_meta_record_for_test(
+        &self,
+        record: &OwnershipRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_meta_record_internal(record)
+    }
+
+    /// Appends an updated ownership claim record to the .meta file for test support.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    pub fn record_ownership_claim_for_test(
         &self,
         claim: &OwnershipClaimRecord,
     ) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::OwnershipClaim(claim.clone()))
+        self.record_meta_record_for_test(&OwnershipRecord::OwnershipClaim(claim.clone()))
     }
 
-    /// Appends an outbound generation pointer record to the .meta file per C6.17 and C5.63.
+    /// Appends an outbound generation pointer record to the .meta file for test support.
     ///
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_outbound_pointer(
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    pub fn record_outbound_pointer_for_test(
         &self,
         pointer: &OutboundPointerRecord,
     ) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::OutboundPointer(pointer.clone()))
+        self.record_meta_record_for_test(&OwnershipRecord::OutboundPointer(pointer.clone()))
     }
 
-    /// Appends an inbound generation pointer record to the .meta file per C6.16.
+    /// Appends an inbound generation pointer record to the .meta file for test support.
     ///
     /// # Errors
     /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
+    #[cfg(any(test, feature = "unstable-test-support"))]
     pub fn record_inbound_pointer(
         &self,
         pointer: &InboundPointerRecord,
     ) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::InboundPointer(pointer.clone()))
+        self.record_meta_record_internal(&OwnershipRecord::InboundPointer(pointer.clone()))
     }
 
-    /// Appends a migration start record to the .meta file per C4.13.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_migration_start(
+    #[allow(dead_code)]
+    pub(crate) fn record_migration_start(
         &self,
         start: &MigrationStartRecord,
     ) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::MigrationStart(start.clone()))
+        self.record_meta_record_internal(&OwnershipRecord::MigrationStart(start.clone()))
     }
 
-    /// Appends a migration end record to the .meta file per C4.13.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_migration_end(&self, end: &MigrationEndRecord) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::MigrationEnd(end.clone()))
+    #[allow(dead_code)]
+    pub(crate) fn record_migration_end(
+        &self,
+        end: &MigrationEndRecord,
+    ) -> Result<(), OperationFailure> {
+        self.record_meta_record_internal(&OwnershipRecord::MigrationEnd(end.clone()))
     }
 
-    /// Appends a rescue policy choice record to the .meta file per C4.13.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if writing fails.
-    pub fn record_rescue_policy_choice(
+    #[allow(dead_code)]
+    pub(crate) fn record_rescue_policy_choice(
         &self,
         choice: &RescuePolicyChoiceRecord,
     ) -> Result<(), OperationFailure> {
-        self.record_meta_record(&OwnershipRecord::RescuePolicyChoice(choice.clone()))
+        self.record_meta_record_internal(&OwnershipRecord::RescuePolicyChoice(choice.clone()))
     }
 
     /// Queries the outbound generation pointer if present.
@@ -1148,9 +1435,8 @@ impl FileEngine {
                 "writer session in uncertain state; reconciliation required",
             ));
         }
-        if self.file.is_some()
-            && !self.locked
-            && self.exclusion_policy == FileExclusionPolicy::Standard
+        if self.exclusion_policy == FileExclusionPolicy::Standard
+            && (self.file.is_none() || !self.locked)
         {
             return Err(OperationFailure::new(
                 FailureCondition::AnotherOwnerHoldsExclusion,
@@ -1191,6 +1477,14 @@ impl StorageEngine for FileEngine {
 
     fn append_block(&mut self, block: &[u8]) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
         self.check_authority()?;
+        if self.exclusion_policy == FileExclusionPolicy::Standard
+            && (self.file.is_none() || !self.locked)
+        {
+            return Err(OperationFailure::new(
+                FailureCondition::AnotherOwnerHoldsExclusion,
+                "writer session has released or does not hold required file exclusion across append per C5.6 and C5.65",
+            ));
+        }
 
         if self.simulate_indeterminate {
             self.uncertain = true;
@@ -1398,85 +1692,6 @@ impl StorageEngine for FileEngine {
 
     fn schema_descriptor(&self) -> Option<&SchemaDescriptor> {
         self.meta_records.schema_descriptor.as_ref()
-    }
-
-    fn set_schema_descriptor(
-        &mut self,
-        descriptor: &SchemaDescriptor,
-    ) -> Result<(), OperationFailure> {
-        let mut descriptor_bytes = Vec::new();
-        descriptor.root.encode(&mut descriptor_bytes);
-        let record = OwnershipRecord::SchemaDescriptor {
-            schema_version: descriptor.version,
-            descriptor_bytes,
-        };
-        self.record_meta_record(&record)
-    }
-
-    fn record_meta_record(&mut self, record: &OwnershipRecord) -> Result<(), OperationFailure> {
-        self.check_authority()?;
-        if self.uncertain {
-            return Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                format!(
-                    "writer session is uncertain: {}",
-                    self.uncertain_diagnostic.as_deref().unwrap_or("unknown")
-                ),
-            ));
-        }
-        match append_meta_record_impl(
-            &self.meta_path,
-            record,
-            self.simulate_write_error,
-            self.simulate_sync_error,
-        ) {
-            Ok(()) => {}
-            Err(MetaWriteError::Open(err)) => {
-                return Err(err);
-            }
-            Err(MetaWriteError::WriteOrSync(err)) => {
-                self.uncertain = true;
-                self.uncertain_diagnostic = Some(format!(
-                    "metadata write failed; write landing undetermined: {err}"
-                ));
-                return Err(err);
-            }
-        }
-        match record {
-            OwnershipRecord::OwnershipClaim(claim) => {
-                self.meta_records.latest_claim = Some(claim.clone());
-            }
-            OwnershipRecord::SchemaDescriptor {
-                schema_version,
-                descriptor_bytes,
-            } => {
-                let (root, _) = DescriptorNode::decode(descriptor_bytes).map_err(|err| {
-                    OperationFailure::new(
-                        FailureCondition::OwnershipRecordUnreadable,
-                        format!("failed to decode schema descriptor in .meta: {err}"),
-                    )
-                })?;
-                self.meta_records.schema_descriptor =
-                    Some(SchemaDescriptor::new(*schema_version, root));
-            }
-            OwnershipRecord::OutboundPointer(pointer) => {
-                self.meta_records.outbound_pointer = Some(pointer.clone());
-            }
-            OwnershipRecord::InboundPointer(pointer) => {
-                self.meta_records.inbound_pointer = Some(pointer.clone());
-            }
-            OwnershipRecord::MigrationStart(start) => {
-                self.meta_records.migration_start = Some(start.clone());
-            }
-            OwnershipRecord::MigrationEnd(end) => {
-                self.meta_records.migration_end = Some(end.clone());
-            }
-            OwnershipRecord::RescuePolicyChoice(choice) => {
-                self.meta_records.rescue_policy_choice = Some(choice.clone());
-            }
-            OwnershipRecord::IdentityStructure(_) | OwnershipRecord::CleanRelease(_) => {}
-        }
-        Ok(())
     }
 
     fn outbound_pointer(&self) -> Option<&OutboundPointerRecord> {
@@ -1718,6 +1933,7 @@ impl FileReaderSession {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::encoding::EventEnvelope;
@@ -1737,7 +1953,17 @@ mod tests {
     fn test_container_frame_roundtrip() {
         let payload = b"Hello, Pardosa Container!".to_vec();
         let mut buf = Vec::new();
-        ContainerFrame::encode_payload(&payload, &mut buf);
+        ContainerFrame::encode_payload(&payload, &mut buf).unwrap();
+        let (decoded, consumed) = ContainerFrame::decode(&buf).unwrap();
+        assert_eq!(consumed, buf.len());
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn test_container_frame_try_encode_payload_roundtrip() {
+        let payload = b"Hello, Pardosa Container!".to_vec();
+        let mut buf = Vec::new();
+        ContainerFrame::try_encode_payload(&payload, &mut buf).unwrap();
         let (decoded, consumed) = ContainerFrame::decode(&buf).unwrap();
         assert_eq!(consumed, buf.len());
         assert_eq!(decoded, payload);
@@ -1747,7 +1973,7 @@ mod tests {
     fn test_corrupt_frame_checksum() {
         let payload = b"Data to corrupt".to_vec();
         let mut buf = Vec::new();
-        ContainerFrame::encode_payload(&payload, &mut buf);
+        ContainerFrame::encode_payload(&payload, &mut buf).unwrap();
         let last_idx = buf.len() - 1;
         buf[last_idx] ^= 0xFF;
         let err = ContainerFrame::decode(&buf).unwrap_err();
@@ -1761,14 +1987,14 @@ mod tests {
         let initial_digest = commitment.current_commitment();
 
         let mut frame1 = Vec::new();
-        ContainerFrame::encode_payload(b"event-1", &mut frame1);
+        ContainerFrame::encode_payload(b"event-1", &mut frame1).unwrap();
         commitment.update_frame(&frame1);
         assert_eq!(commitment.frame_count(), 1);
         let digest1 = commitment.current_commitment();
         assert_ne!(initial_digest, digest1);
 
         let mut frame2 = Vec::new();
-        ContainerFrame::encode_payload(b"event-2", &mut frame2);
+        ContainerFrame::encode_payload(b"event-2", &mut frame2).unwrap();
         commitment.update_frame(&frame2);
         assert_eq!(commitment.frame_count(), 2);
         let digest2 = commitment.current_commitment();
@@ -1786,6 +2012,81 @@ mod tests {
     }
 
     #[test]
+    fn test_completion_create_error_preserves_denial_and_conflict() {
+        use std::error::Error;
+        for (kind, expected) in [
+            (
+                std::io::ErrorKind::PermissionDenied,
+                FailureCondition::TransportUnavailable,
+            ),
+            (
+                std::io::ErrorKind::TimedOut,
+                FailureCondition::TransportUnavailable,
+            ),
+            (
+                std::io::ErrorKind::AlreadyExists,
+                FailureCondition::StoreAlreadyExists,
+            ),
+        ] {
+            let failure = map_completion_create_error(std::io::Error::new(kind, "already exists"));
+            assert_eq!(failure.condition(), &expected);
+            assert_eq!(
+                failure
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .kind(),
+                kind
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_denied_create_preserves_real_io_error() {
+        use std::error::Error;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = FileStorageAdapter::new(dir.path().join("denied"));
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1; 16],
+            boot_id: [2; 16],
+            process_id: 1,
+            process_start_time_ns: 1,
+            claim_time_ns: 1,
+            operator_label: "fixture".into(),
+        };
+        adapter.create_incomplete_meta_only(&claim).unwrap();
+        let descriptor = AdmittedDescriptor::default_for_test();
+        let mut bytes = Vec::new();
+        descriptor.root().encode(&mut bytes).unwrap();
+        adapter
+            .record_meta_record_for_test(&OwnershipRecord::SchemaDescriptor {
+                schema_version: descriptor.version(),
+                descriptor_bytes: bytes,
+            })
+            .unwrap();
+        let original = std::fs::metadata(dir.path()).unwrap().permissions();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = adapter.complete_creation(&claim);
+        std::fs::set_permissions(dir.path(), original).unwrap();
+        let failure = result.unwrap_err();
+        assert_eq!(failure.condition(), &FailureCondition::TransportUnavailable);
+        assert_eq!(
+            failure
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(!adapter.pgno_path().try_exists().unwrap());
+    }
+
+    #[test]
     fn test_file_session_fiber_handle_and_point_lookup() {
         let temp_dir = tempfile::tempdir().unwrap();
         let stem = temp_dir.path().join("test_fiber_point_lookup");
@@ -1799,7 +2100,9 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let fiber_id = [0x42; 16];
         let domain_key = "user:42";
         let derived_id = derive_fiber_id(domain_key);
@@ -1914,14 +2217,18 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let fiber_id = [0x99; 16];
         let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"initial").unwrap();
-        writer.append_envelope(&genesis).expect("append genesis");
+        writer
+            .append_envelope_verdict(&genesis)
+            .expect("append genesis");
         let file_len_before = std::fs::metadata(writer.pgno_path()).unwrap().len();
 
         let dup_genesis = EventEnvelope::genesis([0x02; 16], fiber_id, b"dup").unwrap();
-        let err = writer.append_envelope(&dup_genesis).unwrap_err();
+        let err = writer.append_envelope_verdict(&dup_genesis).unwrap_err();
         assert_eq!(
             *err.condition(),
             FailureCondition::PrecursorChainBroken(None)
@@ -1935,7 +2242,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append_raw_frame_envelope_pre_landing_admission_and_refusal() {
+    fn test_append_frame_verdict_envelope_pre_landing_admission_and_refusal() {
         let temp_dir = tempfile::tempdir().unwrap();
         let stem = temp_dir.path().join("h3_raw_admission");
         let adapter = FileStorageAdapter::new(&stem);
@@ -1948,14 +2255,16 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let fiber_id = [0x77; 16];
         let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"initial").unwrap();
         let mut gen_bytes = Vec::new();
-        genesis.encode(&mut gen_bytes);
+        genesis.encode(&mut gen_bytes).unwrap();
 
         writer
-            .append_raw_frame(&gen_bytes)
+            .append_frame_verdict(&gen_bytes)
             .expect("append valid raw envelope");
         assert_eq!(
             writer
@@ -1970,9 +2279,9 @@ mod tests {
 
         let dup_genesis = EventEnvelope::genesis([0x02; 16], fiber_id, b"dup").unwrap();
         let mut dup_bytes = Vec::new();
-        dup_genesis.encode(&mut dup_bytes);
+        dup_genesis.encode(&mut dup_bytes).unwrap();
 
-        let err = writer.append_raw_frame(&dup_bytes).unwrap_err();
+        let err = writer.append_frame_verdict(&dup_bytes).unwrap_err();
         assert_eq!(
             *err.condition(),
             FailureCondition::PrecursorChainBroken(None)
@@ -1992,10 +2301,10 @@ mod tests {
             payload: b"child".to_vec(),
         };
         let mut child_bytes = Vec::new();
-        child.encode(&mut child_bytes);
+        child.encode(&mut child_bytes).unwrap();
 
         writer
-            .append_raw_frame(&child_bytes)
+            .append_frame_verdict(&child_bytes)
             .expect("append valid raw child");
         assert_eq!(
             writer
@@ -2024,15 +2333,17 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let fiber_id = [0x55; 16];
         let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"initial").unwrap();
         let mut bytes = Vec::new();
-        genesis.encode(&mut bytes);
+        genesis.encode(&mut bytes).unwrap();
         assert!(bytes.len() >= 85);
         bytes[32] = 2;
         let err = writer
-            .append_frame(&bytes)
+            .append_frame_verdict(&bytes)
             .expect_err("malformed boolean discriminant in envelope payload must be rejected");
         assert_eq!(*err.condition(), FailureCondition::EnvelopeMismatch);
     }
@@ -2051,10 +2362,14 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let fiber_id = [0x77; 16];
         let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"initial").unwrap();
-        writer.append_envelope(&genesis).expect("append genesis");
+        writer
+            .append_envelope_verdict(&genesis)
+            .expect("append genesis");
 
         let mut reader = adapter.open_read().expect("open reader");
         let handle = reader.fiber(fiber_id).expect("reader initial point lookup");
@@ -2071,9 +2386,10 @@ mod tests {
             payload: b"broken-precursor".to_vec(),
         };
         let mut broken_bytes = Vec::new();
-        broken_env.encode(&mut broken_bytes);
-        writer
-            .append_unvalidated_frame(&broken_bytes)
+        broken_env.encode(&mut broken_bytes).unwrap();
+        drop(writer);
+        adapter
+            .append_unvalidated_frame_for_test(&broken_bytes)
             .expect("append raw frame");
 
         let read_err = reader.read_all_envelopes().unwrap_err();
@@ -2105,55 +2421,17 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let short_payload = [0u8; 84];
         let err = writer
-            .append_frame(&short_payload)
-            .expect_err("84-byte payload must be rejected by append_frame per H2");
+            .append_frame_verdict(&short_payload)
+            .expect_err("84-byte payload must be rejected by append_frame_verdict per H2");
         assert_eq!(*err.condition(), FailureCondition::EnvelopeMismatch);
         assert!(err
             .to_string()
             .contains("payload too short for event envelope: 84"));
-    }
-
-    #[test]
-    fn test_writer_rejects_set_schema_descriptor_while_uncertain() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let stem = temp_dir.path().join("uncertain_schema");
-        let adapter = FileStorageAdapter::new(&stem);
-        let claim = OwnershipClaimRecord {
-            epoch: 1,
-            machine_id: [1u8; 16],
-            boot_id: [2u8; 16],
-            process_id: 12345,
-            process_start_time_ns: 1_000_000,
-            claim_time_ns: 2_000_000,
-            operator_label: "test-operator".to_string(),
-        };
-        let mut writer = adapter.create(&claim).expect("create writer");
-        writer.store.engine.uncertain = true;
-        writer.store.engine.uncertain_diagnostic =
-            Some("writer session in uncertain state; reconciliation required".to_string());
-        let descriptor = crate::schema::SchemaDescriptor::new(
-            1,
-            crate::schema::DescriptorNode::Struct {
-                name: "OrderPayload".to_string(),
-                fields: vec![crate::schema::FieldDescriptor {
-                    name: "id".to_string(),
-                    node: crate::schema::DescriptorNode::Uuid,
-                }],
-            },
-        );
-        let err = writer
-            .set_schema_descriptor(&descriptor)
-            .expect_err("set_schema_descriptor must be rejected while uncertain per M3");
-        assert_eq!(
-            *err.condition(),
-            FailureCondition::OwnershipRecordUnreadable
-        );
-        assert!(err
-            .to_string()
-            .contains("writer session in uncertain state; reconciliation required"));
     }
 
     #[test]
@@ -2170,9 +2448,12 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
-        writer
-            .append_raw_frame(b"raw-non-envelope")
+        let writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
+        drop(writer);
+        adapter
+            .append_unvalidated_frame_for_test(b"raw-non-envelope")
             .expect("append raw frame");
 
         let reader = adapter.open_read().expect("open reader with raw frames");
@@ -2204,24 +2485,24 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let fiber_id = [0x22; 16];
+        drop(writer);
 
-        writer
-            .append_raw_frame(b"unindexed-raw-frame")
+        adapter
+            .append_unvalidated_frame_for_test(b"unindexed-raw-frame")
             .expect("append raw frame");
 
-        let err_latest = writer.get_latest(fiber_id).unwrap_err();
-        assert_eq!(*err_latest.condition(), FailureCondition::EnvelopeMismatch);
-        assert!(err_latest
-            .to_string()
-            .contains("session contains unindexed raw frames; point lookup unavailable"));
+        let err_open = adapter.open_write(1).unwrap_err();
+        assert_eq!(*err_open.condition(), FailureCondition::EnvelopeMismatch);
 
-        let err_fiber = writer.fiber(fiber_id).unwrap_err();
+        let reader = adapter.open_read().expect("open read");
+        let err_latest = reader.get_latest(fiber_id).unwrap_err();
+        assert_eq!(*err_latest.condition(), FailureCondition::EnvelopeMismatch);
+        let err_fiber = reader.fiber(fiber_id).unwrap_err();
         assert_eq!(*err_fiber.condition(), FailureCondition::EnvelopeMismatch);
-        assert!(err_fiber
-            .to_string()
-            .contains("session contains unindexed raw frames; point lookup unavailable"));
     }
 
     #[test]
@@ -2238,42 +2519,22 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let fiber_id = [0x22; 16];
+        drop(writer);
 
-        writer
-            .append_unvalidated_frame(b"unvalidated-frame-bytes")
+        adapter
+            .append_unvalidated_frame_for_test(b"unvalidated-frame-bytes")
             .expect("append unvalidated frame");
 
-        let err_latest = writer.get_latest(fiber_id).unwrap_err();
-        assert_eq!(*err_latest.condition(), FailureCondition::EnvelopeMismatch);
-        assert!(err_latest
-            .to_string()
-            .contains("session contains unindexed raw frames; point lookup unavailable"));
+        let err_open = adapter.open_write(1).unwrap_err();
+        assert_eq!(*err_open.condition(), FailureCondition::EnvelopeMismatch);
 
-        let err_fiber = writer.fiber(fiber_id).unwrap_err();
+        let reader = adapter.open_read().expect("open reader");
+        let err_fiber = reader.fiber(fiber_id).unwrap_err();
         assert_eq!(*err_fiber.condition(), FailureCondition::EnvelopeMismatch);
-        assert!(err_fiber
-            .to_string()
-            .contains("session contains unindexed raw frames; point lookup unavailable"));
-
-        let err_append_fiber = writer
-            .append_to_fiber(fiber_id, [0x01; 16], b"payload")
-            .unwrap_err();
-        assert_eq!(
-            *err_append_fiber.condition(),
-            FailureCondition::EnvelopeMismatch
-        );
-
-        let env = EventEnvelope::genesis([0x02; 16], fiber_id, b"envelope").unwrap();
-        let err_append_env = writer.append_envelope(&env).unwrap_err();
-        assert_eq!(
-            *err_append_env.condition(),
-            FailureCondition::EnvelopeMismatch
-        );
-        assert!(err_append_env
-            .to_string()
-            .contains("session contains unindexed raw frames; append unavailable"));
     }
 
     #[test]
@@ -2290,7 +2551,9 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let writer = adapter.create(&claim).expect("create writer");
+        let writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let fiber_id = [0x55; 16];
         let event_id = [0x77; 16];
 
@@ -2345,7 +2608,9 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let env1 = EventEnvelope::genesis([0x01; 16], [0x55; 16], b"payload-1").unwrap();
 
         let verdict = writer
@@ -2401,7 +2666,9 @@ mod tests {
             operator_label: "test-operator".to_string(),
         };
 
-        let writer = adapter.create(&claim).expect("create writer");
+        let writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let mut write_err_writer = writer.with_simulate_write_error(true);
         let fiber_id = [0x55; 16];
         let event_id = [0x77; 16];
@@ -2422,7 +2689,9 @@ mod tests {
 
         let stem_sync = temp_dir.path().join("test_file_sync_phase");
         let adapter_sync = FileStorageAdapter::new(&stem_sync);
-        let sync_writer = adapter_sync.create(&claim).expect("create writer");
+        let sync_writer = adapter_sync
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let mut sync_err_writer = sync_writer.with_simulate_sync_error(true);
         let verdict_sync = sync_err_writer
             .append_to_fiber(fiber_id, event_id, b"payload-sync-err")
@@ -2443,7 +2712,9 @@ mod tests {
 
         let stem_meta = temp_dir.path().join("test_file_meta_phase");
         let adapter_meta = FileStorageAdapter::new(&stem_meta);
-        let mut meta_writer = adapter_meta.create(&claim).expect("create writer");
+        let meta_writer = adapter_meta
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let mut perms = std::fs::metadata(meta_writer.meta_path())
             .unwrap()
             .permissions();
@@ -2451,8 +2722,8 @@ mod tests {
         std::fs::set_permissions(meta_writer.meta_path(), perms.clone()).unwrap();
 
         let dummy_record = OwnershipRecord::OwnershipClaim(claim.clone());
-        let meta_err = meta_writer
-            .record_meta_record(&dummy_record)
+        let meta_err = adapter_meta
+            .record_meta_record_for_test(&dummy_record)
             .expect_err("read-only meta should fail append");
         assert_eq!(
             *meta_err.condition(),
@@ -2476,8 +2747,8 @@ mod tests {
             std::fs::set_permissions(meta_writer.meta_path(), perms).expect("restore permissions");
         }
 
-        meta_writer
-            .record_meta_record(&dummy_record)
+        adapter_meta
+            .record_meta_record_for_test(&dummy_record)
             .expect("recording succeeds after restoring permissions");
         assert!(meta_writer.uncertain_diagnostic().is_none());
     }
@@ -2496,7 +2767,9 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
 
         let borrowed_claim: &OwnershipClaimRecord = writer.claim();
         assert_eq!(borrowed_claim.epoch, 1);
@@ -2506,20 +2779,15 @@ mod tests {
         append_meta_record(writer.meta_path(), &OwnershipRecord::OwnershipClaim(claim2))
             .expect("append higher epoch");
 
-        let choice = RescuePolicyChoiceRecord {
-            policy_tag: 0,
-            parameter_payload: vec![],
-        };
-        let err_meta = writer.record_rescue_policy_choice(&choice).unwrap_err();
-        assert_eq!(*err_meta.condition(), FailureCondition::StaleEpoch);
+        let genesis = EventEnvelope::genesis([0x01; 16], [0x11; 16], b"payload").unwrap();
+        let err_append = writer.append_envelope_verdict(&genesis).unwrap_err();
+        assert_eq!(*err_append.condition(), FailureCondition::StaleEpoch);
 
-        let descriptor = SchemaDescriptor::new(1, DescriptorNode::U64);
-        let err_schema = writer.set_schema_descriptor(&descriptor).unwrap_err();
-        assert_eq!(*err_schema.condition(), FailureCondition::StaleEpoch);
+        let err_sync = writer.sync().unwrap_err();
+        assert_eq!(*err_sync.condition(), FailureCondition::StaleEpoch);
 
         let meta_records = adapter.read_meta_records().expect("read meta");
-        assert!(meta_records.rescue_policy_choice.is_none());
-        assert!(meta_records.schema_descriptor.is_none());
+        assert_eq!(meta_records.latest_claim.unwrap().epoch, 2);
     }
 
     #[test]
@@ -2536,7 +2804,9 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let writer = adapter.create(&claim).expect("create writer");
+        let writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         writer
             .release_exclusion()
             .expect("release exclusion succeeds");
@@ -2594,7 +2864,9 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
 
         let mut claim2 = claim.clone();
         claim2.epoch = 2;
@@ -2619,7 +2891,9 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
         let fiber_id = [0x42; 16];
         writer
             .append_to_fiber(fiber_id, [0x01; 16], b"payload")
@@ -2670,9 +2944,12 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
-        writer
-            .append_unvalidated_frame(b"short-payload")
+        let writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
+        drop(writer);
+        adapter
+            .append_unvalidated_frame_for_test(b"short-payload")
             .expect("append short frame");
 
         let mut reader = adapter.open_read().expect("open read");
@@ -2681,9 +2958,9 @@ mod tests {
     }
 
     #[test]
-    fn test_file_record_meta_record_prewrite_failure_preserves_certainty_and_recovers() {
+    fn test_create_persists_schema_descriptor_and_readback() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let stem = temp_dir.path().join("test_meta_prewrite_recovery");
+        let stem = temp_dir.path().join("schema_creation");
         let adapter = FileStorageAdapter::new(&stem);
         let claim = OwnershipClaimRecord {
             epoch: 1,
@@ -2694,59 +2971,21 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let mut writer = adapter.create(&claim).expect("create writer");
-        let meta_path = stem.with_extension("meta");
+        let desc =
+            AdmittedDescriptor::try_from_descriptor(SchemaDescriptor::new(1, DescriptorNode::U64))
+                .unwrap();
+        let writer = adapter.create(&claim, &desc).expect("create writer");
+        assert_eq!(writer.schema_descriptor(), Some(desc.descriptor()));
+        drop(writer);
 
-        let mut perms = std::fs::metadata(&meta_path).unwrap().permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(&meta_path, perms).unwrap();
-
-        let inbound_record = OwnershipRecord::InboundPointer(InboundPointerRecord {
-            prior_generation_locator_id: [0x88; 16],
-            prior_generation_epoch: 2,
-        });
-
-        let err = writer.record_meta_record(&inbound_record).unwrap_err();
-        assert_eq!(
-            *err.condition(),
-            FailureCondition::OwnershipRecordUnreadable
-        );
-        assert!(err.to_string().contains("failed to open .meta for append"));
-        assert!(writer.uncertain_diagnostic().is_none());
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&meta_path, std::fs::Permissions::from_mode(0o644))
-                .expect("restore permissions");
-        }
-        #[cfg(not(unix))]
-        #[allow(clippy::permissions_set_readonly_false)]
-        {
-            let mut restore_perms = std::fs::metadata(&meta_path).unwrap().permissions();
-            restore_perms.set_readonly(false);
-            std::fs::set_permissions(&meta_path, restore_perms).unwrap();
-        }
-
-        writer
-            .record_meta_record(&inbound_record)
-            .expect("recording meta record succeeds after permissions restored");
-        assert!(writer.uncertain_diagnostic().is_none());
-        assert!(writer.inbound_pointer().is_some());
-
-        let fiber_id = [0x55; 16];
-        let event_id = [0x77; 16];
-        let verdict = writer
-            .append_to_fiber(fiber_id, event_id, b"payload-after-meta-recovery")
-            .expect("append succeeds after meta recovery");
-        assert!(matches!(verdict, WriteLandingVerdict::Landed(_)));
-        assert!(writer.uncertain_diagnostic().is_none());
+        let reader = adapter.open_read().expect("open reader");
+        assert_eq!(reader.schema_descriptor(), Some(desc.descriptor()));
     }
 
     #[test]
-    fn test_file_record_meta_record_write_or_sync_failure_marks_uncertain() {
+    fn test_complete_creation_and_open_write_fail_on_missing_schema_descriptor() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let stem = temp_dir.path().join("test_meta_write_or_sync_failure");
+        let stem = temp_dir.path().join("missing_schema");
         let adapter = FileStorageAdapter::new(&stem);
         let claim = OwnershipClaimRecord {
             epoch: 1,
@@ -2757,76 +2996,162 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
-        let writer = adapter.create(&claim).expect("create writer");
-        let mut sync_err_writer = writer.with_simulate_sync_error(true);
+        assert_eq!(
+            adapter.complete_creation(&claim).unwrap_err().condition(),
+            &FailureCondition::NoArtefactExists
+        );
+        adapter.create_incomplete_meta_only(&claim).unwrap();
+        let err_complete = adapter.complete_creation(&claim).unwrap_err();
+        assert_eq!(
+            *err_complete.condition(),
+            FailureCondition::MissingSchemaDescriptor
+        );
+        let err_open_write = adapter.open_write(1).unwrap_err();
+        assert_eq!(
+            *err_open_write.condition(),
+            FailureCondition::MissingSchemaDescriptor
+        );
+    }
 
-        let inbound_record = OwnershipRecord::InboundPointer(InboundPointerRecord {
-            prior_generation_locator_id: [0x88; 16],
-            prior_generation_epoch: 2,
-        });
+    #[test]
+    fn test_read_meta_records_conflicting_descriptors_fails_closed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stem = temp_dir.path().join("test_meta_conflicts");
+        let adapter = FileStorageAdapter::new(&stem);
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1u8; 16],
+            boot_id: [2u8; 16],
+            process_id: 12345,
+            process_start_time_ns: 1_000_000,
+            claim_time_ns: 2_000_000,
+            operator_label: "test-operator".to_string(),
+        };
+        adapter.create_incomplete_meta_only(&claim).unwrap();
+        let meta_path = adapter.meta_path();
 
-        let err = sync_err_writer
-            .record_meta_record(&inbound_record)
-            .unwrap_err();
+        let mut desc1_bytes = Vec::new();
+        DescriptorNode::U64.encode(&mut desc1_bytes).unwrap();
+        append_meta_record(
+            meta_path,
+            &OwnershipRecord::SchemaDescriptor {
+                schema_version: 1,
+                descriptor_bytes: desc1_bytes.clone(),
+            },
+        )
+        .unwrap();
+
+        append_meta_record(
+            meta_path,
+            &OwnershipRecord::SchemaDescriptor {
+                schema_version: 1,
+                descriptor_bytes: desc1_bytes,
+            },
+        )
+        .unwrap();
+
+        let records =
+            read_meta_records(meta_path).expect("identical multiple descriptors are allowed");
+        assert_eq!(records.schema_descriptor.unwrap().version, 1);
+
+        let mut desc2_bytes = Vec::new();
+        DescriptorNode::U32.encode(&mut desc2_bytes).unwrap();
+        append_meta_record(
+            meta_path,
+            &OwnershipRecord::SchemaDescriptor {
+                schema_version: 1,
+                descriptor_bytes: desc2_bytes,
+            },
+        )
+        .unwrap();
+
+        let err = read_meta_records(meta_path).unwrap_err();
         assert_eq!(
             *err.condition(),
             FailureCondition::OwnershipRecordUnreadable
         );
-        assert!(err.to_string().contains("simulated sync_data failure"));
-        assert!(sync_err_writer.uncertain_diagnostic().is_some());
-        let diag = sync_err_writer.uncertain_diagnostic().unwrap();
-        assert!(diag.contains("metadata write failed; write landing undetermined"));
-        assert!(diag.contains("failed to sync .meta: simulated sync_data failure"));
+    }
 
-        let subsequent_err = sync_err_writer
-            .record_meta_record(&inbound_record)
-            .unwrap_err();
+    #[test]
+    fn test_claim_wire_len_boundary_arithmetic() {
         assert_eq!(
-            *subsequent_err.condition(),
-            FailureCondition::OwnershipRecordUnreadable
+            compute_claim_wire_len(u32::MAX as usize - 69).unwrap(),
+            u32::MAX
         );
-        assert!(subsequent_err
-            .to_string()
-            .contains("writer session in uncertain state"));
+        let err_68 = compute_claim_wire_len(u32::MAX as usize - 68).unwrap_err();
+        match err_68.condition() {
+            FailureCondition::ValueConstraintViolated { constraint } => {
+                assert_eq!(constraint, &ValueConstraint::TooLong);
+            }
+            other => panic!("expected ValueConstraintViolated, got {other:?}"),
+        }
+        let err_67 = compute_claim_wire_len(u32::MAX as usize - 67).unwrap_err();
+        match err_67.condition() {
+            FailureCondition::ValueConstraintViolated { constraint } => {
+                assert_eq!(constraint, &ValueConstraint::TooLong);
+            }
+            other => panic!("expected ValueConstraintViolated, got {other:?}"),
+        }
+    }
 
-        let fiber_id = [0x55; 16];
-        let event_id = [0x77; 16];
-        let append_err = sync_err_writer
-            .append_to_fiber(fiber_id, event_id, b"payload-during-uncertainty")
-            .unwrap_err();
+    #[test]
+    fn test_file_adapter_create_oversized_claim_rejected_without_creating_files() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stem = temp_dir.path().join("oversized_claim");
+        let adapter = FileStorageAdapter::new(&stem);
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1u8; 16],
+            boot_id: [2u8; 16],
+            process_id: 12345,
+            process_start_time_ns: 1_000_000,
+            claim_time_ns: 2_000_000,
+            operator_label: "a".repeat(50),
+        };
+        let desc =
+            AdmittedDescriptor::try_from_descriptor(SchemaDescriptor::new(1, DescriptorNode::U64))
+                .unwrap();
+        let err = adapter
+            .create_with_claim_bound(&claim, &desc, 100)
+            .expect_err("oversized claim must be rejected");
+        match err.condition() {
+            FailureCondition::ValueConstraintViolated { constraint } => {
+                assert_eq!(constraint, &ValueConstraint::TooLong);
+            }
+            other => panic!("expected ValueConstraintViolated, got {other:?}"),
+        }
+        assert!(!adapter.meta_path().exists(), ".meta file must not exist");
+        assert!(!adapter.pgno_path().exists(), ".pgno file must not exist");
+    }
+
+    #[test]
+    fn test_file_adapter_create_valid_claim_creates_files_and_prevents_duplicate() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stem = temp_dir.path().join("realistic_claim");
+        let adapter = FileStorageAdapter::new(&stem);
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1u8; 16],
+            boot_id: [2u8; 16],
+            process_id: 12345,
+            process_start_time_ns: 1_000_000,
+            claim_time_ns: 2_000_000,
+            operator_label: "test-operator".to_string(),
+        };
+        let desc =
+            AdmittedDescriptor::try_from_descriptor(SchemaDescriptor::new(1, DescriptorNode::U64))
+                .unwrap();
+        let writer = adapter.create(&claim, &desc).expect("create writer");
+        assert!(adapter.meta_path().exists(), ".meta file must exist");
+        assert!(adapter.pgno_path().exists(), ".pgno file must exist");
+        drop(writer);
+
+        let second_err = adapter
+            .create(&claim, &desc)
+            .expect_err("create on existing store must fail");
         assert_eq!(
-            *append_err.condition(),
-            FailureCondition::OwnershipRecordUnreadable
+            *second_err.condition(),
+            FailureCondition::StoreAlreadyExists
         );
-        assert!(append_err
-            .to_string()
-            .contains("writer session in uncertain state"));
-
-        let stem_write = temp_dir.path().join("test_meta_write_failure");
-        let adapter_write = FileStorageAdapter::new(&stem_write);
-        let writer_write = adapter_write.create(&claim).expect("create writer 2");
-        let mut write_err_writer = writer_write.with_simulate_write_error(true);
-
-        let err_write = write_err_writer
-            .record_meta_record(&inbound_record)
-            .unwrap_err();
-        assert_eq!(
-            *err_write.condition(),
-            FailureCondition::OwnershipRecordUnreadable
-        );
-        assert!(err_write
-            .to_string()
-            .contains("simulated write_all failure"));
-        assert!(write_err_writer.uncertain_diagnostic().is_some());
-        let diag_write = write_err_writer.uncertain_diagnostic().unwrap();
-        assert!(diag_write.contains("metadata write failed; write landing undetermined"));
-        assert!(diag_write.contains("failed to write record to .meta: simulated write_all failure"));
-
-        let subsequent_write_err = write_err_writer
-            .record_meta_record(&inbound_record)
-            .unwrap_err();
-        assert!(subsequent_write_err
-            .to_string()
-            .contains("writer session in uncertain state"));
     }
 }

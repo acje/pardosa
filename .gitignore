@@ -12,6 +12,7 @@
 /target
 scripts/target/
 Cargo.lock
+!/Cargo.lock
 
 # OODA scratch and traces
 .ooda/

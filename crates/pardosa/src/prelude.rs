@@ -13,26 +13,27 @@ pub use crate::file::{
     FileWriterSession, MetaRecords, RollingCommitment,
 };
 pub use crate::migration::{
-    BrokenChainElection, CutoverSummary, MigrationManager, MigrationPhase, MigrationSource,
-    MigrationTarget,
+    AdjacentMigration, BrokenChainElection, CutoverSummary, MigrationManager, MigrationPhase,
+    MigrationSource, MigrationTarget, MigrationWitness, VersionMigration,
 };
 pub use crate::schema::{
-    derive_fiber_id, DescriptorNode, EventF32, EventF64, FieldDescriptor, OrderedF32, OrderedF64,
-    PardosaSchema, PardosaType, SchemaDescriptor, SchemaIdentity, VariantDescriptor,
+    derive_fiber_id, AdmittedDescriptor, DescriptorNode, EventF32, EventF64, FieldDescriptor,
+    OrderedF32, OrderedF64, PardosaSchema, PardosaType, SchemaDescriptor, SchemaIdentity,
+    VariantDescriptor,
 };
 pub use crate::store::{
     admit_create, admit_event, admit_open, admit_precursor_link, evaluate_claim_cas,
     evaluate_owner_liveness, evaluate_takeover, validate_name_pairing, AppendAuthority,
-    ArtefactLocator, ArtefactPresence, ArtefactReader, AttemptedTransition, BatchLandingVerdict,
-    CausalChainError, CleanReleaseProof, CreationPlan, CreationProgression, DeathProof,
-    DiagnosticDetail, EventAdmission, FailureCondition, FiberHandle, FiberMigrationPolicy,
-    FiberState, FrameRecoveryCallback, GenerationKnowledge, HistoryIntegrity,
-    IllegalOpenCombination, IllegalStateTransition, IncompleteCreationState, LivenessVerdict,
-    LockedRescuePolicy, MigrationCompleteness, MigrationDisagreement, MigrationMode,
-    NextAttemptStatus, OpenAdmission, OperationFailure, OwnershipFence, OwnershipStatus,
-    PrecursorLink, QualifiedOpenResult, QualifiedOpenResultBuilder, ReaderObservation,
-    RecordedOwnership, ReopenedFiberState, ReopenedStoreBoundary, ResumeCursor, SessionIndex,
-    StorageEngine, Store, SupersessionStatus, TakeoverProof, TakeoverVerdict, WriteLandingVerdict,
-    MAX_ACTIVE_FIBERS, MAX_STREAM_BYTES, MAX_STREAM_ITEMS,
+    ArtefactLocator, ArtefactPresence, ArtefactReader, AttemptedTransition, CausalChainError,
+    CleanReleaseProof, CreationPlan, CreationProgression, DeathProof, DiagnosticDetail,
+    EventAdmission, FailureCondition, FiberHandle, FiberMigrationPolicy, FiberState,
+    FrameRecoveryCallback, GenerationKnowledge, HistoryIntegrity, IllegalOpenCombination,
+    IllegalStateTransition, IncompleteCreationState, LivenessVerdict, LockedRescuePolicy,
+    MigrationCompleteness, MigrationDisagreement, MigrationMode, OpenAdmission, OperationFailure,
+    OwnershipFence, OwnershipStatus, PrecursorLink, QualifiedOpenResult,
+    QualifiedOpenResultBuilder, ReaderObservation, RecordedOwnership, ReopenedFiberState,
+    ReopenedStoreBoundary, ResumeCursor, SessionIndex, StorageEngine, Store, SupersessionStatus,
+    TakeoverProof, TakeoverVerdict, WriteLandingVerdict, MAX_ACTIVE_FIBERS, MAX_STREAM_BYTES,
+    MAX_STREAM_ITEMS,
 };
-pub use pardosa_derive::PardosaSchema;
+pub use pardosa_derive::{PardosaSchema, PardosaType};
