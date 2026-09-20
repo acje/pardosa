@@ -252,7 +252,7 @@ fn test_m7_symmetric_format_vectors_roundtrip() {
     drop(file_writer);
     for env in &valid_envelopes {
         let mut env_buf = Vec::new();
-        env.encode(&mut env_buf);
+        env.encode(&mut env_buf).unwrap();
         file_adapter
             .append_unvalidated_frame_for_test(&env_buf)
             .expect("append file raw frame");
@@ -278,7 +278,7 @@ fn test_m7_symmetric_format_vectors_roundtrip() {
     drop(nats_writer);
     for env in &valid_envelopes {
         let mut env_buf = Vec::new();
-        env.encode(&mut env_buf);
+        env.encode(&mut env_buf).unwrap();
         nats_adapter
             .append_unvalidated_frame_for_test(&env_buf)
             .expect("append nats raw frame");
@@ -642,7 +642,7 @@ fn test_m7_dimension_3_unreadable_ownership_and_indeterminate_verdict() {
         .expect("create nats writer");
     let env1 = EventEnvelope::genesis([0x01; 16], [0x11; 16], b"clean-frame").unwrap();
     let mut buf1 = Vec::new();
-    env1.encode(&mut buf1);
+    env1.encode(&mut buf1).unwrap();
     let landed = nats_writer.append_frame_verdict(&buf1).expect("verdict");
     assert_eq!(landed, WriteLandingVerdict::Landed(1));
 
@@ -658,7 +658,7 @@ fn test_m7_dimension_3_unreadable_ownership_and_indeterminate_verdict() {
         payload: b"indet-frame".to_vec(),
     };
     let mut buf2 = Vec::new();
-    env2.encode(&mut buf2);
+    env2.encode(&mut buf2).unwrap();
     let undetermined = indet_writer.append_frame_verdict(&buf2).expect("verdict");
     assert_eq!(
         undetermined,
@@ -1085,7 +1085,7 @@ fn test_m7_dimension_7_chain_breaks_and_mismatch_refusal() {
         .append_envelope_verdict(&env1)
         .expect("append env1");
     let mut broken_buf = Vec::new();
-    broken_env.encode(&mut broken_buf);
+    broken_env.encode(&mut broken_buf).unwrap();
     drop(file_writer);
     file_src
         .append_unvalidated_frame_for_test(&broken_buf)
@@ -1173,7 +1173,7 @@ fn test_m7_dimension_8_unanchored_history_and_rolling_commitment() {
     for i in 1..=5 {
         let env = sample_envelope(i);
         let mut env_buf = Vec::new();
-        env.encode(&mut env_buf);
+        env.encode(&mut env_buf).unwrap();
         let mut frame_buf = Vec::new();
         ContainerFrame::encode_payload(&env_buf, &mut frame_buf).unwrap();
         expected_commitment.update_frame(&frame_buf);
@@ -1348,7 +1348,7 @@ fn test_m7_strict_cross_adapter_error_condition_parity() {
         payload: b"broken".to_vec(),
     };
     let mut broken_buf = Vec::new();
-    broken_env.encode(&mut broken_buf);
+    broken_env.encode(&mut broken_buf).unwrap();
     file_adapter
         .append_unvalidated_frame_for_test(&broken_buf)
         .expect("append broken file");
@@ -1499,7 +1499,7 @@ fn test_m7_clean_cancellation_and_shutdown_lock_release() {
 
     let env1 = EventEnvelope::genesis([0x01; 16], [0x22; 16], b"shutdown_frame_1").unwrap();
     let mut buf1 = Vec::new();
-    env1.encode(&mut buf1);
+    env1.encode(&mut buf1).unwrap();
 
     let env2 = EventEnvelope {
         header: EnvelopeHeader {
@@ -1512,7 +1512,7 @@ fn test_m7_clean_cancellation_and_shutdown_lock_release() {
         payload: b"shutdown_frame_2".to_vec(),
     };
     let mut buf2 = Vec::new();
-    env2.encode(&mut buf2);
+    env2.encode(&mut buf2).unwrap();
 
     let file_adapter = FileStorageAdapter::new(dir.path().join("shutdown_file"));
     let mut file_writer_1 = file_adapter

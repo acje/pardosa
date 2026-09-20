@@ -497,7 +497,7 @@ mod tests {
     fn test_session_index_build_from_frames_zero_error_swallowing() {
         let mut env_buf = Vec::new();
         let env1 = EventEnvelope::genesis([0x01; 16], [0x10; 16], b"first").expect("genesis");
-        env1.encode(&mut env_buf);
+        env1.encode(&mut env_buf).unwrap();
 
         let corrupt_short = b"short_frame";
         let err_short = SessionIndex::build_from_frames([corrupt_short.as_slice()]).unwrap_err();
@@ -544,7 +544,7 @@ mod tests {
             payload: vec![],
         };
         let mut broken_buf = Vec::new();
-        broken_env.encode(&mut broken_buf);
+        broken_env.encode(&mut broken_buf).unwrap();
 
         let index_broken =
             SessionIndex::build_from_frames([env_buf.as_slice(), broken_buf.as_slice()]).unwrap();
@@ -693,7 +693,7 @@ mod tests {
         };
 
         let mut frame1 = Vec::new();
-        broken_env.encode(&mut frame1);
+        broken_env.encode(&mut frame1).unwrap();
 
         let index = SessionIndex::build_from_frames([frame1.as_slice()])
             .expect("rebuild succeeds with broken fiber");
@@ -1079,7 +1079,7 @@ mod tests {
             payload: b"first_broken".to_vec(),
         };
         let mut frame1 = Vec::new();
-        broken_env1.encode(&mut frame1);
+        broken_env1.encode(&mut frame1).unwrap();
 
         let index1 = SessionIndex::build_from_frames([frame1.as_slice()])
             .expect("build with single broken frame");
@@ -1096,7 +1096,7 @@ mod tests {
             payload: b"second_broken".to_vec(),
         };
         let mut frame2 = Vec::new();
-        broken_env2.encode(&mut frame2);
+        broken_env2.encode(&mut frame2).unwrap();
 
         let index2 = SessionIndex::build_from_frames([frame1.as_slice(), frame2.as_slice()])
             .expect("build with two broken frames");
@@ -1142,7 +1142,7 @@ mod tests {
                 },
                 payload: Vec::new(),
             };
-            env.encode(&mut frame_data);
+            env.encode(&mut frame_data).unwrap();
         }
 
         let frames: Vec<&[u8]> = frame_data

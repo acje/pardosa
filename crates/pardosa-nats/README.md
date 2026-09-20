@@ -9,7 +9,7 @@ NATS JetStream storage adapter for [Pardosa](https://crates.io/crates/pardosa).
 - **Dual Stream Topology**: Maps each artefact stem to:
   - `{stem}_meta`: Key-value and message stream for ownership claims, monotonic epochs, and generation cutover pointers.
   - `{stem}_data`: Ordered, append-only event stream recording Pardosa container frames.
-- **Single-Writer Fencing & OCC**: Enforces linearizable single-writer ownership using JetStream sequence expectations and monotonic epoch fences. Stale writes and concurrent writers are rejected deterministically via optimistic concurrency control (OCC).
+- **Externally Enforced Single Writer & OCC**: Deployment must maintain one writer per artefact. The adapter checks the metadata epoch separately from the data-subject sequence compare-and-set. Sequence conflicts reject competing appends, but these two operations are not an atomic ownership-and-write fence; concurrent takeover requires external coordination.
 - **Deterministic Subject Routing**: Stream and subject names are derived deterministically from the stem: `{stem}_meta` and `{stem}_data` streams binding `{stem}_meta` and `{stem}_data` subjects, with server expected-stream verification.
 - **Synchronous Session Facade**: Bridges asynchronous JetStream operations into Pardosa's synchronous pipeline contracts via `NatsWriterSession` and `NatsReaderSession`.
 
@@ -22,7 +22,7 @@ use pardosa_nats::NatsStorageAdapter;
 // Connect to NATS JetStream with deterministic stream and subject routing
 let adapter = NatsStorageAdapter::new("nats://127.0.0.1:4222", "tenant_orders")?;
 
-// Create writer session with single-writer fencing epoch
+// Create writer session under externally enforced single-writer ownership
 let claim = OwnershipClaimRecord {
     epoch: 1,
     machine_id: [1u8; 16],

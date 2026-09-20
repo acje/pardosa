@@ -88,7 +88,7 @@ fn test_envelope_conformance_vectors() {
                 assert_eq!(env.payload, expected_utf8.as_bytes());
 
                 let mut enc = Vec::new();
-                env.encode(&mut enc);
+                env.encode(&mut enc).unwrap();
                 assert_eq!(enc, bytes);
             }
             "valid_detached_event" => {
@@ -102,7 +102,7 @@ fn test_envelope_conformance_vectors() {
                 assert_eq!(env.payload, expected_utf8.as_bytes());
 
                 let mut enc = Vec::new();
-                env.encode(&mut enc);
+                env.encode(&mut enc).unwrap();
                 assert_eq!(enc, bytes);
             }
             "invalid_boolean_discriminant_in_envelope" => {
@@ -118,7 +118,7 @@ fn test_envelope_conformance_vectors() {
                 assert_eq!(env.payload.len(), 0);
 
                 let mut enc = Vec::new();
-                env.encode(&mut enc);
+                env.encode(&mut enc).unwrap();
                 assert_eq!(enc, bytes);
             }
             "truncated_envelope_header" => {

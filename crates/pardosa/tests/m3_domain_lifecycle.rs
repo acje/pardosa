@@ -689,6 +689,40 @@ fn test_c5_5_through_16_ownership_and_domain_admissions() {
     );
 }
 
+#[test]
+fn wire_envelope_borrow_and_private_construction() {
+    let positive = r#"
+        use pardosa::encoding::{EventEnvelope, WireEnvelope};
+        fn check(mut raw: EventEnvelope) {
+            WireEnvelope::try_from(&raw).unwrap().encode(&mut Vec::new());
+            raw.payload.push(1);
+            raw.encode(&mut Vec::new()).unwrap();
+        }
+    "#;
+    let (ok, error) = run_rustc(positive);
+    assert!(ok, "{error}");
+    let (ok, error) = run_rustc(
+        r#"
+        use pardosa::encoding::{EventEnvelope, WireEnvelope};
+        fn check(mut raw: EventEnvelope) {
+            let wire = WireEnvelope::try_from(&raw).unwrap();
+            raw.payload.push(1);
+            wire.encode(&mut Vec::new());
+        }
+    "#,
+    );
+    assert!(!ok && error.contains("E0502"), "{error}");
+    let (ok, error) = run_rustc(
+        r#"
+        use pardosa::encoding::{EventEnvelope, WireEnvelope};
+        fn check(raw: &EventEnvelope) {
+            let _ = WireEnvelope { envelope: raw, wire_len: 0 };
+        }
+    "#,
+    );
+    assert!(!ok && error.contains("E0451"), "{error}");
+}
+
 fn run_rustc(code: &str) -> (bool, String) {
     use std::io::Write;
 
@@ -1607,7 +1641,7 @@ fn test_m1_integration_with_frames_exact_limit_accepted() {
         payload: vec![0u8; MAX_STREAM_BYTES - 85],
     };
     let mut encoded = Vec::with_capacity(MAX_STREAM_BYTES);
-    env.encode(&mut encoded);
+    env.encode(&mut encoded).unwrap();
     assert_eq!(encoded.len(), MAX_STREAM_BYTES);
     let frame = ContainerFrame::new(encoded);
     let res = ArtefactReader::with_frames("integration-exact-64mib", vec![frame], |reader| {
@@ -1928,10 +1962,10 @@ fn test_for_each_envelope_refuses_broken_chain_and_stops_delivery() {
     e2_broken.header.precursor = [99u8; 16];
 
     let mut env1_bytes = Vec::new();
-    e1.encode(&mut env1_bytes);
+    e1.encode(&mut env1_bytes).unwrap();
 
     let mut env2_bytes = Vec::new();
-    e2_broken.encode(&mut env2_bytes);
+    e2_broken.encode(&mut env2_bytes).unwrap();
 
     engine.append_block(&env1_bytes).unwrap();
     engine.append_block(&env2_bytes).unwrap();
@@ -1960,9 +1994,9 @@ fn test_for_each_envelope_consumer_callback_error_does_not_poison_reader_session
     let e2 = EventEnvelope::chain(&e1, [2u8; 16], b"payload-2").unwrap();
 
     let mut env1_bytes = Vec::new();
-    e1.encode(&mut env1_bytes);
+    e1.encode(&mut env1_bytes).unwrap();
     let mut env2_bytes = Vec::new();
-    e2.encode(&mut env2_bytes);
+    e2.encode(&mut env2_bytes).unwrap();
 
     engine.append_block(&env1_bytes).unwrap();
     engine.append_block(&env2_bytes).unwrap();
@@ -2012,7 +2046,7 @@ fn test_for_each_envelope_transport_unavailable_does_not_poison_reader_session()
     let fiber = [0x77; 16];
     let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"payload-1").unwrap();
     let mut env1_bytes = Vec::new();
-    e1.encode(&mut env1_bytes);
+    e1.encode(&mut env1_bytes).unwrap();
     engine.append_block(&env1_bytes).unwrap();
 
     let mut store = Store::open_reader(engine);
@@ -2045,7 +2079,7 @@ fn test_for_each_envelope_positive_corruption_poisons_reader_session_terminally(
     let fiber = [0x66; 16];
     let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"payload-1").unwrap();
     let mut env1_bytes = Vec::new();
-    e1.encode(&mut env1_bytes);
+    e1.encode(&mut env1_bytes).unwrap();
     engine.append_block(&env1_bytes).unwrap();
     engine.append_block(b"short-corrupt-frame").unwrap();
 
@@ -2081,7 +2115,7 @@ fn test_m3_consumer_callback_returning_precursor_chain_broken_does_not_poison_re
     let fiber = [0x44; 16];
     let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"payload-1").unwrap();
     let mut env1_bytes = Vec::new();
-    e1.encode(&mut env1_bytes);
+    e1.encode(&mut env1_bytes).unwrap();
     engine.append_block(&env1_bytes).unwrap();
 
     let mut store = Store::open_reader(engine);
@@ -2111,7 +2145,7 @@ fn test_m14_session_index_refuses_when_reader_retains_broken_state() {
     let fiber = [0x33; 16];
     let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"payload-1").unwrap();
     let mut env1_bytes = Vec::new();
-    e1.encode(&mut env1_bytes);
+    e1.encode(&mut env1_bytes).unwrap();
     engine.append_block(&env1_bytes).unwrap();
     engine.append_block(b"broken-frame").unwrap();
 
@@ -2134,7 +2168,7 @@ fn test_h1_open_reader_with_transport_unavailable_refuses_point_lookups_and_reco
     let fiber = [0x22; 16];
     let e1 = EventEnvelope::genesis([1u8; 16], fiber, b"payload-h1").unwrap();
     let mut env1_bytes = Vec::new();
-    e1.encode(&mut env1_bytes);
+    e1.encode(&mut env1_bytes).unwrap();
 
     let engine = MockEngine {
         blocks: vec![env1_bytes],

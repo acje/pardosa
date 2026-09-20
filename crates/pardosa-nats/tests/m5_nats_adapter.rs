@@ -144,7 +144,7 @@ fn test_m5_format_vectors_roundtrip_on_nats_adapter() {
                 .expect("create writer");
             drop(writer);
             let mut env_buf = Vec::new();
-            env.encode(&mut env_buf);
+            env.encode(&mut env_buf).unwrap();
             adapter
                 .append_unvalidated_frame_for_test(&env_buf)
                 .expect("append raw frame");
@@ -250,7 +250,7 @@ fn test_m5_nats_indeterminate_landing_verdict() {
         .expect("create writer");
     let env1 = EventEnvelope::genesis([0x01; 16], [0xaa; 16], b"event-1").unwrap();
     let mut buf1 = Vec::new();
-    env1.encode(&mut buf1);
+    env1.encode(&mut buf1).unwrap();
     let landed = writer.append_frame_verdict(&buf1).expect("verdict");
     assert_eq!(landed, WriteLandingVerdict::Landed(1));
 
@@ -266,7 +266,7 @@ fn test_m5_nats_indeterminate_landing_verdict() {
         payload: b"event-2".to_vec(),
     };
     let mut buf2 = Vec::new();
-    env2.encode(&mut buf2);
+    env2.encode(&mut buf2).unwrap();
     let indet = writer_sim.append_frame_verdict(&buf2).expect("verdict");
     assert_eq!(
         indet,

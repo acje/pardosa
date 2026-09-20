@@ -458,71 +458,82 @@ fn test_v21_schema_descriptor_golden_wire_bytes_and_persistence() {
 
 fn run_rustc(code: &str) -> (bool, String) {
     use std::io::Write;
-    use std::process::Command;
-
-    let deps_dir = std::env::current_exe()
-        .expect("current test executable")
-        .parent()
-        .expect("parent deps directory")
-        .to_path_buf();
-
-    let entries = std::fs::read_dir(&deps_dir)
-        .unwrap_or_else(|e| panic!("failed to read deps dir {}: {e}", deps_dir.display()));
-    let mut rlibs = Vec::new();
-    for entry in entries {
-        let entry =
-            entry.unwrap_or_else(|e| panic!("failed to read entry in {}: {e}", deps_dir.display()));
-        let p = entry.path();
-        if let Some(s) = p.file_name().and_then(|n| n.to_str()) {
-            if s.starts_with("libpardosa-") && s.ends_with(".rlib") {
-                rlibs.push(p.clone());
-            }
+    use std::process::{Command, Stdio};
+    use std::sync::OnceLock;
+    static ARTIFACT: OnceLock<std::path::PathBuf> = OnceLock::new();
+    let artifact = ARTIFACT.get_or_init(|| {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let mut command = Command::new(env!("CARGO"));
+        command
+            .args([
+                "build",
+                "--locked",
+                "--lib",
+                "--message-format=json",
+                "--manifest-path",
+            ])
+            .arg(&manifest)
+            .args(["-p", env!("CARGO_PKG_NAME")]);
+        if cfg!(not(debug_assertions)) {
+            command.arg("--release");
         }
-    }
-    let rlib = match rlibs.len() {
-        0 => panic!(
-            "could not locate libpardosa rlib in deps directory: {}",
-            deps_dir.display()
-        ),
-        1 => rlibs.remove(0),
-        _ => {
-            rlibs.sort_by_key(|p| {
-                std::fs::metadata(p)
-                    .and_then(|m| m.modified())
-                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-            });
-            rlibs.pop().unwrap()
-        }
-    };
-
-    let rustc_cmd = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-    let mut cmd = Command::new(&rustc_cmd);
-    cmd.arg("--edition")
-        .arg("2021")
-        .arg("-L")
-        .arg(&deps_dir)
+        let output = command.output().expect("build package proof artifact");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let records: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("Cargo JSON"))
+            .collect();
+        let matches: Vec<_> = records
+            .iter()
+            .filter(|r| {
+                r["reason"] == "compiler-artifact"
+                    && r["manifest_path"].as_str() == manifest.to_str()
+                    && r["target"]["name"] == "pardosa"
+                    && r["target"]["kind"] == serde_json::json!(["lib"])
+                    && r["features"] == serde_json::json!(["default", "uuid"])
+            })
+            .collect();
+        assert_eq!(matches.len(), 1, "exact package/target/features");
+        let paths: Vec<_> = matches[0]["filenames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.as_str())
+            .filter(|p| p.ends_with(".rlib"))
+            .collect();
+        assert_eq!(paths.len(), 1);
+        paths[0].into()
+    });
+    let mut child = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+        .args(["--edition=2021", "--crate-type=lib", "--emit=mir=-", "-"])
         .arg("--extern")
-        .arg(format!("pardosa={}", rlib.display()));
-    let mut child = cmd
-        .arg("--crate-type")
-        .arg("lib")
-        .arg("--emit")
-        .arg("mir=-")
-        .arg("-")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
+        .arg(format!("pardosa={}", artifact.display()))
+        .arg("-L")
+        .arg(format!(
+            "dependency={}",
+            artifact.parent().unwrap().join("deps").display()
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn rustc");
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(code.as_bytes())
-            .expect("write code to rustc stdin");
-    }
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(code.as_bytes())
+        .expect("write source");
     let output = child.wait_with_output().expect("wait rustc");
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    (output.status.success(), stderr)
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
 }
 
 #[test]
@@ -952,6 +963,13 @@ fn test_m3_checked_cursor_advancement_composition() {
         after: u8,
     }
 
+    assert_eq!(
+        Option::<BadConsumedType>::decode_type(&[1, 0]).unwrap_err(),
+        DecodeError::TruncatedPayload {
+            expected: usize::MAX,
+            available: 2
+        }
+    );
     let err = ComposedStruct::decode_type(&[0u8; 10]).unwrap_err();
     assert_eq!(
         err,
@@ -969,6 +987,8 @@ fn test_h1_type_depth_const_values() {
     assert_eq!(EventVec::<u32, 10>::TYPE_DEPTH, 1);
     assert_eq!(Option::<Option<u32>>::TYPE_DEPTH, 2);
     assert_eq!(EventVec::<Option<u32>, 10>::TYPE_DEPTH, 2);
+    assert_eq!(EventF32::TYPE_DEPTH, 1);
+    assert_eq!(EventF64::TYPE_DEPTH, 1);
 
     #[derive(PardosaType)]
     struct LeafStruct {
@@ -981,6 +1001,49 @@ fn test_h1_type_depth_const_values() {
         inner: LeafStruct,
     }
     assert_eq!(NestedStruct::TYPE_DEPTH, 2);
+}
+
+#[test]
+fn test_depth_boundary_float_composition() {
+    for leaf in ["EventF32", "EventF64"] {
+        for depth in [16, 17] {
+            let ty = format!(
+                "{}{}{}",
+                "Option<".repeat(depth - 2),
+                leaf,
+                ">".repeat(depth - 2)
+            );
+            let code = format!(
+                "use pardosa::prelude::*; #[derive(PardosaType)] struct Outer {{ value: {ty} }}"
+            );
+            let (ok, stderr) = run_rustc(&code);
+            assert_eq!(ok, depth == 16, "{leaf} depth {depth}: {stderr}");
+            if !ok {
+                assert!(stderr.contains("E0080"), "{stderr}");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_depth_boundary_root_variants() {
+    for shape in [0, 1, 2] {
+        for depth in [16, 17] {
+            let wrappers = depth - if shape == 0 { 1 } else { 2 };
+            let ty = format!("{}u8{}", "Option<".repeat(wrappers), ">".repeat(wrappers));
+            let variant = match shape {
+                0 => format!("Data({ty}) = 1"),
+                1 => format!("Data {{ value: {ty} }} = 1"),
+                _ => format!("Data({ty}, u8) = 1"),
+            };
+            let code = format!("use pardosa::prelude::*; #[derive(PardosaSchema)] #[repr(u8)] #[pardosa(version = 1)] enum Root {{ #[pardosa(tombstone)] Tombstone = 0, {variant} }}");
+            let (ok, stderr) = run_rustc(&code);
+            assert_eq!(ok, depth == 16, "shape {shape} depth {depth}: {stderr}");
+            if !ok {
+                assert!(stderr.contains("E0080"), "{stderr}");
+            }
+        }
+    }
 }
 
 #[test]

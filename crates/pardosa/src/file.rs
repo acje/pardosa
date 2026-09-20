@@ -570,6 +570,14 @@ pub fn compute_claim_wire_len(label_len: usize) -> Result<u32, OperationFailure>
     compute_claim_wire_len_bounded(label_len, u32::MAX as usize)
 }
 
+fn map_completion_create_error(err: std::io::Error) -> OperationFailure {
+    let condition = match err.kind() {
+        std::io::ErrorKind::AlreadyExists => FailureCondition::StoreAlreadyExists,
+        _ => FailureCondition::TransportUnavailable,
+    };
+    OperationFailure::with_source(condition, "failed to create .pgno during completion", err)
+}
+
 impl FileStorageAdapter {
     /// Creates a new file storage adapter from a base path.
     ///
@@ -970,11 +978,20 @@ impl FileStorageAdapter {
         claim: &OwnershipClaimRecord,
     ) -> Result<FileWriterSession, OperationFailure> {
         let presence = self.try_presence()?;
-        if presence != ArtefactPresence::OwnershipRecordOnly {
-            return Err(OperationFailure::new(
-                FailureCondition::StoreAlreadyExists,
-                "artefact creation is not in incomplete state per C5.10",
-            ));
+        match presence {
+            ArtefactPresence::OwnershipRecordOnly => {}
+            ArtefactPresence::None => {
+                return Err(OperationFailure::new(
+                    FailureCondition::NoArtefactExists,
+                    "no ownership record exists for completion",
+                ))
+            }
+            ArtefactPresence::EventDataOnly | ArtefactPresence::Both => {
+                return Err(OperationFailure::new(
+                    FailureCondition::StoreAlreadyExists,
+                    "event data already exists during completion",
+                ))
+            }
         }
 
         let meta = read_meta_records(&self.meta_path)?;
@@ -1008,12 +1025,7 @@ impl FileStorageAdapter {
             .write(true)
             .create_new(true)
             .open(&self.pgno_path)
-            .map_err(|err| {
-                OperationFailure::new(
-                    FailureCondition::StoreAlreadyExists,
-                    format!("failed to create .pgno during completion: {err}"),
-                )
-            })?;
+            .map_err(map_completion_create_error)?;
         let header_bytes = ContainerHeader::new().to_bytes();
         pgno_file.write_all(&header_bytes).map_err(|err| {
             OperationFailure::new(
@@ -2000,6 +2012,81 @@ mod tests {
     }
 
     #[test]
+    fn test_completion_create_error_preserves_denial_and_conflict() {
+        use std::error::Error;
+        for (kind, expected) in [
+            (
+                std::io::ErrorKind::PermissionDenied,
+                FailureCondition::TransportUnavailable,
+            ),
+            (
+                std::io::ErrorKind::TimedOut,
+                FailureCondition::TransportUnavailable,
+            ),
+            (
+                std::io::ErrorKind::AlreadyExists,
+                FailureCondition::StoreAlreadyExists,
+            ),
+        ] {
+            let failure = map_completion_create_error(std::io::Error::new(kind, "already exists"));
+            assert_eq!(failure.condition(), &expected);
+            assert_eq!(
+                failure
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .kind(),
+                kind
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_denied_create_preserves_real_io_error() {
+        use std::error::Error;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = FileStorageAdapter::new(dir.path().join("denied"));
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1; 16],
+            boot_id: [2; 16],
+            process_id: 1,
+            process_start_time_ns: 1,
+            claim_time_ns: 1,
+            operator_label: "fixture".into(),
+        };
+        adapter.create_incomplete_meta_only(&claim).unwrap();
+        let descriptor = AdmittedDescriptor::default_for_test();
+        let mut bytes = Vec::new();
+        descriptor.root().encode(&mut bytes).unwrap();
+        adapter
+            .record_meta_record_for_test(&OwnershipRecord::SchemaDescriptor {
+                schema_version: descriptor.version(),
+                descriptor_bytes: bytes,
+            })
+            .unwrap();
+        let original = std::fs::metadata(dir.path()).unwrap().permissions();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = adapter.complete_creation(&claim);
+        std::fs::set_permissions(dir.path(), original).unwrap();
+        let failure = result.unwrap_err();
+        assert_eq!(failure.condition(), &FailureCondition::TransportUnavailable);
+        assert_eq!(
+            failure
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(!adapter.pgno_path().try_exists().unwrap());
+    }
+
+    #[test]
     fn test_file_session_fiber_handle_and_point_lookup() {
         let temp_dir = tempfile::tempdir().unwrap();
         let stem = temp_dir.path().join("test_fiber_point_lookup");
@@ -2174,7 +2261,7 @@ mod tests {
         let fiber_id = [0x77; 16];
         let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"initial").unwrap();
         let mut gen_bytes = Vec::new();
-        genesis.encode(&mut gen_bytes);
+        genesis.encode(&mut gen_bytes).unwrap();
 
         writer
             .append_frame_verdict(&gen_bytes)
@@ -2192,7 +2279,7 @@ mod tests {
 
         let dup_genesis = EventEnvelope::genesis([0x02; 16], fiber_id, b"dup").unwrap();
         let mut dup_bytes = Vec::new();
-        dup_genesis.encode(&mut dup_bytes);
+        dup_genesis.encode(&mut dup_bytes).unwrap();
 
         let err = writer.append_frame_verdict(&dup_bytes).unwrap_err();
         assert_eq!(
@@ -2214,7 +2301,7 @@ mod tests {
             payload: b"child".to_vec(),
         };
         let mut child_bytes = Vec::new();
-        child.encode(&mut child_bytes);
+        child.encode(&mut child_bytes).unwrap();
 
         writer
             .append_frame_verdict(&child_bytes)
@@ -2252,7 +2339,7 @@ mod tests {
         let fiber_id = [0x55; 16];
         let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"initial").unwrap();
         let mut bytes = Vec::new();
-        genesis.encode(&mut bytes);
+        genesis.encode(&mut bytes).unwrap();
         assert!(bytes.len() >= 85);
         bytes[32] = 2;
         let err = writer
@@ -2299,7 +2386,7 @@ mod tests {
             payload: b"broken-precursor".to_vec(),
         };
         let mut broken_bytes = Vec::new();
-        broken_env.encode(&mut broken_bytes);
+        broken_env.encode(&mut broken_bytes).unwrap();
         drop(writer);
         adapter
             .append_unvalidated_frame_for_test(&broken_bytes)
@@ -2909,6 +2996,10 @@ mod tests {
             claim_time_ns: 2_000_000,
             operator_label: "test-operator".to_string(),
         };
+        assert_eq!(
+            adapter.complete_creation(&claim).unwrap_err().condition(),
+            &FailureCondition::NoArtefactExists
+        );
         adapter.create_incomplete_meta_only(&claim).unwrap();
         let err_complete = adapter.complete_creation(&claim).unwrap_err();
         assert_eq!(

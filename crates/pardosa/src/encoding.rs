@@ -808,13 +808,61 @@ pub struct EventEnvelope {
     pub payload: Vec<u8>,
 }
 
-impl EventEnvelope {
-    /// Encodes this event envelope into 85 + payload_length bytes.
+fn envelope_wire_len(payload_len: usize, limit: usize) -> Result<u32, DecodeError> {
+    payload_len
+        .checked_add(85)
+        .filter(|len| *len <= limit)
+        .and_then(|len| u32::try_from(len).ok())
+        .ok_or(DecodeError::ValueConstraintViolated {
+            constraint: ValueConstraint::TooLong,
+        })
+}
+
+/// An immutable envelope borrow whose complete wire size fits a u32 frame.
+/// Caller-owned allocation capacity and aggregate memory are not bounded.
+#[derive(Debug, Clone, Copy)]
+pub struct WireEnvelope<'a> {
+    envelope: &'a EventEnvelope,
+    wire_len: u32,
+}
+
+impl<'a> TryFrom<&'a EventEnvelope> for WireEnvelope<'a> {
+    type Error = DecodeError;
+
+    fn try_from(envelope: &'a EventEnvelope) -> Result<Self, Self::Error> {
+        Self::bounded(envelope, u32::MAX as usize)
+    }
+}
+
+impl<'a> WireEnvelope<'a> {
+    fn bounded(envelope: &'a EventEnvelope, limit: usize) -> Result<Self, DecodeError> {
+        Ok(Self {
+            envelope,
+            wire_len: envelope_wire_len(envelope.payload.len(), limit)?,
+        })
+    }
+
+    /// Appends validated bytes without revalidation; the borrow prevents mutation.
     pub fn encode(&self, buf: &mut Vec<u8>) {
-        self.header.encode(buf);
-        let payload_len = self.payload.len() as u32;
-        buf.extend_from_slice(&payload_len.to_le_bytes());
-        buf.extend_from_slice(&self.payload);
+        self.envelope.header.encode(buf);
+        buf.extend_from_slice(&(self.wire_len - 85).to_le_bytes());
+        buf.extend_from_slice(&self.envelope.payload);
+    }
+}
+
+impl EventEnvelope {
+    /// Encodes this raw envelope after validating its complete wire size.
+    ///
+    /// # Errors
+    /// Returns `ValueConstraintViolated(TooLong)` if 85 + payload length exceeds
+    /// u32::MAX or overflows usize. The output is unchanged on validation failure.
+    pub fn encode(&self, buf: &mut Vec<u8>) -> Result<(), DecodeError> {
+        self.encode_bounded(buf, u32::MAX as usize)
+    }
+
+    fn encode_bounded(&self, buf: &mut Vec<u8>, limit: usize) -> Result<(), DecodeError> {
+        WireEnvelope::bounded(self, limit)?.encode(buf);
+        Ok(())
     }
 
     /// Decodes an event envelope from wire bytes.
@@ -839,6 +887,7 @@ impl EventEnvelope {
     /// # Errors
     /// Returns [`DecodeError::ValueConstraintViolated`] with [`ValueConstraint::Empty`]
     /// if `event_id` is all zeroes.
+    /// Returns `ValueConstraintViolated(TooLong)` if the complete wire size exceeds u32::MAX.
     pub fn genesis(
         event_id: [u8; 16],
         fiber_id: [u8; 16],
@@ -850,15 +899,7 @@ impl EventEnvelope {
             });
         }
         let payload = payload.into();
-        if payload
-            .len()
-            .checked_add(85)
-            .is_none_or(|len| len > u32::MAX as usize)
-        {
-            return Err(DecodeError::ValueConstraintViolated {
-                constraint: ValueConstraint::TooLong,
-            });
-        }
+        envelope_wire_len(payload.len(), u32::MAX as usize)?;
         Ok(Self {
             header: EnvelopeHeader {
                 event_id,
@@ -876,6 +917,7 @@ impl EventEnvelope {
     /// # Errors
     /// Returns [`DecodeError::ValueConstraintViolated`] with [`ValueConstraint::Empty`]
     /// if `event_id` or `predecessor.header.event_id` is all zeroes.
+    /// Returns `ValueConstraintViolated(TooLong)` if the complete wire size exceeds u32::MAX.
     pub fn chain(
         predecessor: &EventEnvelope,
         event_id: [u8; 16],
@@ -887,15 +929,7 @@ impl EventEnvelope {
             });
         }
         let payload = payload.into();
-        if payload
-            .len()
-            .checked_add(85)
-            .is_none_or(|len| len > u32::MAX as usize)
-        {
-            return Err(DecodeError::ValueConstraintViolated {
-                constraint: ValueConstraint::TooLong,
-            });
-        }
+        envelope_wire_len(payload.len(), u32::MAX as usize)?;
         Ok(Self {
             header: EnvelopeHeader {
                 event_id,
@@ -913,6 +947,7 @@ impl EventEnvelope {
     /// # Errors
     /// Returns [`DecodeError::ValueConstraintViolated`] with [`ValueConstraint::Empty`]
     /// if `event_id` or `predecessor.header.event_id` is all zeroes.
+    /// Returns `ValueConstraintViolated(TooLong)` if the complete wire size exceeds u32::MAX.
     pub fn chain_detached(
         predecessor: &EventEnvelope,
         event_id: [u8; 16],
@@ -924,15 +959,7 @@ impl EventEnvelope {
             });
         }
         let payload = payload.into();
-        if payload
-            .len()
-            .checked_add(85)
-            .is_none_or(|len| len > u32::MAX as usize)
-        {
-            return Err(DecodeError::ValueConstraintViolated {
-                constraint: ValueConstraint::TooLong,
-            });
-        }
+        envelope_wire_len(payload.len(), u32::MAX as usize)?;
         Ok(Self {
             header: EnvelopeHeader {
                 event_id,
@@ -1645,6 +1672,40 @@ pub fn checked_advance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn envelope_wire_admission_size_boundaries() {
+        assert_eq!(
+            envelope_wire_len(u32::MAX as usize - 85, u32::MAX as usize).unwrap(),
+            u32::MAX
+        );
+        assert!(envelope_wire_len(u32::MAX as usize - 84, u32::MAX as usize).is_err());
+        assert!(envelope_wire_len(usize::MAX, u32::MAX as usize).is_err());
+        assert!(envelope_wire_len(u32::MAX as usize - 84, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn envelope_wire_admission_preserves_output_and_rechecks_mutation() {
+        let mut raw = EventEnvelope::genesis([1; 16], [2; 16], [3]).unwrap();
+        let mut output = vec![9];
+        raw.encode_bounded(&mut output, 85).unwrap_err();
+        assert_eq!(output, [9]);
+        raw.encode_bounded(&mut output, 86).unwrap();
+        assert_eq!(output.len(), 87);
+        raw.payload.push(4);
+        let previous = output.clone();
+        raw.encode_bounded(&mut output, 86).unwrap_err();
+        assert_eq!(output, previous);
+        let literal = EventEnvelope {
+            header: raw.header.clone(),
+            payload: vec![],
+        };
+        let view = WireEnvelope::try_from(&literal).unwrap();
+        let mut encoded = Vec::new();
+        view.encode(&mut encoded);
+        assert_eq!(encoded.len(), 85);
+        assert_eq!(EventEnvelope::decode(&encoded).unwrap().0, literal);
+    }
 
     #[test]
     fn test_event_string_valid_and_over_bound() {

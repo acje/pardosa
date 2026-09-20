@@ -223,7 +223,7 @@ fn test_m6_caller_transformation_closure_and_refusal() {
 }
 
 #[test]
-fn test_m6_per_fiber_policies_keep_purge_lock_and_prune() {
+fn test_m6_live_migration_refused_with_populated_single_fiber() {
     let dir = tempfile::tempdir().expect("tempdir");
     let source = FileStorageAdapter::new(dir.path().join("source_policies"));
     let target = FileStorageAdapter::new(dir.path().join("target_policies"));
@@ -257,7 +257,7 @@ fn test_m6_per_fiber_policies_keep_purge_lock_and_prune() {
 }
 
 #[test]
-fn test_m6_dense_rechaining_and_pairwise_order() {
+fn test_m6_live_migration_refused_with_interleaved_fibers() {
     let dir = tempfile::tempdir().expect("tempdir");
     let source = FileStorageAdapter::new(dir.path().join("source_order"));
     let target = FileStorageAdapter::new(dir.path().join("target_order"));
@@ -296,7 +296,7 @@ fn test_m6_dense_rechaining_and_pairwise_order() {
 }
 
 #[test]
-fn test_m6_broken_chain_election_refuse_vs_permit() {
+fn test_m6_broken_history_readable_for_migration_but_live_manager_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
     let source_refuse = FileStorageAdapter::new(dir.path().join("source_refuse"));
     let target_refuse = FileStorageAdapter::new(dir.path().join("target_refuse"));
@@ -323,7 +323,7 @@ fn test_m6_broken_chain_election_refuse_vs_permit() {
     };
     writer.append_envelope_verdict(&env1).expect("append env1");
     let mut broken_buf = Vec::new();
-    broken_env.encode(&mut broken_buf);
+    broken_env.encode(&mut broken_buf).unwrap();
     drop(writer);
     source_refuse
         .append_unvalidated_frame_for_test(&broken_buf)
@@ -392,7 +392,7 @@ fn test_m6_broken_chain_election_refuse_vs_permit() {
 }
 
 #[test]
-fn test_m6_chase_phase_concurrent_source_appends() {
+fn test_m6_live_migration_refusal_recommends_offline_administration() {
     let dir = tempfile::tempdir().expect("tempdir");
     let source = FileStorageAdapter::new(dir.path().join("source_chase"));
     let target = FileStorageAdapter::new(dir.path().join("target_chase"));
@@ -406,7 +406,7 @@ fn test_m6_chase_phase_concurrent_source_appends() {
 }
 
 #[test]
-fn test_m6_transform_failure_retry_does_not_leak_staged_state() {
+fn test_m6_live_migration_refused_before_source_or_target_creation() {
     let dir = tempfile::tempdir().expect("tempdir");
     let source = FileStorageAdapter::new(dir.path().join("source_retry"));
     let target = FileStorageAdapter::new(dir.path().join("target_retry"));
@@ -421,71 +421,82 @@ fn test_m6_transform_failure_retry_does_not_leak_staged_state() {
 
 fn run_rustc(code: &str) -> (bool, String) {
     use std::io::Write;
-    use std::process::Command;
-
-    let deps_dir = std::env::current_exe()
-        .expect("current test executable")
-        .parent()
-        .expect("parent deps directory")
-        .to_path_buf();
-
-    let entries = std::fs::read_dir(&deps_dir)
-        .unwrap_or_else(|e| panic!("failed to read deps dir {}: {e}", deps_dir.display()));
-    let mut rlibs = Vec::new();
-    for entry in entries {
-        let entry =
-            entry.unwrap_or_else(|e| panic!("failed to read entry in {}: {e}", deps_dir.display()));
-        let p = entry.path();
-        if let Some(s) = p.file_name().and_then(|n| n.to_str()) {
-            if s.starts_with("libpardosa-") && s.ends_with(".rlib") {
-                rlibs.push(p.clone());
-            }
+    use std::process::{Command, Stdio};
+    use std::sync::OnceLock;
+    static ARTIFACT: OnceLock<std::path::PathBuf> = OnceLock::new();
+    let artifact = ARTIFACT.get_or_init(|| {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let mut command = Command::new(env!("CARGO"));
+        command
+            .args([
+                "build",
+                "--locked",
+                "--lib",
+                "--message-format=json",
+                "--manifest-path",
+            ])
+            .arg(&manifest)
+            .args(["-p", env!("CARGO_PKG_NAME")]);
+        if cfg!(not(debug_assertions)) {
+            command.arg("--release");
         }
-    }
-    let rlib = match rlibs.len() {
-        0 => panic!(
-            "could not locate libpardosa rlib in deps directory: {}",
-            deps_dir.display()
-        ),
-        1 => rlibs.remove(0),
-        _ => {
-            rlibs.sort_by_key(|p| {
-                std::fs::metadata(p)
-                    .and_then(|m| m.modified())
-                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-            });
-            rlibs.pop().unwrap()
-        }
-    };
-
-    let rustc_cmd = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-    let mut cmd = Command::new(&rustc_cmd);
-    cmd.arg("--edition")
-        .arg("2021")
-        .arg("-L")
-        .arg(&deps_dir)
+        let output = command.output().expect("build package proof artifact");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let records: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("Cargo JSON"))
+            .collect();
+        let matches: Vec<_> = records
+            .iter()
+            .filter(|r| {
+                r["reason"] == "compiler-artifact"
+                    && r["manifest_path"].as_str() == manifest.to_str()
+                    && r["target"]["name"] == "pardosa"
+                    && r["target"]["kind"] == serde_json::json!(["lib"])
+                    && r["features"] == serde_json::json!(["default", "uuid"])
+            })
+            .collect();
+        assert_eq!(matches.len(), 1, "exact package/target/features");
+        let paths: Vec<_> = matches[0]["filenames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.as_str())
+            .filter(|p| p.ends_with(".rlib"))
+            .collect();
+        assert_eq!(paths.len(), 1);
+        paths[0].into()
+    });
+    let mut child = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+        .args(["--edition=2021", "--crate-type=lib", "--emit=mir=-", "-"])
         .arg("--extern")
-        .arg(format!("pardosa={}", rlib.display()));
-    let mut child = cmd
-        .arg("--crate-type")
-        .arg("lib")
-        .arg("--emit")
-        .arg("mir=-")
-        .arg("-")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
+        .arg(format!("pardosa={}", artifact.display()))
+        .arg("-L")
+        .arg(format!(
+            "dependency={}",
+            artifact.parent().unwrap().join("deps").display()
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn rustc");
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(code.as_bytes())
-            .expect("write code to rustc stdin");
-    }
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(code.as_bytes())
+        .expect("write source");
     let output = child.wait_with_output().expect("wait rustc");
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    (output.status.success(), stderr)
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
 }
 
 #[test]

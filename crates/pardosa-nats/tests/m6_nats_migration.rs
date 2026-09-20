@@ -208,7 +208,7 @@ fn test_m6_nats_broken_chain_election() {
     };
     writer.append_envelope_verdict(&env1).expect("append env1");
     let mut broken_buf = Vec::new();
-    broken_env.encode(&mut broken_buf);
+    broken_env.encode(&mut broken_buf).unwrap();
     drop(writer);
     source
         .append_unvalidated_frame_for_test(&broken_buf)

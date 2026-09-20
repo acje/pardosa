@@ -233,9 +233,9 @@ fn test_m4_readonly_open_concurrent_with_writer() {
     let frames2 = reader2.read_all_frames().expect("reader2 read all");
 
     let mut env1_buf = Vec::new();
-    env1.encode(&mut env1_buf);
+    env1.encode(&mut env1_buf).unwrap();
     let mut env2_buf = Vec::new();
-    env2.encode(&mut env2_buf);
+    env2.encode(&mut env2_buf).unwrap();
 
     assert_eq!(frames1.len(), 2);
     assert_eq!(frames1[0], env1_buf);
@@ -307,7 +307,7 @@ fn test_m4_incomplete_creation_and_orphan() {
         .expect("create normal");
     let env_orphan = EventEnvelope::genesis([2; 16], [3; 16], b"orphan-data").unwrap();
     let mut env_orphan_buf = Vec::new();
-    env_orphan.encode(&mut env_orphan_buf);
+    env_orphan.encode(&mut env_orphan_buf).unwrap();
     orphan_writer
         .append_envelope_verdict(&env_orphan)
         .expect("append");
@@ -346,7 +346,7 @@ fn test_m4_per_landing_epoch_verification() {
         .expect("create writer epoch 1");
     let env1 = EventEnvelope::genesis([1; 16], [2; 16], b"frame-at-epoch-1").unwrap();
     let mut env1_buf = Vec::new();
-    env1.encode(&mut env1_buf);
+    env1.encode(&mut env1_buf).unwrap();
     writer
         .append_envelope_verdict(&env1)
         .expect("first append at epoch 1");
@@ -540,7 +540,7 @@ fn test_m4_format_vectors_roundtrip_on_filesystem_adapter() {
                 .expect("create writer");
             drop(writer);
             let mut env_buf = Vec::new();
-            env.encode(&mut env_buf);
+            env.encode(&mut env_buf).unwrap();
             adapter
                 .append_unvalidated_frame_for_test(&env_buf)
                 .expect("append raw frame");

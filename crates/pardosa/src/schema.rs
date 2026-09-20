@@ -1448,7 +1448,8 @@ impl<T: PardosaType> PardosaType for Option<T> {
             0x00 => Ok((None, 1)),
             0x01 => {
                 let (val, consumed) = T::decode_type(&buf[1..])?;
-                Ok((Some(val), 1 + consumed))
+                let total = crate::encoding::checked_advance(1, consumed, buf.len())?;
+                Ok((Some(val), total))
             }
             other => Err(DecodeError::InvalidOptionTag { tag: other }),
         }

@@ -434,8 +434,17 @@ impl<E: StorageEngine> Store<E> {
         &mut self,
         envelope: &EventEnvelope,
     ) -> Result<WriteLandingVerdict<u64>, OperationFailure> {
+        let wire = crate::encoding::WireEnvelope::try_from(envelope).map_err(|err| {
+            OperationFailure::with_source(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: crate::encoding::ValueConstraint::TooLong,
+                },
+                "event envelope exceeds frame wire limit",
+                err,
+            )
+        })?;
         let mut env_buf = Vec::new();
-        envelope.encode(&mut env_buf);
+        wire.encode(&mut env_buf);
         self.append_frame_verdict(&env_buf)
     }
 
@@ -452,9 +461,7 @@ impl<E: StorageEngine> Store<E> {
         self.check_session_authority()?;
         let mut handle = self.fiber(fiber_id)?;
         let envelope = handle.append(event_id, payload)?;
-        let mut env_buf = Vec::new();
-        envelope.encode(&mut env_buf);
-        let verdict = self.append_frame_verdict(&env_buf)?;
+        let verdict = self.append_envelope_verdict(&envelope)?;
         match verdict {
             WriteLandingVerdict::Landed(_) => Ok(WriteLandingVerdict::Landed(envelope)),
             WriteLandingVerdict::Undetermined { carried_epoch } => {
@@ -476,9 +483,7 @@ impl<E: StorageEngine> Store<E> {
         self.check_session_authority()?;
         let mut handle = self.fiber(fiber_id)?;
         let envelope = handle.detach(event_id, payload)?;
-        let mut env_buf = Vec::new();
-        envelope.encode(&mut env_buf);
-        let verdict = self.append_frame_verdict(&env_buf)?;
+        let verdict = self.append_envelope_verdict(&envelope)?;
         match verdict {
             WriteLandingVerdict::Landed(_) => Ok(WriteLandingVerdict::Landed(envelope)),
             WriteLandingVerdict::Undetermined { carried_epoch } => {
@@ -500,9 +505,7 @@ impl<E: StorageEngine> Store<E> {
         self.check_session_authority()?;
         let mut handle = self.fiber(fiber_id)?;
         let envelope = handle.rescue(event_id, payload)?;
-        let mut env_buf = Vec::new();
-        envelope.encode(&mut env_buf);
-        let verdict = self.append_frame_verdict(&env_buf)?;
+        let verdict = self.append_envelope_verdict(&envelope)?;
         match verdict {
             WriteLandingVerdict::Landed(_) => Ok(WriteLandingVerdict::Landed(envelope)),
             WriteLandingVerdict::Undetermined { carried_epoch } => {
@@ -1231,7 +1234,7 @@ mod tests {
         let fiber1 = [0x11; 16];
         let gen1_env = EventEnvelope::genesis([0x01; 16], fiber1, b"fiber1-msg1").unwrap();
         let mut gen1 = Vec::new();
-        gen1_env.encode(&mut gen1);
+        gen1_env.encode(&mut gen1).unwrap();
         let mut child1 = Vec::new();
         EventEnvelope {
             header: crate::encoding::EnvelopeHeader {
@@ -1243,7 +1246,8 @@ mod tests {
             },
             payload: b"fiber1-msg2".to_vec(),
         }
-        .encode(&mut child1);
+        .encode(&mut child1)
+        .unwrap();
 
         store.append_frame_verdict(&gen1).expect("append gen1");
         store.append_frame_verdict(&child1).expect("append child1");

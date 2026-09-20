@@ -698,6 +698,21 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
     };
 
     let schema_version = parse_schema_version(input)?;
+    let depth_assertions = data_enum.variants.iter().flat_map(|variant| {
+        let overhead = match &variant.fields {
+            Fields::Unnamed(fields) if fields.unnamed.len() == 1 => 1usize,
+            _ => 2usize,
+        };
+        variant.fields.iter().map(move |field| {
+            let ty = &field.ty;
+            quote! {
+                const _: () = {
+                    let allowed_depth = ::pardosa::schema::MAX_DESCRIPTOR_DEPTH - #overhead;
+                    assert!(<#ty as ::pardosa::schema::PardosaType>::TYPE_DEPTH <= allowed_depth);
+                };
+            }
+        })
+    });
 
     let mut has_tombstone = false;
     let mut variant_data = Vec::with_capacity(data_enum.variants.len());
@@ -1071,6 +1086,7 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
                 }
             }
         }
+        #(#depth_assertions)*
     })
 }
 

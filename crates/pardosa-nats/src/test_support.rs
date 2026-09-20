@@ -36,6 +36,15 @@ impl LiveNatsServer {
         fresh
     }
 
+    /// Starts a private server whose lifetime is independent of the shared fixture.
+    ///
+    /// # Panics
+    /// Panics if the private server cannot start.
+    #[must_use]
+    pub fn isolated() -> Self {
+        Self::spawn().expect("failed to spawn isolated nats-server")
+    }
+
     /// URL of the running server in `nats://127.0.0.1:<port>` format.
     #[must_use]
     pub fn url(&self) -> &str {

@@ -126,10 +126,10 @@
 To independently verify candidate commit `d386fae` against `gh-report` (`868d38b`) without committing sibling path dependencies:
 
 ```bash
-cd /Users/anders.jensen/Documents/github/Mattilsynet/gh-report
+cd /Users/anders.jensen/code/gh-report
 cargo test -p gh-report \
-  --config 'patch."https://github.com/acje/pardosa".pardosa.path="/Users/anders.jensen/Documents/github/Mattilsynet/pardosa/crates/pardosa"' \
-  --config 'patch."https://github.com/acje/pardosa".pardosa-nats.path="/Users/anders.jensen/Documents/github/Mattilsynet/pardosa/crates/pardosa-nats"'
+  --config 'patch."https://github.com/acje/pardosa".pardosa.path="/Users/anders.jensen/code/pardosa/crates/pardosa"' \
+  --config 'patch."https://github.com/acje/pardosa".pardosa-nats.path="/Users/anders.jensen/code/pardosa/crates/pardosa-nats"'
 ```
 
 All 1,366 unit, integration, and doctests pass cleanly (exit 0). Recorded as candidate execution evidence for `868d38b` on `d386fae`.

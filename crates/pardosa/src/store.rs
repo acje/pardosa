@@ -1333,11 +1333,20 @@ impl fmt::Display for FailureCondition {
 }
 
 /// Closed failure type carrying a named condition and Pardosa-owned diagnostic detail per C6.7, C6.9, and C6.11.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct OperationFailure {
     condition: FailureCondition,
     diagnostic_detail: DiagnosticDetail,
+    source: Option<std::sync::Arc<dyn std::error::Error + Send + Sync>>,
 }
+
+impl PartialEq for OperationFailure {
+    fn eq(&self, other: &Self) -> bool {
+        self.condition == other.condition && self.diagnostic_detail == other.diagnostic_detail
+    }
+}
+
+impl Eq for OperationFailure {}
 
 impl OperationFailure {
     /// Creates a new operation failure with a condition and diagnostic detail.
@@ -1346,6 +1355,22 @@ impl OperationFailure {
         Self {
             condition,
             diagnostic_detail: detail.into(),
+            source: None,
+        }
+    }
+
+    /// Creates a failure retaining its typed backend source across clones.
+    /// Equality compares condition and diagnostic detail, excluding the source.
+    #[must_use]
+    pub fn with_source(
+        condition: FailureCondition,
+        detail: impl Into<DiagnosticDetail>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            condition,
+            diagnostic_detail: detail.into(),
+            source: Some(std::sync::Arc::new(source)),
         }
     }
 
@@ -1399,8 +1424,9 @@ impl fmt::Display for OperationFailure {
 
 impl std::error::Error for OperationFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match &self.condition {
-            FailureCondition::PrecursorChainBroken(Some(err)) => Some(err),
+        match (&self.source, &self.condition) {
+            (Some(source), _) => Some(source.as_ref()),
+            (None, FailureCondition::PrecursorChainBroken(Some(err))) => Some(err),
             _ => None,
         }
     }
@@ -2696,7 +2722,7 @@ mod tests {
             payload: vec![1, 2, 3],
         };
         let mut env_bytes = Vec::new();
-        genesis_env.encode(&mut env_bytes);
+        genesis_env.encode(&mut env_bytes).unwrap();
         let frame = crate::file::ContainerFrame::new(env_bytes);
 
         let res = ArtefactReader::with_frames("frame-reader", vec![frame], |reader| {
@@ -2724,7 +2750,7 @@ mod tests {
             payload: vec![1, 2, 3],
         };
         let mut env_bytes = Vec::new();
-        genesis_env.encode(&mut env_bytes);
+        genesis_env.encode(&mut env_bytes).unwrap();
         let mut frame = crate::file::ContainerFrame::new(env_bytes);
         frame.checksum ^= 0xffff_ffff;
 
@@ -2750,7 +2776,7 @@ mod tests {
             payload: vec![1, 2, 3],
         };
         let mut env_bytes = Vec::new();
-        genesis_env.encode(&mut env_bytes);
+        genesis_env.encode(&mut env_bytes).unwrap();
         env_bytes.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
         let frame = crate::file::ContainerFrame::new(env_bytes.clone());
 
@@ -3778,7 +3804,7 @@ mod tests {
                 payload: vec![],
             };
             let mut buf = Vec::new();
-            env.encode(&mut buf);
+            env.encode(&mut buf).unwrap();
             crate::file::ContainerFrame::new(buf)
         });
         let at_limit_res =
@@ -3799,7 +3825,7 @@ mod tests {
                 payload: vec![],
             };
             let mut buf = Vec::new();
-            env.encode(&mut buf);
+            env.encode(&mut buf).unwrap();
             crate::file::ContainerFrame::new(buf)
         });
         let mut invoked = false;
@@ -4045,7 +4071,7 @@ mod tests {
             payload: vec![0u8; MAX_STREAM_BYTES - 85],
         };
         let mut encoded = Vec::with_capacity(MAX_STREAM_BYTES);
-        env.encode(&mut encoded);
+        env.encode(&mut encoded).unwrap();
         assert_eq!(encoded.len(), MAX_STREAM_BYTES);
         let frame = crate::file::ContainerFrame::new(encoded);
         let res = ArtefactReader::with_frames("exact-64mib-frame", vec![frame], |reader| {
@@ -4099,7 +4125,7 @@ mod tests {
         };
         let c1 = env1.commitment();
         let mut enc1 = Vec::new();
-        env1.encode(&mut enc1);
+        env1.encode(&mut enc1).unwrap();
         assert_eq!(enc1.len(), 85 + p1_len);
         let frame1 = crate::file::ContainerFrame::new(enc1);
 
@@ -4115,7 +4141,7 @@ mod tests {
             payload: vec![0u8; p2_len],
         };
         let mut enc2 = Vec::new();
-        env2.encode(&mut enc2);
+        env2.encode(&mut enc2).unwrap();
         assert_eq!(enc2.len(), 85 + p2_len);
         let frame2 = crate::file::ContainerFrame::new(enc2);
 

@@ -185,7 +185,7 @@ fn test_nats_per_landing_epoch_verification_and_stale_epoch() {
 
     let env1 = EventEnvelope::genesis([0x01; 16], [0xaa; 16], b"event-epoch-1").unwrap();
     let mut buf1 = Vec::new();
-    env1.encode(&mut buf1);
+    env1.encode(&mut buf1).unwrap();
 
     let count1 = writer1
         .append_frame_verdict(&buf1)
@@ -208,7 +208,7 @@ fn test_nats_per_landing_epoch_verification_and_stale_epoch() {
         payload: b"stale-event".to_vec(),
     };
     let mut buf_stale = Vec::new();
-    env_stale.encode(&mut buf_stale);
+    env_stale.encode(&mut buf_stale).unwrap();
 
     let stale_err = writer1.append_frame_verdict(&buf_stale).unwrap_err();
     assert_eq!(stale_err.condition(), &FailureCondition::StaleEpoch);
@@ -227,7 +227,7 @@ fn test_nats_per_landing_epoch_verification_and_stale_epoch() {
         payload: b"event-epoch-2".to_vec(),
     };
     let mut buf2 = Vec::new();
-    env2.encode(&mut buf2);
+    env2.encode(&mut buf2).unwrap();
 
     let count2 = writer2
         .append_frame_verdict(&buf2)
@@ -250,7 +250,7 @@ fn test_nats_indeterminate_landing_verdict() {
 
     let env1 = EventEnvelope::genesis([0x01; 16], [0xaa; 16], b"normal-event").unwrap();
     let mut buf1 = Vec::new();
-    env1.encode(&mut buf1);
+    env1.encode(&mut buf1).unwrap();
 
     let verdict = writer
         .append_frame_verdict(&buf1)
@@ -269,7 +269,7 @@ fn test_nats_indeterminate_landing_verdict() {
         payload: b"uncertain-event".to_vec(),
     };
     let mut buf2 = Vec::new();
-    env2.encode(&mut buf2);
+    env2.encode(&mut buf2).unwrap();
     let indet_verdict = indet_writer
         .append_frame_verdict(&buf2)
         .expect("indeterminate append verdict");
@@ -291,7 +291,7 @@ fn test_nats_indeterminate_landing_verdict() {
         payload: b"another-normal-event".to_vec(),
     };
     let mut buf3 = Vec::new();
-    env3.encode(&mut buf3);
+    env3.encode(&mut buf3).unwrap();
     let err = regular_writer
         .append_frame_verdict(&buf3)
         .expect_err("subsequent operations must be rejected while uncertain");
@@ -446,6 +446,10 @@ fn test_nats_complete_creation_validation_and_error_propagation() {
     let stem = unique_stem("complete_creation_val");
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
     let claim_a = sample_claim(1);
+    assert_eq!(
+        adapter.complete_creation(&claim_a).unwrap_err().condition(),
+        &FailureCondition::NoArtefactExists
+    );
 
     adapter
         .create_incomplete_meta_only(&claim_a)
@@ -748,69 +752,81 @@ fn test_nats_reader_capability_no_transport_escape() {
 
 fn run_rustc_nats(code: &str) -> (bool, String) {
     use std::io::Write;
-    use std::process::Command;
-
-    let deps_dir = std::env::current_exe()
-        .expect("current test executable")
-        .parent()
-        .expect("parent deps directory")
-        .to_path_buf();
-
-    let entries = std::fs::read_dir(&deps_dir)
-        .unwrap_or_else(|e| panic!("failed to read deps dir {}: {e}", deps_dir.display()));
-    let mut nats_rlibs = Vec::new();
-    let mut pardosa_rlibs = Vec::new();
-    for entry in entries {
-        let entry = entry.unwrap();
-        let p = entry.path();
-        if let Some(s) = p.file_name().and_then(|n| n.to_str()) {
-            if s.starts_with("libpardosa_nats-") && s.ends_with(".rlib") {
-                nats_rlibs.push(p.clone());
-            } else if s.starts_with("libpardosa-") && s.ends_with(".rlib") {
-                pardosa_rlibs.push(p.clone());
-            }
+    use std::process::{Command, Stdio};
+    use std::sync::OnceLock;
+    static ARTIFACT: OnceLock<std::path::PathBuf> = OnceLock::new();
+    let artifact = ARTIFACT.get_or_init(|| {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let mut command = Command::new(env!("CARGO"));
+        command
+            .args([
+                "build",
+                "--locked",
+                "--lib",
+                "--message-format=json",
+                "--manifest-path",
+            ])
+            .arg(&manifest)
+            .args(["-p", env!("CARGO_PKG_NAME")]);
+        if cfg!(not(debug_assertions)) {
+            command.arg("--release");
         }
-    }
-    nats_rlibs.sort_by_key(|p| {
-        std::fs::metadata(p)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        let output = command.output().expect("build package proof artifact");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let records: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("Cargo JSON"))
+            .collect();
+        let matches: Vec<_> = records
+            .iter()
+            .filter(|r| {
+                r["reason"] == "compiler-artifact"
+                    && r["manifest_path"].as_str() == manifest.to_str()
+                    && r["target"]["name"] == "pardosa_nats"
+                    && r["target"]["kind"] == serde_json::json!(["lib"])
+                    && r["features"] == serde_json::json!(["default"])
+            })
+            .collect();
+        assert_eq!(matches.len(), 1, "exact package/target/features");
+        let paths: Vec<_> = matches[0]["filenames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.as_str())
+            .filter(|p| p.ends_with(".rlib"))
+            .collect();
+        assert_eq!(paths.len(), 1);
+        paths[0].into()
     });
-    pardosa_rlibs.sort_by_key(|p| {
-        std::fs::metadata(p)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-    });
-    let nats_rlib = nats_rlibs.pop().expect("libpardosa_nats rlib");
-    let pardosa_rlib = pardosa_rlibs.pop().expect("libpardosa rlib");
-
-    let rustc_cmd = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-    let mut cmd = Command::new(&rustc_cmd);
-    cmd.arg("--edition")
-        .arg("2021")
+    let mut child = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+        .args(["--edition=2021", "--crate-type=lib", "--emit=mir=-", "-"])
+        .arg("--extern")
+        .arg(format!("pardosa_nats={}", artifact.display()))
         .arg("-L")
-        .arg(&deps_dir)
-        .arg("--extern")
-        .arg(format!("pardosa={}", pardosa_rlib.display()))
-        .arg("--extern")
-        .arg(format!("pardosa_nats={}", nats_rlib.display()))
-        .arg("--crate-type")
-        .arg("lib")
-        .arg("--emit")
-        .arg("mir=-")
-        .arg("-")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
-
-    let mut child = cmd.spawn().expect("spawn rustc");
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(code.as_bytes()).expect("write code");
-    }
+        .arg(format!(
+            "dependency={}",
+            artifact.parent().unwrap().join("deps").display()
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rustc");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(code.as_bytes())
+        .expect("write source");
     let output = child.wait_with_output().expect("wait rustc");
     (
         output.status.success(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
     )
 }
 
@@ -956,7 +972,7 @@ fn test_nats_format_vectors_roundtrip() {
                 .expect("create writer");
             drop(writer);
             let mut env_buf = Vec::new();
-            env.encode(&mut env_buf);
+            env.encode(&mut env_buf).unwrap();
             adapter
                 .append_unvalidated_frame_for_test(&env_buf)
                 .expect("append raw frame");
@@ -1275,7 +1291,7 @@ fn test_nats_append_frame_rejects_malformed_boolean_discriminant() {
     let fiber_id = [0x55; 16];
     let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"initial").unwrap();
     let mut bytes = Vec::new();
-    genesis.encode(&mut bytes);
+    genesis.encode(&mut bytes).unwrap();
     assert!(bytes.len() >= 85);
     bytes[32] = 2;
     let err = writer
@@ -1316,7 +1332,7 @@ fn test_nats_reader_retains_broken_slot_after_read_all_envelopes_error() {
         payload: b"broken-precursor".to_vec(),
     };
     let mut broken_bytes = Vec::new();
-    broken_env.encode(&mut broken_bytes);
+    broken_env.encode(&mut broken_bytes).unwrap();
     drop(writer);
     adapter
         .append_unvalidated_frame_for_test(&broken_bytes)
@@ -1405,7 +1421,7 @@ fn test_nats_append_frame_verdict_envelope_pre_landing_admission_and_refusal() {
     let fiber_id = [0x88; 16];
     let genesis = EventEnvelope::genesis([0x01; 16], fiber_id, b"initial").unwrap();
     let mut gen_bytes = Vec::new();
-    genesis.encode(&mut gen_bytes);
+    genesis.encode(&mut gen_bytes).unwrap();
 
     writer
         .append_frame_verdict(&gen_bytes)
@@ -1414,7 +1430,7 @@ fn test_nats_append_frame_verdict_envelope_pre_landing_admission_and_refusal() {
 
     let dup_genesis = EventEnvelope::genesis([0x02; 16], fiber_id, b"dup").unwrap();
     let mut dup_bytes = Vec::new();
-    dup_genesis.encode(&mut dup_bytes);
+    dup_genesis.encode(&mut dup_bytes).unwrap();
 
     let err = writer.append_frame_verdict(&dup_bytes).unwrap_err();
     assert_eq!(
@@ -1434,7 +1450,7 @@ fn test_nats_append_frame_verdict_envelope_pre_landing_admission_and_refusal() {
         payload: b"child".to_vec(),
     };
     let mut child_bytes = Vec::new();
-    child.encode(&mut child_bytes);
+    child.encode(&mut child_bytes).unwrap();
 
     writer
         .append_frame_verdict(&child_bytes)
@@ -1486,7 +1502,7 @@ fn test_nats_writer_retains_uncertain_diagnostic_on_undetermined_landing() {
 
     let env1 = EventEnvelope::genesis([0x01; 16], [0xaa; 16], b"normal-event").unwrap();
     let mut buf1 = Vec::new();
-    env1.encode(&mut buf1);
+    env1.encode(&mut buf1).unwrap();
     writer
         .append_frame_verdict(&buf1)
         .expect("normal append verdict");
@@ -1504,7 +1520,7 @@ fn test_nats_writer_retains_uncertain_diagnostic_on_undetermined_landing() {
         payload: b"uncertain-event".to_vec(),
     };
     let mut buf2 = Vec::new();
-    env2.encode(&mut buf2);
+    env2.encode(&mut buf2).unwrap();
     let verdict = indet_writer
         .append_frame_verdict(&buf2)
         .expect("indeterminate verdict");
@@ -1533,7 +1549,7 @@ fn test_nats_presend_refusal_does_not_poison_session() {
 
     let env1 = EventEnvelope::genesis([0x01; 16], [0xaa; 16], b"normal-event").unwrap();
     let mut buf1 = Vec::new();
-    env1.encode(&mut buf1);
+    env1.encode(&mut buf1).unwrap();
     writer
         .append_frame_verdict(&buf1)
         .expect("normal append verdict");
@@ -1550,7 +1566,7 @@ fn test_nats_presend_refusal_does_not_poison_session() {
         payload: vec![0x42; 2 * 1024 * 1024],
     };
     let mut oversized_buf = Vec::new();
-    oversized_env.encode(&mut oversized_buf);
+    oversized_env.encode(&mut oversized_buf).unwrap();
     let _err = writer
         .append_frame_verdict(&oversized_buf)
         .expect_err("oversized envelope must be refused pre-send");
@@ -1567,7 +1583,7 @@ fn test_nats_presend_refusal_does_not_poison_session() {
         payload: b"recovery-event".to_vec(),
     };
     let mut buf3 = Vec::new();
-    env3.encode(&mut buf3);
+    env3.encode(&mut buf3).unwrap();
     writer
         .append_frame_verdict(&buf3)
         .expect("subsequent small valid append must succeed after pre-send refusal");
@@ -1710,7 +1726,7 @@ fn test_nats_replay_bounded_batching_exact_order_and_commitment() {
     for seq in 1..=frame_count {
         let env = sample_envelope(seq);
         let mut encoded = Vec::new();
-        env.encode(&mut encoded);
+        env.encode(&mut encoded).unwrap();
         let appended_verdict = writer
             .append_envelope_verdict(&env)
             .expect("append envelope");
