@@ -945,9 +945,11 @@ dependencies = [
 name = "scripts"
 version = "0.1.0"
 dependencies = [
+ "proc-macro2",
  "regex",
  "serde",
  "serde_json",
+ "syn 3.0.5",
 ]
 
 [[package]]
