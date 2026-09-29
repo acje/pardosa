@@ -189,6 +189,10 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 fn collect_enums<'a>(items: &'a [syn::Item], out: &mut Vec<&'a syn::ItemEnum>) {
     for item in items {
+        #[expect(
+            clippy::wildcard_enum_match_arm,
+            reason = "syn::Item has dozens of AST variants"
+        )]
         match item {
             syn::Item::Enum(e) => out.push(e),
             syn::Item::Mod(m) => {

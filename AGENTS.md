@@ -13,23 +13,91 @@ sibling checkout (`Mattilsynet/gh-report`, `docs/trunk-delivery.md`). Local
 specification and source authority remain here. Active adoption work is tracked
 in gh-report's `ghr-hxyqs.66`, alongside Pardosa's existing review records.
 
-After dependency intake, run implementation checks from this repository:
+## Resource Contracts & Bounds (FLEET-RES-01)
+
+Changes to ingestion, buffering, concurrency, retries, recursion, or hot paths
+must define and satisfy explicit resource bounds:
+- **Items and bytes accounted separately**: A bounded channel alone does not bound
+  memory; admit work before unbounded allocation or payload retention.
+- **Permit lifetimes & RAII**: Permits and resource charges must stay alive for the
+  actual resource lifetime, including error paths and cancellations. Release exactly
+  once via RAII.
+- **Admission control**: Work admission must be bounded. If admission waits, bound
+  the number of waiters and what they retain.
+- **Progress, cancellation & shutdown**:
+  - Individual work units, retries, and recursion depth must be bounded.
+  - Service lifetime loops require reachable, supervised shutdown and bounded work
+    between shutdown checks.
+  - Dropping task handles does not cancel asynchronous tasks; use explicit cancellation
+    tokens and await task completion during shutdown.
+- **Atomic file write protocol (CHE-0032)**:
+  All durable state written to disk must use the atomic sequence:
+  `write temporary file` $\rightarrow$ `fsync file` $\rightarrow$ `atomic rename` $\rightarrow$ `fsync parent directory`.
+
+## Verification tiers
+
+Verification is strictly tier-scoped. A claim is backed by the tier whose scope
+matches the claim: sub-missions are backed by MID; epics and releases are backed
+by BOUNDARY.
+
+- **INNER** (every hopper TDD increment and per-review-round re-verification;
+  changed crate ONLY; exit-code criterion: test + clippy exit 0):
+  ```sh
+  CARGO_TERM_PROGRESS_WHEN=never cargo test -p pardosa --locked --message-format=short
+  CARGO_TERM_PROGRESS_WHEN=never cargo clippy -p pardosa --all-targets --locked --message-format=short -- -D warnings
+  ```
+  `--all-targets` is mandatory on clippy to catch test/bench/example lints.
+  `--workspace` and `--all-features` are forbidden at this tier.
+
+- **MID** (once at sub-mission completion before done-claim; changed crates
+  plus their mechanically computed reverse-dependent closure; exit-code criterion:
+  every listed package's test + clippy exit 0):
+  ```sh
+  cargo test -p pardosa -p pardosa-derive -p pardosa-nats --locked
+  cargo clippy -p pardosa -p pardosa-derive -p pardosa-nats --all-targets --locked -- -D warnings
+  cargo fmt --all -- --check
+  ```
+  Compute reverse dependents via `cargo metadata --format-version 1 --no-deps`.
+  `--workspace` is forbidden at this tier; verify stays scoped to affected crates.
+
+- **BOUNDARY** (once per epic before epic done-claim; full workspace; exit 0 across all):
+  ```sh
+  cargo build --workspace --all-features --locked
+  timeout 900 cargo test --workspace --all-features --locked --no-fail-fast
+  cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+  cargo fmt --all -- --check
+  ```
+  - `timeout 900` is mandatory on the test line. Exit 124 is `Outcome::Surprise`,
+    NEVER a test failure. Investigate the stall; do not fold it into a failure count.
+  - `--no-fail-fast` is mandatory on the test line to ensure full blast-radius
+    visibility in a single pass.
+- `cargo deny check` and `cargo audit` are supply-chain gates; run
+  before publishing or bumping dependencies.
+
+## Rustdoc budget gate
+
+Run the same native check from the repository root locally and in CI:
 
 ```sh
-cargo atest -p pardosa --locked
-cargo aclippy -p pardosa --all-targets --locked -- -D warnings
-cargo atest -p pardosa -p pardosa-derive -p pardosa-nats --locked
-cargo aclippy -p pardosa -p pardosa-derive -p pardosa-nats --all-targets --locked -- -D warnings
-cargo fmt --all -- --check
+comment-free --check-doc-budget --doc-advisory-words 80 --doc-max-words 120 --max-warning-files 0 .
 ```
 
-The first pair is INNER; the three-package pair is the current adoption MID
-baseline. Record failures and live-NATS skips explicitly. Retain the root
-`Cargo.lock` as a reproducible producer verification/release input. The fresh
-admission baseline is recorded in gh-report bead `ghr-krvir`; historical
-producer revisions did not track a lock, so this is not historical dependency
-parity. Reassess intake when the lock, selected features, or execution context
-changes.
+Requires comment-free 0.2.0 at the canonical revision below:
+
+```sh
+cargo +1.98.0 install --git https://github.com/acje/comment-free --rev e45de7ef3b0fcd9a1ec299b9026b14fb5b0cf534 --locked comment-free
+```
+
+The read-only native gate recursively scans Rust sources under `.` with the
+tool's build/hidden pruning: 80 prose words is advisory; 120 is enforced.
+Fenced code is excluded by the tool. Summary-only output retains full totals
+while suppressing finding details; diagnostics remain visible.
+Native gate exits are 0 for pass, 1 for enforced breach, and 2 for
+unknown/error, including undecided payloads or empty scope. Policy and its
+implementation/tests/proofs belong upstream; repository checks establish
+integration only. No rewrite mode runs.
+Macro-generated docs without spelled `doc` tokens remain outside detection;
+this is not proof of semantic documentation coverage or process-memory bounds.
 
 ## Resuming the pardosa 1.0 spec work
 

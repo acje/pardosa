@@ -459,16 +459,17 @@ impl SessionIndex {
             Ok(()) => {
                 self.commit_envelope_unchecked(env);
             }
-            Err(err) => match err.condition() {
-                FailureCondition::PrecursorChainBroken(_) => {
+            Err(err) => {
+                if matches!(err.condition(), FailureCondition::PrecursorChainBroken(_)) {
                     self.mark_fiber_broken(
                         env.header.fiber_id,
                         err.diagnostic_detail().message().to_string(),
                     )?;
                     self.record_broken_event_id(env.header.fiber_id, env.header.event_id)?;
+                } else {
+                    return Err(err);
                 }
-                _ => return Err(err),
-            },
+            }
         }
         Ok(())
     }

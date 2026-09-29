@@ -226,10 +226,12 @@ impl FiberState {
     ) -> Result<Self, IllegalStateTransition> {
         match self {
             Self::Locked => Ok(Self::Defined),
-            _ => Err(IllegalStateTransition {
-                from: *self,
-                attempted: AttemptedTransition::Rescue,
-            }),
+            Self::Undefined | Self::Defined | Self::Detached | Self::Purged => {
+                Err(IllegalStateTransition {
+                    from: *self,
+                    attempted: AttemptedTransition::Rescue,
+                })
+            }
         }
     }
 
@@ -2663,7 +2665,7 @@ mod tests {
 
         ArtefactReader::with_stream(
             "test-stream",
-            vec![genesis_env.clone(), event_env.clone()],
+            vec![genesis_env.clone(), event_env],
             |reader| {
                 let obs1 = reader
                     .read_event()
@@ -2695,18 +2697,14 @@ mod tests {
             },
             payload: vec![],
         };
-        ArtefactReader::with_stream(
-            "bad-stream",
-            vec![genesis_env.clone(), bad_event],
-            |reader| {
-                assert!(reader.read_event().expect("genesis").is_ok());
-                let err = reader.read_event().expect("bad event").unwrap_err();
-                assert_eq!(
-                    err.condition(),
-                    &FailureCondition::PrecursorChainBroken(None)
-                );
-            },
-        );
+        ArtefactReader::with_stream("bad-stream", vec![genesis_env, bad_event], |reader| {
+            assert!(reader.read_event().expect("genesis").is_ok());
+            let err = reader.read_event().expect("bad event").unwrap_err();
+            assert_eq!(
+                err.condition(),
+                &FailureCondition::PrecursorChainBroken(None)
+            );
+        });
     }
 
     #[test]
@@ -2944,11 +2942,7 @@ mod tests {
 
         ArtefactReader::with_stream(
             "stream-wrong-fiber",
-            vec![
-                genesis_fiber1.clone(),
-                genesis_fiber2.clone(),
-                wrong_fiber_event,
-            ],
+            vec![genesis_fiber1.clone(), genesis_fiber2, wrong_fiber_event],
             |reader| {
                 assert!(reader.read_event().expect("first").is_ok());
                 assert!(reader.read_event().expect("second").is_ok());
@@ -3910,7 +3904,7 @@ mod tests {
 
         ArtefactReader::with_stream(
             "dup-cross-fiber",
-            vec![genesis_env.clone(), dup_other_fiber],
+            vec![genesis_env, dup_other_fiber],
             |reader| {
                 let obs1 = reader
                     .read_event()

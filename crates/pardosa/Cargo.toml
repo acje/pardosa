@@ -11,6 +11,9 @@ rust-version = "1.89.0"
 keywords = ["event-store", "eventsourcing", "storage", "schema", "linearizable"]
 categories = ["database-implementations", "data-structures"]
 
+[lints]
+workspace = true
+
 [dependencies]
 pardosa-derive = { version = "0.5.5", path = "../pardosa-derive" }
 crc32c = "0.6"

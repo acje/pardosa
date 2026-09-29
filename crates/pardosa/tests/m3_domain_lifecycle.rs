@@ -1,7 +1,9 @@
 #![allow(deprecated)]
+#![allow(clippy::pedantic)]
 
 use pardosa::prelude::*;
 use std::process::Command;
+use std::sync::Arc;
 
 #[test]
 fn test_c6_1_fiber_lifecycle_transitions() {
@@ -2040,7 +2042,7 @@ fn test_for_each_envelope_consumer_callback_error_does_not_poison_reader_session
 fn test_for_each_envelope_transport_unavailable_does_not_poison_reader_session() {
     let fail_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut engine = MockEngine {
-        fail_reads_with_transport_unavailable: fail_flag.clone(),
+        fail_reads_with_transport_unavailable: Arc::clone(&fail_flag),
         ..Default::default()
     };
     let fiber = [0x77; 16];
@@ -2172,7 +2174,7 @@ fn test_h1_open_reader_with_transport_unavailable_refuses_point_lookups_and_reco
 
     let engine = MockEngine {
         blocks: vec![env1_bytes],
-        fail_reads_with_transport_unavailable: fail_flag.clone(),
+        fail_reads_with_transport_unavailable: Arc::clone(&fail_flag),
         ..Default::default()
     };
 

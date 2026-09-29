@@ -1,3 +1,5 @@
+#![allow(clippy::pedantic)]
+
 use pardosa::file::FileStorageAdapter;
 use pardosa::migration::*;
 use pardosa::prelude::*;
@@ -167,7 +169,7 @@ fn test_m6_migration_cross_adapter_file_to_nats() {
     let env1 = sample_genesis_envelope(1, 0x77, b"cross_data");
     writer.append_envelope_verdict(&env1).expect("append cross");
 
-    let err_mgr = MigrationManager::new(source.clone(), target.clone()).unwrap_err();
+    let err_mgr = MigrationManager::new(source, target.clone()).unwrap_err();
     assert_eq!(
         *err_mgr.condition(),
         FailureCondition::InvariantBreakingConfiguration

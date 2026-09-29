@@ -1,3 +1,5 @@
+#![allow(clippy::pedantic)]
+
 use pardosa::file::FileStorageAdapter;
 use pardosa::migration::*;
 use pardosa::prelude::*;
@@ -53,7 +55,7 @@ fn test_m6_live_migration_manager_and_freeze_refused() {
     let source = FileStorageAdapter::new(dir.path().join("source"));
     let target = FileStorageAdapter::new(dir.path().join("target"));
 
-    let err_new = MigrationManager::new(source.clone(), target.clone()).unwrap_err();
+    let err_new = MigrationManager::new(source, target).unwrap_err();
     assert_eq!(
         *err_new.condition(),
         FailureCondition::InvariantBreakingConfiguration
@@ -64,7 +66,9 @@ fn test_m6_live_migration_manager_and_freeze_refused() {
 #[test]
 fn test_compile_fail_migration_new_for_test_removed() {
     let code = r#"
-        use pardosa::file::FileStorageAdapter;
+#![allow(clippy::pedantic)]
+
+use pardosa::file::FileStorageAdapter;
         use pardosa::migration::MigrationManager;
 
         pub fn check() {
@@ -204,7 +208,7 @@ fn test_m6_caller_transformation_closure_and_refusal() {
     let env1 = sample_genesis_envelope(1, 0xaa, b"input_data");
     writer.append_envelope_verdict(&env1).expect("append 1");
 
-    let err = MigrationManager::new(source.clone(), target.clone()).unwrap_err();
+    let err = MigrationManager::new(source.clone(), target).unwrap_err();
     assert_eq!(
         *err.condition(),
         FailureCondition::InvariantBreakingConfiguration
@@ -248,7 +252,7 @@ fn test_m6_live_migration_refused_with_populated_single_fiber() {
     writer.append_envelope_verdict(&a2).expect("append a2");
     writer.append_envelope_verdict(&a3).expect("append a3");
 
-    let err = MigrationManager::new(source.clone(), target.clone()).unwrap_err();
+    let err = MigrationManager::new(source.clone(), target).unwrap_err();
     assert_eq!(
         *err.condition(),
         FailureCondition::InvariantBreakingConfiguration
@@ -287,7 +291,7 @@ fn test_m6_live_migration_refused_with_interleaved_fibers() {
     writer.append_envelope_verdict(&b2).expect("append");
     writer.append_envelope_verdict(&a3).expect("append");
 
-    let err = MigrationManager::new(source.clone(), target.clone()).unwrap_err();
+    let err = MigrationManager::new(source.clone(), target).unwrap_err();
     assert_eq!(
         *err.condition(),
         FailureCondition::InvariantBreakingConfiguration
@@ -329,8 +333,7 @@ fn test_m6_broken_history_readable_for_migration_but_live_manager_refused() {
         .append_unvalidated_frame_for_test(&broken_buf)
         .expect("append broken raw frame");
 
-    let err_refuse =
-        MigrationManager::new(source_refuse.clone(), target_refuse.clone()).unwrap_err();
+    let err_refuse = MigrationManager::new(source_refuse.clone(), target_refuse).unwrap_err();
     assert_eq!(
         *err_refuse.condition(),
         FailureCondition::InvariantBreakingConfiguration
@@ -383,8 +386,7 @@ fn test_m6_broken_history_readable_for_migration_but_live_manager_refused() {
         FailureCondition::PrecursorChainBroken(_)
     ));
 
-    let err_permit =
-        MigrationManager::new(source_permit.clone(), target_permit.clone()).unwrap_err();
+    let err_permit = MigrationManager::new(source_permit, target_permit).unwrap_err();
     assert_eq!(
         *err_permit.condition(),
         FailureCondition::InvariantBreakingConfiguration
@@ -397,7 +399,7 @@ fn test_m6_live_migration_refusal_recommends_offline_administration() {
     let source = FileStorageAdapter::new(dir.path().join("source_chase"));
     let target = FileStorageAdapter::new(dir.path().join("target_chase"));
 
-    let err = MigrationManager::new(source.clone(), target.clone()).unwrap_err();
+    let err = MigrationManager::new(source, target).unwrap_err();
     assert_eq!(
         *err.condition(),
         FailureCondition::InvariantBreakingConfiguration
@@ -411,7 +413,7 @@ fn test_m6_live_migration_refused_before_source_or_target_creation() {
     let source = FileStorageAdapter::new(dir.path().join("source_retry"));
     let target = FileStorageAdapter::new(dir.path().join("target_retry"));
 
-    let err = MigrationManager::new(source.clone(), target.clone()).unwrap_err();
+    let err = MigrationManager::new(source, target).unwrap_err();
     assert_eq!(
         *err.condition(),
         FailureCondition::InvariantBreakingConfiguration

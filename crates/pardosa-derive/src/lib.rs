@@ -699,6 +699,10 @@ fn expand_pardosa_schema(input: &DeriveInput) -> syn::Result<proc_macro2::TokenS
 
     let schema_version = parse_schema_version(input)?;
     let depth_assertions = data_enum.variants.iter().flat_map(|variant| {
+        #[expect(
+            clippy::wildcard_enum_match_arm,
+            reason = "syn AST expression/type variants"
+        )]
         let overhead = match &variant.fields {
             Fields::Unnamed(fields) if fields.unnamed.len() == 1 => 1usize,
             _ => 2usize,
@@ -1148,6 +1152,10 @@ fn check_tombstone_attr(attrs: &[Attribute]) -> syn::Result<bool> {
     Ok(false)
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "syn AST expression/type variants"
+)]
 fn parse_discriminant_value(expr: &Expr) -> syn::Result<u32> {
     match expr {
         Expr::Lit(ExprLit {
@@ -1161,6 +1169,10 @@ fn parse_discriminant_value(expr: &Expr) -> syn::Result<u32> {
     }
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "syn AST expression/type variants"
+)]
 fn check_type_for_issues(ty: &Type, enum_name: &syn::Ident) -> syn::Result<()> {
     match ty {
         Type::Path(type_path) => {

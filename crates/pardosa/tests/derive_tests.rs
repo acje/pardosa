@@ -1,3 +1,6 @@
+#![allow(clippy::pedantic)]
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use pardosa::prelude::*;
 
 #[derive(Debug, PartialEq, Eq, PardosaSchema)]

@@ -1,4 +1,5 @@
 #![allow(deprecated)]
+#![allow(clippy::pedantic)]
 
 use pardosa::prelude::*;
 use std::fs;
@@ -1131,7 +1132,7 @@ fn test_file_open_write_both_missing_descriptor_fails_closed() {
         .write_all(&ContainerHeader::new().to_bytes())
         .expect("write meta header");
     let mut claim_bytes = Vec::new();
-    OwnershipRecord::OwnershipClaim(claim.clone()).encode(&mut claim_bytes);
+    OwnershipRecord::OwnershipClaim(claim).encode(&mut claim_bytes);
     let mut claim_frame = Vec::new();
     ContainerFrame::encode_payload(&claim_bytes, &mut claim_frame).unwrap();
     meta_file
@@ -1175,7 +1176,7 @@ fn test_file_open_write_both_persisted_invalid_descriptor_fails_closed() {
         .write_all(&ContainerHeader::new().to_bytes())
         .expect("write meta header");
     let mut claim_bytes = Vec::new();
-    OwnershipRecord::OwnershipClaim(claim.clone()).encode(&mut claim_bytes);
+    OwnershipRecord::OwnershipClaim(claim).encode(&mut claim_bytes);
     let mut claim_frame = Vec::new();
     ContainerFrame::encode_payload(&claim_bytes, &mut claim_frame).unwrap();
     meta_file

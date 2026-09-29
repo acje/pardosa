@@ -2,6 +2,7 @@
 .dolt/
 *.db
 .beads-credential-key
+*.pem
 .beads/proxieddb/
 .beads.gate.lock
 

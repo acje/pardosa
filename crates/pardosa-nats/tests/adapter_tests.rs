@@ -1,4 +1,5 @@
 #![allow(deprecated)]
+#![allow(clippy::pedantic)]
 
 use pardosa::prelude::*;
 use pardosa_nats::test_support::LiveNatsServer;
@@ -650,7 +651,7 @@ fn test_nats_interleaved_open_coherent_snapshot() {
     };
 
     let handle_a = {
-        let barrier = barrier.clone();
+        let barrier = Arc::clone(&barrier);
         let adapter = adapter_clone.clone();
         let env_a = env_a.clone();
         thread::spawn(move || {
@@ -662,7 +663,7 @@ fn test_nats_interleaved_open_coherent_snapshot() {
     };
 
     let handle_b = {
-        let barrier = barrier.clone();
+        let barrier = barrier;
         let adapter = adapter_clone;
         let env_b = env_b.clone();
         thread::spawn(move || {
@@ -2263,7 +2264,7 @@ fn test_nats_from_client_internal_no_nested_block_on() {
     let server = LiveNatsServer::acquire();
     let stem = unique_stem("no_nested_block_on");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("tokio runtime"));
-    let rt_clone = rt.clone();
+    let rt_clone = Arc::clone(&rt);
     let server_url = server.url().to_string();
 
     let adapter = rt.block_on(async move {
@@ -2876,12 +2877,12 @@ fn test_nats_adapter_create_oversized_claim_rejected_without_creating_streams() 
     let err = adapter
         .create_with_claim_bound(&claim, &sample_descriptor(), 100)
         .expect_err("oversized claim must be rejected");
-    match err.condition() {
-        FailureCondition::ValueConstraintViolated { constraint } => {
-            assert_eq!(constraint, &ValueConstraint::TooLong);
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::ValueConstraintViolated {
+            constraint: ValueConstraint::TooLong,
         }
-        other => panic!("expected ValueConstraintViolated, got {other:?}"),
-    }
+    );
     assert_eq!(
         adapter.try_presence().unwrap(),
         ArtefactPresence::None,

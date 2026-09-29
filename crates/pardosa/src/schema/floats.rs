@@ -267,9 +267,11 @@ impl TryFrom<EventF32> for OrderedF32 {
     fn try_from(v: EventF32) -> Result<Self, Self::Error> {
         match v {
             EventF32::Finite(inner) => Ok(inner),
-            _ => Err(DecodeError::ValueConstraintViolated {
-                constraint: ValueConstraint::NotReal,
-            }),
+            EventF32::NaN | EventF32::NegInf | EventF32::PosInf => {
+                Err(DecodeError::ValueConstraintViolated {
+                    constraint: ValueConstraint::NotReal,
+                })
+            }
         }
     }
 }
@@ -419,9 +421,11 @@ impl TryFrom<EventF64> for OrderedF64 {
     fn try_from(v: EventF64) -> Result<Self, Self::Error> {
         match v {
             EventF64::Finite(inner) => Ok(inner),
-            _ => Err(DecodeError::ValueConstraintViolated {
-                constraint: ValueConstraint::NotReal,
-            }),
+            EventF64::NaN | EventF64::NegInf | EventF64::PosInf => {
+                Err(DecodeError::ValueConstraintViolated {
+                    constraint: ValueConstraint::NotReal,
+                })
+            }
         }
     }
 }

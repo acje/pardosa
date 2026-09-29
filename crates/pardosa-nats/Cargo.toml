@@ -11,6 +11,9 @@ rust-version = "1.89.0"
 keywords = ["pardosa", "nats", "jetstream", "storage", "event-store"]
 categories = ["database-implementations", "asynchronous"]
 
+[lints]
+workspace = true
+
 [dependencies]
 pardosa = { version = "0.5.5", path = "../pardosa" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "net"] }

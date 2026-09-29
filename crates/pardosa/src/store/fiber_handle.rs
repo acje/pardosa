@@ -365,7 +365,10 @@ impl FiberHandle {
                 self.event_count = next_count;
                 Ok(envelope)
             }
-            _ => Err(OperationFailure::new(
+            FiberState::Undefined
+            | FiberState::Detached
+            | FiberState::Purged
+            | FiberState::Locked => Err(OperationFailure::new(
                 FailureCondition::InvariantBreakingConfiguration,
                 format!(
                     "cannot detach fiber in {:?} state; detach is only valid from Defined",
@@ -451,13 +454,15 @@ impl FiberHandle {
                 self.event_count = next_count;
                 Ok(envelope)
             }
-            _ => Err(OperationFailure::new(
-                FailureCondition::InvariantBreakingConfiguration,
-                format!(
-                    "cannot rescue fiber in {:?} state; rescue is only valid from Detached or Locked",
-                    self.state
-                ),
-            )),
+            FiberState::Undefined | FiberState::Defined | FiberState::Purged => {
+                Err(OperationFailure::new(
+                    FailureCondition::InvariantBreakingConfiguration,
+                    format!(
+                        "cannot rescue fiber in {:?} state; rescue is only valid from Detached or Locked",
+                        self.state
+                    ),
+                ))
+            }
         }
     }
 }

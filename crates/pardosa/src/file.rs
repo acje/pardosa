@@ -448,7 +448,7 @@ pub fn read_meta_records(meta_path: &Path) -> Result<MetaRecords, OperationFailu
             OwnershipRecord::RescuePolicyChoice(r) => {
                 records.rescue_policy_choice = Some(r);
             }
-            _ => {}
+            OwnershipRecord::CleanRelease(_) | OwnershipRecord::IdentityStructure(_) => {}
         }
     }
     Ok(records)
@@ -570,6 +570,10 @@ pub fn compute_claim_wire_len(label_len: usize) -> Result<u32, OperationFailure>
     compute_claim_wire_len_bounded(label_len, u32::MAX as usize)
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "std::io::ErrorKind is non-exhaustive"
+)]
 fn map_completion_create_error(err: std::io::Error) -> OperationFailure {
     let condition = match err.kind() {
         std::io::ErrorKind::AlreadyExists => FailureCondition::StoreAlreadyExists,
@@ -1097,7 +1101,7 @@ impl FileStorageAdapter {
                         "artefact append authority permanently retired via outbound pointer per C5.63",
                     ));
                 }
-                let claim = meta.latest_claim.clone().ok_or_else(|| {
+                let claim = meta.latest_claim.ok_or_else(|| {
                     OperationFailure::new(
                         FailureCondition::OwnershipUnestablished,
                         "ownership record unseeded; cannot open writer session without established claim per C5.10",
@@ -2721,7 +2725,7 @@ mod tests {
         perms.set_readonly(true);
         std::fs::set_permissions(meta_writer.meta_path(), perms.clone()).unwrap();
 
-        let dummy_record = OwnershipRecord::OwnershipClaim(claim.clone());
+        let dummy_record = OwnershipRecord::OwnershipClaim(claim);
         let meta_err = adapter_meta
             .record_meta_record_for_test(&dummy_record)
             .expect_err("read-only meta should fail append");
@@ -2774,7 +2778,7 @@ mod tests {
         let borrowed_claim: &OwnershipClaimRecord = writer.claim();
         assert_eq!(borrowed_claim.epoch, 1);
 
-        let mut claim2 = claim.clone();
+        let mut claim2 = claim;
         claim2.epoch = 2;
         append_meta_record(writer.meta_path(), &OwnershipRecord::OwnershipClaim(claim2))
             .expect("append higher epoch");
@@ -2868,7 +2872,7 @@ mod tests {
             .create(&claim, &AdmittedDescriptor::default_for_test())
             .expect("create writer");
 
-        let mut claim2 = claim.clone();
+        let mut claim2 = claim;
         claim2.epoch = 2;
         append_meta_record(writer.meta_path(), &OwnershipRecord::OwnershipClaim(claim2))
             .expect("append higher epoch");
@@ -3079,19 +3083,19 @@ mod tests {
             u32::MAX
         );
         let err_68 = compute_claim_wire_len(u32::MAX as usize - 68).unwrap_err();
-        match err_68.condition() {
-            FailureCondition::ValueConstraintViolated { constraint } => {
-                assert_eq!(constraint, &ValueConstraint::TooLong);
+        assert_eq!(
+            *err_68.condition(),
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
             }
-            other => panic!("expected ValueConstraintViolated, got {other:?}"),
-        }
+        );
         let err_67 = compute_claim_wire_len(u32::MAX as usize - 67).unwrap_err();
-        match err_67.condition() {
-            FailureCondition::ValueConstraintViolated { constraint } => {
-                assert_eq!(constraint, &ValueConstraint::TooLong);
+        assert_eq!(
+            *err_67.condition(),
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
             }
-            other => panic!("expected ValueConstraintViolated, got {other:?}"),
-        }
+        );
     }
 
     #[test]
@@ -3114,12 +3118,12 @@ mod tests {
         let err = adapter
             .create_with_claim_bound(&claim, &desc, 100)
             .expect_err("oversized claim must be rejected");
-        match err.condition() {
-            FailureCondition::ValueConstraintViolated { constraint } => {
-                assert_eq!(constraint, &ValueConstraint::TooLong);
+        assert_eq!(
+            *err.condition(),
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
             }
-            other => panic!("expected ValueConstraintViolated, got {other:?}"),
-        }
+        );
         assert!(!adapter.meta_path().exists(), ".meta file must not exist");
         assert!(!adapter.pgno_path().exists(), ".pgno file must not exist");
     }

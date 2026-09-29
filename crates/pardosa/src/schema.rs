@@ -1767,13 +1767,10 @@ mod tests {
         );
         let mut buf_17 = Vec::new();
         let err_encode = node_17.encode(&mut buf_17).unwrap_err();
-        match err_encode {
-            EncodeError::DepthExceeded { depth, max } => {
-                assert_eq!(depth, 17);
-                assert_eq!(max, 16);
-            }
-            other => panic!("expected DepthExceeded, got {other:?}"),
-        }
+        assert_eq!(
+            err_encode,
+            EncodeError::DepthExceeded { depth: 17, max: 16 }
+        );
     }
 
     #[test]
@@ -1795,13 +1792,10 @@ mod tests {
         }
         let mut buf = Vec::new();
         let err_encode = deep_node.encode(&mut buf).unwrap_err();
-        match err_encode {
-            EncodeError::DepthExceeded { depth, max } => {
-                assert_eq!(depth, 17);
-                assert_eq!(max, 16);
-            }
-            other => panic!("expected DepthExceeded, got {other:?}"),
-        }
+        assert_eq!(
+            err_encode,
+            EncodeError::DepthExceeded { depth: 17, max: 16 }
+        );
 
         let err_validate = deep_node.validate_structure().unwrap_err();
         assert_eq!(
@@ -1949,13 +1943,7 @@ mod tests {
             };
         }
         let err = SchemaIdentity::try_from_descriptor(1, &deep_node).unwrap_err();
-        match err {
-            EncodeError::DepthExceeded { depth, max } => {
-                assert_eq!(depth, 17);
-                assert_eq!(max, 16);
-            }
-            other => panic!("expected DepthExceeded, got {other:?}"),
-        }
+        assert_eq!(err, EncodeError::DepthExceeded { depth: 17, max: 16 });
 
         let valid_node = DescriptorNode::U64;
         let identity = SchemaIdentity::try_from_descriptor(1, &valid_node).unwrap();
@@ -2120,12 +2108,12 @@ mod tests {
         );
         let err = AdmittedDescriptor::try_from_descriptor(desc_over)
             .expect_err("65,537 bytes must be rejected");
-        match err.condition() {
-            FailureCondition::ValueConstraintViolated { constraint } => {
-                assert_eq!(constraint, &ValueConstraint::TooLong);
+        assert_eq!(
+            *err.condition(),
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
             }
-            other => panic!("expected ValueConstraintViolated, got {other:?}"),
-        }
+        );
 
         let huge_name_desc = SchemaDescriptor::new(
             1,
@@ -2139,12 +2127,12 @@ mod tests {
         );
         let err_huge = AdmittedDescriptor::try_from_descriptor(huge_name_desc)
             .expect_err("AST string exceeding bound must be rejected before allocation");
-        match err_huge.condition() {
-            FailureCondition::ValueConstraintViolated { constraint } => {
-                assert_eq!(constraint, &ValueConstraint::TooLong);
+        assert_eq!(
+            *err_huge.condition(),
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
             }
-            other => panic!("expected ValueConstraintViolated, got {other:?}"),
-        }
+        );
     }
 
     #[test]
@@ -2183,12 +2171,12 @@ mod tests {
             "root.encode must not be executed when aggregate descriptor exceeds 64 KiB"
         );
 
-        match err.condition() {
-            FailureCondition::ValueConstraintViolated { constraint } => {
-                assert_eq!(constraint, &ValueConstraint::TooLong);
+        assert_eq!(
+            *err.condition(),
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
             }
-            other => panic!("expected ValueConstraintViolated, got {other:?}"),
-        }
+        );
         assert_eq!(
             err.diagnostic_detail().message(),
             format!("encoded descriptor record exceeds 64 KiB: {expected_len}")

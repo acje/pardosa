@@ -56,6 +56,7 @@
 //! responsibility via the migration subsystem.
 
 #![deny(missing_docs)]
+#![allow(clippy::pedantic)]
 
 pub mod adapter;
 #[cfg(any(test, feature = "unstable-test-support"))]

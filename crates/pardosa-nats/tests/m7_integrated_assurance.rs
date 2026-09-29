@@ -1,4 +1,5 @@
 #![allow(deprecated)]
+#![allow(clippy::pedantic)]
 
 use pardosa::file::FileStorageAdapter;
 use pardosa::prelude::*;
@@ -978,8 +979,7 @@ fn test_m7_dimension_6_transformation_refusal_and_fiber_policies() {
         .append_envelope_verdict(&env1)
         .expect("append 1");
 
-    let file_tx_err =
-        MigrationManager::new(file_src_fail.clone(), file_target_fail.clone()).unwrap_err();
+    let file_tx_err = MigrationManager::new(file_src_fail.clone(), file_target_fail).unwrap_err();
     assert_eq!(
         *file_tx_err.condition(),
         FailureCondition::InvariantBreakingConfiguration
@@ -1091,7 +1091,7 @@ fn test_m7_dimension_7_chain_breaks_and_mismatch_refusal() {
         .append_unvalidated_frame_for_test(&broken_buf)
         .expect("append broken");
 
-    let file_break_err = MigrationManager::new(file_src.clone(), file_target.clone()).unwrap_err();
+    let file_break_err = MigrationManager::new(file_src.clone(), file_target).unwrap_err();
     assert_eq!(
         *file_break_err.condition(),
         FailureCondition::InvariantBreakingConfiguration
@@ -1134,8 +1134,7 @@ fn test_m7_dimension_7_chain_breaks_and_mismatch_refusal() {
     file_target_permit
         .create(&claim, &sample_descriptor())
         .expect("create permit target");
-    let file_permit_err =
-        MigrationManager::new(file_src.clone(), file_target_permit.clone()).unwrap_err();
+    let file_permit_err = MigrationManager::new(file_src, file_target_permit).unwrap_err();
     assert_eq!(
         *file_permit_err.condition(),
         FailureCondition::InvariantBreakingConfiguration

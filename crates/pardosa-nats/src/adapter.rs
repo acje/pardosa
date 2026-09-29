@@ -7,6 +7,10 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "tokio::runtime::RuntimeFlavor is non-exhaustive"
+)]
 pub(crate) fn run_future<F, T>(handle: &tokio::runtime::Handle, fut: F) -> T
 where
     F: std::future::Future<Output = T> + Send + 'static,
@@ -57,6 +61,10 @@ fn is_wrong_last_sequence(err: &async_nats::jetstream::context::PublishError) ->
 /// All decoded ownership records found in an artefact's meta stream.
 pub type NatsMetaRecords = MetaRecords;
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "async_nats::jetstream::context::CreateStreamErrorKind has third-party error variants"
+)]
 fn map_completion_create_error(
     err: async_nats::jetstream::context::CreateStreamError,
 ) -> OperationFailure {
@@ -263,7 +271,7 @@ async fn read_meta_records_async(
             OwnershipRecord::RescuePolicyChoice(r) => {
                 records.rescue_policy_choice = Some(r);
             }
-            _ => {}
+            OwnershipRecord::CleanRelease(_) | OwnershipRecord::IdentityStructure(_) => {}
         }
     }
     Ok(records)
@@ -277,10 +285,10 @@ fn map_nats_stream_open_error(
 ) -> OperationFailure {
     use async_nats::jetstream::context::GetStreamErrorKind;
     use async_nats::jetstream::ErrorCode;
-    let is_not_found = match err.kind() {
-        GetStreamErrorKind::JetStream(js_err) => js_err.error_code() == ErrorCode::STREAM_NOT_FOUND,
-        _ => false,
-    };
+    let is_not_found = matches!(
+        err.kind(),
+        GetStreamErrorKind::JetStream(js_err) if js_err.error_code() == ErrorCode::STREAM_NOT_FOUND
+    );
 
     if is_not_found {
         OperationFailure::new(
@@ -301,10 +309,10 @@ fn map_nats_stream_delete_error(
 ) -> Result<(), OperationFailure> {
     use async_nats::jetstream::context::GetStreamErrorKind;
     use async_nats::jetstream::ErrorCode;
-    let is_not_found = match err.kind() {
-        GetStreamErrorKind::JetStream(js_err) => js_err.error_code() == ErrorCode::STREAM_NOT_FOUND,
-        _ => false,
-    };
+    let is_not_found = matches!(
+        err.kind(),
+        GetStreamErrorKind::JetStream(js_err) if js_err.error_code() == ErrorCode::STREAM_NOT_FOUND
+    );
     if is_not_found {
         Ok(())
     } else {
@@ -328,14 +336,13 @@ fn map_nats_raw_message_error(
 ) -> OperationFailure {
     use async_nats::jetstream::stream::RawMessageErrorKind;
     use async_nats::jetstream::ErrorCode;
-    let is_missing = match err.kind() {
-        RawMessageErrorKind::NoMessageFound => true,
-        RawMessageErrorKind::JetStream(js_err) => {
-            let code = js_err.error_code();
-            code == ErrorCode::NO_MESSAGE_FOUND || code == ErrorCode::SEQUENCE_NOT_FOUND
-        }
-        _ => false,
-    };
+    let is_missing = matches!(err.kind(), RawMessageErrorKind::NoMessageFound)
+        || matches!(
+            err.kind(),
+            RawMessageErrorKind::JetStream(js_err)
+                if js_err.error_code() == ErrorCode::NO_MESSAGE_FOUND
+                    || js_err.error_code() == ErrorCode::SEQUENCE_NOT_FOUND
+        );
 
     if is_missing {
         OperationFailure::new(
@@ -814,7 +821,7 @@ impl NatsStorageAdapter {
         let claim = initial_claim.clone();
         let descriptor_clone = descriptor.clone();
         let handle = self.runtime.handle().clone();
-        let runtime = self.runtime.clone();
+        let runtime = Arc::clone(&self.runtime);
 
         run_future(&handle, async move {
             js.create_stream(async_nats::jetstream::stream::Config {
@@ -1380,7 +1387,7 @@ impl NatsStorageAdapter {
         let data_subject = self.data_subject.clone();
         let claim_clone = claim.clone();
         let handle = self.runtime.handle().clone();
-        let runtime = self.runtime.clone();
+        let runtime = Arc::clone(&self.runtime);
 
         run_future(&handle, async move {
             let meta_records = read_meta_records_async(&js, &meta_name).await?;
@@ -1532,7 +1539,7 @@ impl NatsStorageAdapter {
                         "artefact append authority permanently retired via outbound pointer per C5.63",
                     ));
                 }
-                let claim = meta.latest_claim.clone().ok_or_else(|| {
+                let claim = meta.latest_claim.ok_or_else(|| {
                     OperationFailure::new(
                         FailureCondition::OwnershipUnestablished,
                         "ownership record unseeded; cannot open writer session without established claim per C5.10",
@@ -1638,7 +1645,7 @@ impl NatsStorageAdapter {
         let engine = NatsEngine {
             client: self.client.clone(),
             js: self.js.clone(),
-            runtime: self.runtime.clone(),
+            runtime: Arc::clone(&self.runtime),
             stem: self.stem.clone(),
             meta_stream_name: self.meta_stream_name.clone(),
             data_stream_name: self.data_stream_name.clone(),
@@ -1688,7 +1695,7 @@ impl NatsStorageAdapter {
         let engine = NatsEngine {
             client: self.client.clone(),
             js: self.js.clone(),
-            runtime: self.runtime.clone(),
+            runtime: Arc::clone(&self.runtime),
             stem: self.stem.clone(),
             meta_stream_name: self.meta_stream_name.clone(),
             data_stream_name: self.data_stream_name.clone(),
@@ -2761,12 +2768,12 @@ mod tests {
                 let mut engine = NatsEngine {
                     client: adapter.client.clone(),
                     js: adapter.js.clone(),
-                    runtime: adapter.runtime.clone(),
+                    runtime: Arc::clone(&adapter.runtime),
                     stem: adapter.stem.clone(),
                     meta_stream_name: adapter.meta_stream_name.clone(),
                     data_stream_name: adapter.data_stream_name.clone(),
                     meta_subject: adapter.meta_subject.clone(),
-                    data_subject: adapter.data_subject.clone(),
+                    data_subject: adapter.data_subject,
                     carried_epoch: 1,
                     claim: Some(claim),
                     meta_records: NatsMetaRecords::default(),
