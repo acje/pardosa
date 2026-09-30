@@ -273,9 +273,35 @@ fn acquire_file_exclusion(
     }
 }
 
-fn read_container_frames(
-    file: &mut File,
-) -> Result<(ContainerHeader, Vec<Vec<u8>>, RollingCommitment), OperationFailure> {
+/// Information about an uncommitted torn trailing frame truncated on recovery per C5.16.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TornTailInfo {
+    /// Byte offset where valid container frames end and truncation occurred.
+    pub valid_len: u64,
+    /// Number of incomplete trailing bytes truncated.
+    pub truncated_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TailState {
+    Clean,
+    TornTail(TornTailInfo),
+}
+
+#[derive(Debug)]
+pub(crate) struct ContainerScan {
+    pub(crate) header: ContainerHeader,
+    pub(crate) frames: Vec<Vec<u8>>,
+    #[expect(
+        dead_code,
+        reason = "rolling commitment retained for container dragline anchor"
+    )]
+    pub(crate) rolling: RollingCommitment,
+    pub(crate) tail_state: TailState,
+    pub(crate) valid_len: u64,
+}
+
+fn read_container_frames(file: &mut File) -> Result<ContainerScan, OperationFailure> {
     file.seek(SeekFrom::Start(0)).map_err(|err| {
         OperationFailure::new(
             FailureCondition::PrecursorChainBroken(None),
@@ -321,18 +347,76 @@ fn read_container_frames(
     })?;
     let mut frames = Vec::new();
     let mut rolling = RollingCommitment::new();
+    let mut tail_state = TailState::Clean;
     while cursor < buf.len() {
-        let (payload, consumed) = ContainerFrame::decode(&buf[cursor..]).map_err(|err| {
-            OperationFailure::new(
-                FailureCondition::PrecursorChainBroken(None),
-                format!("invalid container frame at offset {cursor}: {err}"),
-            )
-        })?;
+        let (payload, consumed) = match ContainerFrame::decode(&buf[cursor..]) {
+            Ok(res) => res,
+            Err(DecodeError::TruncatedPayload { .. }) => {
+                tail_state = TailState::TornTail(TornTailInfo {
+                    valid_len: cursor as u64,
+                    truncated_bytes: (buf.len() - cursor) as u64,
+                });
+                break;
+            }
+            Err(err) => {
+                return Err(OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    format!("invalid container frame at offset {cursor}: {err}"),
+                ));
+            }
+        };
         rolling.update_frame(&buf[cursor..cursor + consumed]);
         frames.push(payload);
         cursor += consumed;
     }
-    Ok((header, frames, rolling))
+    let valid_len = cursor as u64;
+    Ok(ContainerScan {
+        header,
+        frames,
+        rolling,
+        tail_state,
+        valid_len,
+    })
+}
+
+fn reconcile_tail_state(
+    pgno_file: &mut File,
+    scan: &ContainerScan,
+) -> Result<Option<TornTailInfo>, OperationFailure> {
+    match scan.tail_state {
+        TailState::Clean => {
+            pgno_file.seek(SeekFrom::End(0)).map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    format!("failed to seek to end of .pgno: {err}"),
+                )
+            })?;
+            Ok(None)
+        }
+        TailState::TornTail(info) => {
+            pgno_file.set_len(info.valid_len).map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::TransportUnavailable,
+                    format!("failed to truncate torn trailing frame in .pgno: {err}"),
+                )
+            })?;
+            pgno_file.sync_data().map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::TransportUnavailable,
+                    format!("failed to sync truncated .pgno: {err}"),
+                )
+            })?;
+            pgno_file
+                .seek(SeekFrom::Start(info.valid_len))
+                .map_err(|err| {
+                    OperationFailure::new(
+                        FailureCondition::PrecursorChainBroken(None),
+                        format!("failed to seek to end of container: {err}"),
+                    )
+                })?;
+            Ok(Some(info))
+        }
+    }
 }
 
 /// All decoded ownership records found in an artefact's .meta file.
@@ -368,20 +452,26 @@ pub fn read_meta_records(meta_path: &Path) -> Result<MetaRecords, OperationFailu
             format!("failed to open .meta file: {err}"),
         )
     })?;
-    let (header, frames, _) = read_container_frames(&mut file).map_err(|err| {
+    let scan = read_container_frames(&mut file).map_err(|err| {
         OperationFailure::new(
             FailureCondition::OwnershipRecordUnreadable,
             format!("failed to read frames from .meta file: {err}"),
         )
     })?;
-    if header.format_version != CONTAINER_FORMAT_VERSION {
+    if scan.tail_state != TailState::Clean {
+        return Err(OperationFailure::new(
+            FailureCondition::OwnershipRecordUnreadable,
+            "uncommitted torn trailing frame in .meta per C5.12",
+        ));
+    }
+    if scan.header.format_version != CONTAINER_FORMAT_VERSION {
         return Err(OperationFailure::new(
             FailureCondition::OwnershipRecordUnreadable,
             "container header in .meta has invalid format version",
         ));
     }
     let mut records = MetaRecords::default();
-    for frame in frames {
+    for frame in scan.frames {
         let (record, consumed) = OwnershipRecord::decode(&frame).map_err(|err| {
             OperationFailure::new(
                 FailureCondition::OwnershipRecordUnreadable,
@@ -824,6 +914,9 @@ impl FileStorageAdapter {
             simulate_write_error: false,
             fail_after_n_blocks: None,
             undetermined_after_n_blocks: None,
+            #[cfg(any(test, feature = "unstable-test-support"))]
+            simulate_enospc_quota: None,
+            recovered_tail_truncation: None,
         };
 
         let store = Store::open_writer(engine)?;
@@ -908,8 +1001,8 @@ impl FileStorageAdapter {
                 format!("failed to sync frame: {err}"),
             )
         })?;
-        let (_, frames, _) = read_container_frames(&mut file)?;
-        Ok(frames.len() as u64)
+        let scan = read_container_frames(&mut file)?;
+        Ok(scan.frames.len() as u64)
     }
 
     /// Creates only the .meta component of an artefact for testing incomplete creation per C5.10.
@@ -1064,35 +1157,28 @@ impl FileStorageAdapter {
             simulate_write_error: false,
             fail_after_n_blocks: None,
             undetermined_after_n_blocks: None,
+            #[cfg(any(test, feature = "unstable-test-support"))]
+            simulate_enospc_quota: None,
+            recovered_tail_truncation: None,
         };
 
         let store = Store::open_writer(engine)?;
         Ok(FileWriterSession { store })
     }
 
-    /// Opens the artefact strictly for writing with a carried epoch per C5.5, C5.6, C5.62, and C12.4.
-    ///
-    /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::NoArtefactExists`] if artefact is missing.
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipUnestablished`] if opening orphan .pgno.
-    /// Returns [`OperationFailure`] with [`FailureCondition::MissingSchemaDescriptor`] if schema descriptor is missing or invalid.
-    /// Returns [`OperationFailure`] with [`FailureCondition::StaleEpoch`] if carried epoch is superseded.
-    /// Returns [`OperationFailure`] with [`FailureCondition::AnotherOwnerHoldsExclusion`] if lock is held.
-    /// Returns [`OperationFailure`] with [`FailureCondition::ExclusionUnavailable`] if lock unsupported.
-    pub fn open_write(&self, carried_epoch: u64) -> Result<FileWriterSession, OperationFailure> {
+    fn check_open_write_presence(
+        &self,
+        carried_epoch: u64,
+    ) -> Result<Option<FileWriterSession>, OperationFailure> {
         match self.try_presence()? {
-            ArtefactPresence::None => {
-                return Err(OperationFailure::new(
-                    FailureCondition::NoArtefactExists,
-                    "no artefact exists on open; strict open does not create per C5.62",
-                ));
-            }
-            ArtefactPresence::EventDataOnly => {
-                return Err(OperationFailure::new(
-                    FailureCondition::OwnershipUnestablished,
-                    "event data present without ownership record refused on write path per C5.10",
-                ));
-            }
+            ArtefactPresence::None => Err(OperationFailure::new(
+                FailureCondition::NoArtefactExists,
+                "no artefact exists on open; strict open does not create per C5.62",
+            )),
+            ArtefactPresence::EventDataOnly => Err(OperationFailure::new(
+                FailureCondition::OwnershipUnestablished,
+                "event data present without ownership record refused on write path per C5.10",
+            )),
             ArtefactPresence::OwnershipRecordOnly => {
                 let meta = read_meta_records(&self.meta_path)?;
                 if meta.outbound_pointer.is_some() {
@@ -1113,9 +1199,24 @@ impl FileStorageAdapter {
                         "stale epoch on open writer per C5.5 and C12.4",
                     ));
                 }
-                return self.complete_creation(&claim);
+                self.complete_creation(&claim).map(Some)
             }
-            ArtefactPresence::Both => {}
+            ArtefactPresence::Both => Ok(None),
+        }
+    }
+
+    /// Opens the artefact strictly for writing with a carried epoch per C5.5, C5.6, C5.62, and C12.4.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::NoArtefactExists`] if artefact is missing.
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipUnestablished`] if opening orphan .pgno.
+    /// Returns [`OperationFailure`] with [`FailureCondition::MissingSchemaDescriptor`] if schema descriptor is missing or invalid.
+    /// Returns [`OperationFailure`] with [`FailureCondition::StaleEpoch`] if carried epoch is superseded.
+    /// Returns [`OperationFailure`] with [`FailureCondition::AnotherOwnerHoldsExclusion`] if lock is held.
+    /// Returns [`OperationFailure`] with [`FailureCondition::ExclusionUnavailable`] if lock unsupported.
+    pub fn open_write(&self, carried_epoch: u64) -> Result<FileWriterSession, OperationFailure> {
+        if let Some(session) = self.check_open_write_presence(carried_epoch)? {
+            return Ok(session);
         }
 
         let mut pgno_file = OpenOptions::new()
@@ -1165,13 +1266,8 @@ impl FileStorageAdapter {
             ));
         }
 
-        let (_, frames, _) = read_container_frames(&mut pgno_file)?;
-        pgno_file.seek(SeekFrom::End(0)).map_err(|err| {
-            OperationFailure::new(
-                FailureCondition::PrecursorChainBroken(None),
-                format!("failed to seek to end of .pgno: {err}"),
-            )
-        })?;
+        let scan = read_container_frames(&mut pgno_file)?;
+        let recovered_tail_truncation = reconcile_tail_state(&mut pgno_file, &scan)?;
 
         let engine = FileEngine {
             file: Some(pgno_file),
@@ -1183,7 +1279,7 @@ impl FileStorageAdapter {
             meta_records: meta,
             exclusion_policy: self.exclusion_policy,
             locked: true,
-            frame_count: frames.len() as u64,
+            frame_count: scan.frames.len() as u64,
             read_all_count: 0,
             uncertain: false,
             uncertain_diagnostic: None,
@@ -1192,6 +1288,9 @@ impl FileStorageAdapter {
             simulate_write_error: false,
             fail_after_n_blocks: None,
             undetermined_after_n_blocks: None,
+            #[cfg(any(test, feature = "unstable-test-support"))]
+            simulate_enospc_quota: None,
+            recovered_tail_truncation,
         };
 
         let store = Store::open_writer(engine)?;
@@ -1231,14 +1330,20 @@ impl FileStorageAdapter {
                         format!("failed to open .pgno for reading: {err}"),
                     )
                 })?;
-            let (_, frames, _) = read_container_frames(&mut f)?;
+            let scan = read_container_frames(&mut f)?;
+            if scan.tail_state != TailState::Clean {
+                return Err(OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    "container has uncommitted torn trailing frame; write reconciliation required per C5.10",
+                ));
+            }
             f.seek(SeekFrom::Start(0)).map_err(|err| {
                 OperationFailure::new(
                     FailureCondition::PrecursorChainBroken(None),
                     format!("failed to seek .pgno to start: {err}"),
                 )
             })?;
-            (Some(f), frames.len() as u64)
+            (Some(f), scan.frames.len() as u64)
         } else {
             (None, 0)
         };
@@ -1262,6 +1367,9 @@ impl FileStorageAdapter {
             simulate_write_error: false,
             fail_after_n_blocks: None,
             undetermined_after_n_blocks: None,
+            #[cfg(any(test, feature = "unstable-test-support"))]
+            simulate_enospc_quota: None,
+            recovered_tail_truncation: None,
         };
 
         let store = Store::open_reader(engine);
@@ -1404,9 +1512,18 @@ pub struct FileEngine {
     pub(crate) simulate_write_error: bool,
     pub(crate) fail_after_n_blocks: Option<usize>,
     pub(crate) undetermined_after_n_blocks: Option<usize>,
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    pub(crate) simulate_enospc_quota: Option<usize>,
+    pub(crate) recovered_tail_truncation: Option<TornTailInfo>,
 }
 
 impl FileEngine {
+    /// Returns information about an uncommitted torn trailing frame truncated on open, if any.
+    #[must_use]
+    pub fn recovered_tail_truncation(&self) -> Option<TornTailInfo> {
+        self.recovered_tail_truncation
+    }
+
     /// Returns the number of times `read_all` was invoked on this engine.
     #[cfg(any(test, feature = "unstable-test-support"))]
     #[must_use]
@@ -1468,6 +1585,62 @@ impl FileEngine {
         }
         Ok(())
     }
+
+    fn check_append_simulation(
+        &mut self,
+    ) -> Result<Option<WriteLandingVerdict<u64>>, OperationFailure> {
+        if self.simulate_indeterminate {
+            self.uncertain = true;
+            self.uncertain_diagnostic = Some(
+                "write landing undetermined: simulated indeterminate write landing".to_string(),
+            );
+            return Ok(Some(WriteLandingVerdict::Undetermined {
+                carried_epoch: self.carried_epoch,
+            }));
+        }
+
+        if let Some(limit) = self.undetermined_after_n_blocks {
+            if self.frame_count >= limit as u64 {
+                self.uncertain = true;
+                self.uncertain_diagnostic = Some(
+                    "write landing undetermined: simulated indeterminate write landing".to_string(),
+                );
+                return Ok(Some(WriteLandingVerdict::Undetermined {
+                    carried_epoch: self.carried_epoch,
+                }));
+            }
+        }
+
+        if let Some(limit) = self.fail_after_n_blocks {
+            if self.frame_count >= limit as u64 {
+                return Err(OperationFailure::new(
+                    FailureCondition::PrecursorChainBroken(None),
+                    "simulated write failure after limit",
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RollbackOutcome {
+    Succeeded,
+    TruncateFailed,
+    SyncFailed,
+    SeekFailed,
+}
+
+impl RollbackOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "rollback succeeded (truncated, synced, cursor restored)",
+            Self::TruncateFailed => "rollback set_len failed",
+            Self::SyncFailed => "rollback sync_data failed",
+            Self::SeekFailed => "rollback seek failed",
+        }
+    }
 }
 
 impl StorageEngine for FileEngine {
@@ -1490,35 +1663,8 @@ impl StorageEngine for FileEngine {
             ));
         }
 
-        if self.simulate_indeterminate {
-            self.uncertain = true;
-            self.uncertain_diagnostic = Some(
-                "write landing undetermined: simulated indeterminate write landing".to_string(),
-            );
-            return Ok(WriteLandingVerdict::Undetermined {
-                carried_epoch: self.carried_epoch,
-            });
-        }
-
-        if let Some(limit) = self.undetermined_after_n_blocks {
-            if self.frame_count >= limit as u64 {
-                self.uncertain = true;
-                self.uncertain_diagnostic = Some(
-                    "write landing undetermined: simulated indeterminate write landing".to_string(),
-                );
-                return Ok(WriteLandingVerdict::Undetermined {
-                    carried_epoch: self.carried_epoch,
-                });
-            }
-        }
-
-        if let Some(limit) = self.fail_after_n_blocks {
-            if self.frame_count >= limit as u64 {
-                return Err(OperationFailure::new(
-                    FailureCondition::PrecursorChainBroken(None),
-                    "simulated write failure after limit",
-                ));
-            }
+        if let Some(verdict) = self.check_append_simulation()? {
+            return Ok(verdict);
         }
 
         let file = self.file.as_mut().ok_or_else(|| {
@@ -1528,7 +1674,7 @@ impl StorageEngine for FileEngine {
             )
         })?;
 
-        file.seek(SeekFrom::End(0)).map_err(|err| {
+        let initial_len = file.seek(SeekFrom::End(0)).map_err(|err| {
             OperationFailure::new(
                 FailureCondition::TransportUnavailable,
                 format!("failed to seek to end of container: {err}"),
@@ -1538,13 +1684,34 @@ impl StorageEngine for FileEngine {
         let write_res = if self.simulate_write_error {
             Err(std::io::Error::other("simulated write_all failure"))
         } else {
+            #[cfg(any(test, feature = "unstable-test-support"))]
+            if let Some(quota) = self.simulate_enospc_quota {
+                let mut writer = QuotaWriter::new(&mut *file, quota);
+                let res = writer.write_all(block);
+                self.simulate_enospc_quota = Some(writer.remaining_quota());
+                res
+            } else {
+                file.write_all(block)
+            }
+            #[cfg(not(any(test, feature = "unstable-test-support")))]
             file.write_all(block)
         };
 
         if let Err(err) = write_res {
+            let rollback_outcome = if file.set_len(initial_len).is_err() {
+                RollbackOutcome::TruncateFailed
+            } else if file.sync_data().is_err() {
+                RollbackOutcome::SyncFailed
+            } else if file.seek(SeekFrom::Start(initial_len)).is_err() {
+                RollbackOutcome::SeekFailed
+            } else {
+                RollbackOutcome::Succeeded
+            };
+
             self.uncertain = true;
             self.uncertain_diagnostic = Some(format!(
-                "write_all failed; write landing undetermined: {err}"
+                "write_all failed; write landing undetermined: {err}; {}",
+                rollback_outcome.as_str()
             ));
             return Ok(WriteLandingVerdict::Undetermined {
                 carried_epoch: self.carried_epoch,
@@ -1582,14 +1749,20 @@ impl StorageEngine for FileEngine {
                 format!("failed to seek container file: {err}"),
             )
         })?;
-        let (_, frames, _) = read_container_frames(file)?;
-        file.seek(SeekFrom::End(0)).map_err(|err| {
+        let scan = read_container_frames(file)?;
+        if scan.tail_state != TailState::Clean {
+            return Err(OperationFailure::new(
+                FailureCondition::PrecursorChainBroken(None),
+                "container has uncommitted torn trailing frame",
+            ));
+        }
+        file.seek(SeekFrom::Start(scan.valid_len)).map_err(|err| {
             OperationFailure::new(
                 FailureCondition::PrecursorChainBroken(None),
                 format!("failed to seek to end of container: {err}"),
             )
         })?;
-        Ok(frames)
+        Ok(scan.frames)
     }
 
     fn read_chunk(
@@ -1623,18 +1796,24 @@ impl StorageEngine for FileEngine {
                 format!("failed to seek container file: {err}"),
             )
         })?;
-        let (_header, frames, _) = read_container_frames(file)?;
-        file.seek(SeekFrom::End(0)).map_err(|err| {
+        let scan = read_container_frames(file)?;
+        if scan.tail_state != TailState::Clean {
+            return Err(OperationFailure::new(
+                FailureCondition::PrecursorChainBroken(None),
+                "container has uncommitted torn trailing frame",
+            ));
+        }
+        file.seek(SeekFrom::Start(scan.valid_len)).map_err(|err| {
             OperationFailure::new(
                 FailureCondition::PrecursorChainBroken(None),
                 format!("failed to seek to end of container: {err}"),
             )
         })?;
-        self.frame_count = frames.len() as u64;
-        for (pos, frame) in frames.iter().enumerate() {
+        self.frame_count = scan.frames.len() as u64;
+        for (pos, frame) in scan.frames.iter().enumerate() {
             on_frame(pos as u64, frame)?;
         }
-        Ok(frames.len() as u64)
+        Ok(scan.frames.len() as u64)
     }
 
     fn acquire_exclusion(&mut self) -> Result<(), OperationFailure> {
@@ -1763,6 +1942,12 @@ impl std::ops::DerefMut for FileWriterSession {
 }
 
 impl FileWriterSession {
+    /// Returns information about an uncommitted torn trailing frame truncated on open, if any.
+    #[must_use]
+    pub fn recovered_tail_truncation(&self) -> Option<TornTailInfo> {
+        self.store.engine().recovered_tail_truncation()
+    }
+
     /// Returns the active ownership claim record.
     #[must_use]
     pub fn claim(&self) -> &OwnershipClaimRecord {
@@ -1835,6 +2020,14 @@ impl FileWriterSession {
     #[must_use]
     pub fn with_fail_after_n_blocks(mut self, n: usize) -> Self {
         self.store.engine.fail_after_n_blocks = Some(n);
+        self
+    }
+
+    /// Configures simulated storage full (ENOSPC) after `quota` bytes are written.
+    #[cfg(any(test, feature = "unstable-test-support"))]
+    #[must_use]
+    pub fn with_simulate_enospc(mut self, quota: usize) -> Self {
+        self.store.engine.simulate_enospc_quota = Some(quota);
         self
     }
 
@@ -1933,6 +2126,154 @@ impl FileReaderSession {
         F: FnMut(B, EventEnvelopeRef<'_>) -> Result<B, OperationFailure>,
     {
         self.store.fold_envelopes(init, f)
+    }
+}
+
+/// Fault-injecting writer wrapping a [`Write`] sink to simulate storage-full conditions.
+#[cfg(any(test, feature = "unstable-test-support"))]
+#[derive(Debug)]
+pub struct QuotaWriter<W: Write> {
+    inner: W,
+    remaining_quota: usize,
+    allow_partial: bool,
+    force_enospc: bool,
+    injected_error: Option<std::io::ErrorKind>,
+    bytes_written: usize,
+}
+
+#[cfg(any(test, feature = "unstable-test-support"))]
+impl<W: Write> QuotaWriter<W> {
+    /// Creates a new quota writer wrapping `inner` with the specified byte `quota`.
+    pub fn new(inner: W, quota: usize) -> Self {
+        Self {
+            inner,
+            remaining_quota: quota,
+            allow_partial: true,
+            force_enospc: false,
+            injected_error: None,
+            bytes_written: 0,
+        }
+    }
+
+    /// Sets whether partial writes are permitted before `StorageFull` is returned.
+    #[must_use]
+    pub fn with_allow_partial(mut self, allow_partial: bool) -> Self {
+        self.allow_partial = allow_partial;
+        self
+    }
+
+    /// Forces immediate `StorageFull` on the next write or flush attempt.
+    #[must_use]
+    pub fn with_force_enospc(mut self, force: bool) -> Self {
+        self.force_enospc = force;
+        self
+    }
+
+    /// Injects an error kind to return on the next write or flush attempt.
+    #[must_use]
+    pub fn with_injected_error(mut self, kind: std::io::ErrorKind) -> Self {
+        self.injected_error = Some(kind);
+        self
+    }
+
+    /// Updates the remaining write quota.
+    pub fn set_quota(&mut self, quota: usize) {
+        self.remaining_quota = quota;
+    }
+
+    /// Injects or clears an error kind for subsequent write or flush attempts.
+    pub fn set_injected_error(&mut self, kind: Option<std::io::ErrorKind>) {
+        self.injected_error = kind;
+    }
+
+    /// Returns the remaining byte quota.
+    #[must_use]
+    pub fn remaining_quota(&self) -> usize {
+        self.remaining_quota
+    }
+
+    /// Returns the total bytes successfully written through this writer.
+    #[must_use]
+    pub fn bytes_written(&self) -> usize {
+        self.bytes_written
+    }
+
+    /// Consumes the quota writer, returning the inner writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+
+    /// Returns a reference to the inner writer.
+    #[must_use]
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Returns a mutable reference to the inner writer.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+}
+
+#[cfg(any(test, feature = "unstable-test-support"))]
+impl<W: Write> Write for QuotaWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(kind) = self.injected_error {
+            return Err(std::io::Error::new(kind, "simulated injected I/O error"));
+        }
+        if self.force_enospc {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "simulated ENOSPC: forced storage full",
+            ));
+        }
+        if self.remaining_quota == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "simulated ENOSPC: byte write quota exhausted",
+            ));
+        }
+        let to_write = if self.allow_partial {
+            buf.len().min(self.remaining_quota)
+        } else if buf.len() > self.remaining_quota {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "simulated ENOSPC: payload exceeds remaining write quota",
+            ));
+        } else {
+            buf.len()
+        };
+        let n = self.inner.write(&buf[..to_write])?;
+        self.remaining_quota = self.remaining_quota.saturating_sub(n);
+        self.bytes_written = self.bytes_written.saturating_add(n);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(kind) = self.injected_error {
+            return Err(std::io::Error::new(kind, "simulated injected I/O error"));
+        }
+        if self.force_enospc {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "simulated ENOSPC: forced storage full on flush",
+            ));
+        }
+        self.inner.flush()
+    }
+}
+
+#[cfg(any(test, feature = "unstable-test-support"))]
+impl<W: Write + Seek> Seek for QuotaWriter<W> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+#[cfg(any(test, feature = "unstable-test-support"))]
+impl<W: Write + Read> Read for QuotaWriter<W> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
     }
 }
 
@@ -3157,5 +3498,170 @@ mod tests {
             *second_err.condition(),
             FailureCondition::StoreAlreadyExists
         );
+    }
+
+    #[test]
+    fn test_quota_writer_basic_enospc() {
+        let mut buf = Vec::new();
+        let mut writer = QuotaWriter::new(&mut buf, 5);
+        let n1 = writer.write(b"abc").expect("write 3 bytes");
+        assert_eq!(n1, 3);
+        assert_eq!(writer.remaining_quota(), 2);
+        assert_eq!(writer.bytes_written(), 3);
+
+        let n2 = writer
+            .write(b"def")
+            .expect("write 2 bytes with partial allow");
+        assert_eq!(n2, 2);
+        assert_eq!(writer.remaining_quota(), 0);
+        assert_eq!(writer.bytes_written(), 5);
+
+        let err = writer.write(b"ghi").expect_err("quota exhausted");
+        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+    }
+
+    #[test]
+    fn test_quota_writer_no_partial_disallowed() {
+        let mut buf = Vec::new();
+        let mut writer = QuotaWriter::new(&mut buf, 5).with_allow_partial(false);
+        let err = writer
+            .write(b"123456")
+            .expect_err("write exceeding quota without partial must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(writer.remaining_quota(), 5);
+        assert_eq!(writer.bytes_written(), 0);
+
+        let n = writer.write(b"1234").expect("write within quota");
+        assert_eq!(n, 4);
+        assert_eq!(writer.remaining_quota(), 1);
+        assert_eq!(writer.bytes_written(), 4);
+    }
+
+    #[test]
+    fn test_quota_writer_forced_enospc_and_injected_error() {
+        let mut buf = Vec::new();
+        let mut writer = QuotaWriter::new(&mut buf, 100).with_force_enospc(true);
+        let err = writer.write(b"hello").expect_err("force enospc");
+        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+        let flush_err = writer.flush().expect_err("force enospc on flush");
+        assert_eq!(flush_err.kind(), std::io::ErrorKind::StorageFull);
+
+        let mut writer2 = QuotaWriter::new(&mut buf, 100)
+            .with_injected_error(std::io::ErrorKind::PermissionDenied);
+        let err2 = writer2.write(b"hello").expect_err("injected error");
+        assert_eq!(err2.kind(), std::io::ErrorKind::PermissionDenied);
+        let flush_err2 = writer2.flush().expect_err("injected error on flush");
+        assert_eq!(flush_err2.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn test_quota_writer_seek_and_read() {
+        use std::io::Cursor;
+        let data = b"0123456789".to_vec();
+        let cursor = Cursor::new(data);
+        let mut writer = QuotaWriter::new(cursor, 50);
+
+        let pos = writer.seek(SeekFrom::Start(3)).expect("seek to 3");
+        assert_eq!(pos, 3);
+
+        let mut read_buf = [0u8; 4];
+        let n = writer.read(&mut read_buf).expect("read 4 bytes");
+        assert_eq!(n, 4);
+        assert_eq!(&read_buf, b"3456");
+        assert_eq!(writer.into_inner().into_inner(), b"0123456789");
+    }
+
+    #[test]
+    fn test_file_append_enospc_atomic_rollback() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stem = temp_dir.path().join("test_file_enospc_rollback");
+        let adapter = FileStorageAdapter::new(&stem);
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1u8; 16],
+            boot_id: [2u8; 16],
+            process_id: 12345,
+            process_start_time_ns: 1_000_000,
+            claim_time_ns: 2_000_000,
+            operator_label: "test-operator".to_string(),
+        };
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
+        let fiber_id = [0x55; 16];
+        let event_id1 = [0x01; 16];
+
+        let v1 = writer
+            .append_to_fiber(fiber_id, event_id1, b"event-1")
+            .expect("first append succeeds");
+        assert!(matches!(v1, WriteLandingVerdict::Landed(_)));
+        let len_after_first = std::fs::metadata(writer.pgno_path()).unwrap().len();
+
+        let mut enospc_writer = writer.with_simulate_enospc(15);
+        let event_id2 = [0x02; 16];
+        let v2 = enospc_writer
+            .append_to_fiber(fiber_id, event_id2, b"event-2-payload-exceeding-quota")
+            .expect("append returns verdict");
+        assert_eq!(v2, WriteLandingVerdict::Undetermined { carried_epoch: 1 });
+        let len_after_rollback = std::fs::metadata(enospc_writer.pgno_path()).unwrap().len();
+        assert_eq!(
+            len_after_first, len_after_rollback,
+            "file length must roll back to initial length after ENOSPC"
+        );
+    }
+
+    #[test]
+    fn test_torn_trailing_frame_truncation_on_open_write() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let stem = temp_dir.path().join("test_torn_trailing_trunc");
+        let adapter = FileStorageAdapter::new(&stem);
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1u8; 16],
+            boot_id: [2u8; 16],
+            process_id: 12345,
+            process_start_time_ns: 1_000_000,
+            claim_time_ns: 2_000_000,
+            operator_label: "test-operator".to_string(),
+        };
+        let mut writer = adapter
+            .create(&claim, &AdmittedDescriptor::default_for_test())
+            .expect("create writer");
+        let fiber_id = [0x77; 16];
+        let event_id1 = [0x01; 16];
+        writer
+            .append_to_fiber(fiber_id, event_id1, b"valid-event-1")
+            .expect("first append succeeds");
+        drop(writer);
+
+        let valid_len = std::fs::metadata(adapter.pgno_path()).unwrap().len();
+
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(adapter.pgno_path())
+            .expect("open pgno to inject torn bytes");
+        let mut partial = Vec::new();
+        ContainerFrame::encode_payload(b"uncommitted-torn-frame", &mut partial).unwrap();
+        file.write_all(&partial[..10]).expect("write 10 torn bytes");
+        file.sync_data().expect("sync torn bytes");
+        drop(file);
+
+        let torn_len = std::fs::metadata(adapter.pgno_path()).unwrap().len();
+        assert_eq!(torn_len, valid_len + 10);
+
+        let mut writer2 = adapter
+            .open_write(1)
+            .expect("open_write detects and truncates torn frame");
+        let truncated_len = std::fs::metadata(adapter.pgno_path()).unwrap().len();
+        assert_eq!(
+            truncated_len, valid_len,
+            "torn bytes must be truncated on open_write"
+        );
+
+        let event_id2 = [0x02; 16];
+        let v2 = writer2
+            .append_to_fiber(fiber_id, event_id2, b"valid-event-2")
+            .expect("subsequent append succeeds after truncation");
+        assert!(matches!(v2, WriteLandingVerdict::Landed(_)));
     }
 }

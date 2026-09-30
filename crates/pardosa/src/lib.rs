@@ -119,4 +119,9 @@ pub mod prelude;
 pub mod schema;
 pub mod store;
 
+pub use file::TornTailInfo;
+
+#[cfg(any(test, feature = "unstable-test-support"))]
+pub use file::QuotaWriter;
+
 pub use pardosa_derive::{PardosaSchema, PardosaType};
