@@ -107,6 +107,23 @@ impl ContainerFrame {
         Self { payload, checksum }
     }
 
+    /// Encodes this container frame into wire format (length + payload + CRC32C).
+    ///
+    /// # Errors
+    /// Returns [`EncodeError::ChecksumMismatch`] if `self.checksum` does not match
+    /// the computed CRC32C checksum of `self.payload`.
+    /// Returns [`EncodeError::LengthExceeded`] if payload length exceeds `u32::MAX`.
+    pub fn encode(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
+        let computed = crc32c::crc32c(&self.payload);
+        if self.checksum != computed {
+            return Err(EncodeError::ChecksumMismatch {
+                computed,
+                recorded: self.checksum,
+            });
+        }
+        Self::encode_payload(&self.payload, buf)
+    }
+
     /// Encodes a payload into container framing format (length + payload + CRC32C).
     ///
     /// # Errors
@@ -184,6 +201,30 @@ impl ContainerFrame {
             });
         }
         Ok((payload.to_vec(), total_frame_len))
+    }
+
+    /// Decodes a framed chunk from a byte slice into a [`ContainerFrame`].
+    ///
+    /// Returns the decoded frame and the total number of frame bytes consumed.
+    ///
+    /// # Errors
+    /// Returns [`DecodeError::TruncatedPayload`] if framing length prefix or payload is truncated.
+    /// Returns [`DecodeError::ChecksumMismatch`] if computed CRC32C does not match recorded checksum.
+    pub fn decode_frame(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let (payload, consumed) = Self::decode(buf)?;
+        let recorded_checksum = u32::from_le_bytes([
+            buf[consumed - 4],
+            buf[consumed - 3],
+            buf[consumed - 2],
+            buf[consumed - 1],
+        ]);
+        Ok((
+            Self {
+                payload,
+                checksum: recorded_checksum,
+            },
+            consumed,
+        ))
     }
 }
 

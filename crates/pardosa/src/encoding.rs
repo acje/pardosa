@@ -212,6 +212,13 @@ pub enum EncodeError {
         /// Maximum allowed depth.
         max: usize,
     },
+    /// Frame checksum does not match computed CRC32C over payload.
+    ChecksumMismatch {
+        /// Computed CRC32C checksum over payload bytes.
+        computed: u32,
+        /// Recorded checksum on the frame.
+        recorded: u32,
+    },
     /// Custom error message.
     Custom(String),
 }
