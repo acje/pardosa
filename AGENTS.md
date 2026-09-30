@@ -66,6 +66,7 @@ by BOUNDARY.
   timeout 900 cargo test --workspace --all-features --locked --no-fail-fast
   cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
   cargo fmt --all -- --check
+  sh scripts/verify.sh
   ```
   - `timeout 900` is mandatory on the test line. Exit 124 is `Outcome::Surprise`,
     NEVER a test failure. Investigate the stall; do not fold it into a failure count.
