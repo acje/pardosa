@@ -116,21 +116,13 @@ async fn read_meta_records_async(
             if *mapped.condition() == FailureCondition::NoArtefactExists {
                 return Ok(NatsMetaRecords::default());
             }
-            return Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                format!("failed to get meta stream {meta_stream_name}: {err}"),
-            ));
+            return Err(mapped);
         }
     };
-    let info = match stream.info().await {
-        Ok(info) => info,
-        Err(err) => {
-            return Err(OperationFailure::new(
-                FailureCondition::OwnershipRecordUnreadable,
-                format!("failed to get info for meta stream {meta_stream_name}: {err}"),
-            ));
-        }
-    };
+    let info = stream
+        .info()
+        .await
+        .map_err(|err| map_nats_info_error(meta_stream_name, &err))?;
     if info.state.messages == 0 {
         return Err(OperationFailure::new(
             FailureCondition::OwnershipRecordUnreadable,
@@ -147,15 +139,10 @@ async fn read_meta_records_async(
     }
     let mut records = NatsMetaRecords::default();
     for seq in first..=last {
-        let raw = match stream.get_raw_message(seq).await {
-            Ok(msg) => msg,
-            Err(err) => {
-                return Err(OperationFailure::new(
-                    FailureCondition::OwnershipRecordUnreadable,
-                    format!("failed to get raw message from meta stream at seq {seq}: {err}"),
-                ));
-            }
-        };
+        let raw = stream
+            .get_raw_message(seq)
+            .await
+            .map_err(|err| map_meta_raw_message_error(seq, &err))?;
         if seq == 1 {
             let (header, consumed) = ContainerHeader::decode(&raw.payload).map_err(|err| {
                 OperationFailure::new(
@@ -323,11 +310,32 @@ fn map_nats_stream_delete_error(
     }
 }
 
-fn map_nats_info_error(stream_name: &str, err: impl std::fmt::Display) -> OperationFailure {
-    OperationFailure::new(
-        FailureCondition::TransportUnavailable,
-        format!("transport unavailable querying info for stream {stream_name}: {err}"),
-    )
+fn map_nats_info_error(
+    stream_name: &str,
+    err: &async_nats::jetstream::context::RequestError,
+) -> OperationFailure {
+    use async_nats::jetstream::ErrorCode;
+    use std::error::Error;
+
+    let js_err = err
+        .source()
+        .and_then(|s| s.downcast_ref::<async_nats::jetstream::Error>());
+
+    let is_not_found = js_err
+        .map(|js| js.error_code() == ErrorCode::STREAM_NOT_FOUND)
+        .unwrap_or(false);
+
+    if is_not_found {
+        OperationFailure::new(
+            FailureCondition::NoArtefactExists,
+            format!("stream {stream_name} not found: {err}"),
+        )
+    } else {
+        OperationFailure::new(
+            FailureCondition::TransportUnavailable,
+            format!("transport unavailable querying info for stream {stream_name}: {err}"),
+        )
+    }
 }
 
 fn map_nats_raw_message_error(
@@ -357,6 +365,24 @@ fn map_nats_raw_message_error(
     }
 }
 
+fn map_meta_raw_message_error(
+    seq: u64,
+    err: &async_nats::jetstream::stream::RawMessageError,
+) -> OperationFailure {
+    let failure = map_nats_raw_message_error(seq, err);
+    if matches!(
+        failure.condition(),
+        FailureCondition::PrecursorChainBroken(_)
+    ) {
+        OperationFailure::new(
+            FailureCondition::OwnershipRecordUnreadable,
+            format!("missing message in meta stream at seq {seq}: {err}"),
+        )
+    } else {
+        failure
+    }
+}
+
 async fn read_data_frames_async(
     js: &async_nats::jetstream::Context,
     data_stream_name: &str,
@@ -369,7 +395,7 @@ async fn read_data_frames_async(
         let info = stream
             .info()
             .await
-            .map_err(|err| map_nats_info_error(data_stream_name, err))?;
+            .map_err(|err| map_nats_info_error(data_stream_name, &err))?;
         (
             info.state.messages,
             info.state.first_sequence,
@@ -461,7 +487,7 @@ async fn read_chunk_async(
         let info = stream
             .info()
             .await
-            .map_err(|err| map_nats_info_error(data_stream_name, err))?;
+            .map_err(|err| map_nats_info_error(data_stream_name, &err))?;
         (
             info.state.messages,
             info.state.first_sequence,
@@ -751,7 +777,8 @@ impl NatsStorageAdapter {
     /// Returns the current monotonic epoch for this artefact from the meta stream.
     ///
     /// # Errors
-    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if reading fails.
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`]
+    /// or [`FailureCondition::TransportUnavailable`] if reading fails.
     pub fn current_epoch(&self) -> Result<u64, OperationFailure> {
         let meta = self.read_meta_records()?;
         Ok(meta.latest_claim.map_or(0, |c| c.epoch))
@@ -1603,7 +1630,7 @@ impl NatsStorageAdapter {
                 let info = stream
                     .info()
                     .await
-                    .map_err(|err| map_nats_info_error(&data_name, err))?;
+                    .map_err(|err| map_nats_info_error(&data_name, &err))?;
                 (
                     info.state.messages,
                     info.state.first_sequence,
@@ -2222,7 +2249,7 @@ impl StorageEngine for NatsEngine {
                 let info = stream
                     .info()
                     .await
-                    .map_err(|err| map_nats_info_error(&data_name, err))?;
+                    .map_err(|err| map_nats_info_error(&data_name, &err))?;
                 (
                     info.state.messages,
                     info.state.first_sequence,
@@ -3054,5 +3081,82 @@ mod tests {
             *res.expect_err("must fail").condition(),
             FailureCondition::TransportUnavailable
         );
+    }
+
+    #[test]
+    fn test_map_nats_info_error_no_responders_is_transport_unavailable() {
+        use async_nats::jetstream::context::{RequestError, RequestErrorKind};
+        let err = RequestError::new(RequestErrorKind::NoResponders);
+        let failure = map_nats_info_error("test_stream", &err);
+        assert_eq!(*failure.condition(), FailureCondition::TransportUnavailable);
+        assert!(failure
+            .diagnostic_detail()
+            .message()
+            .contains("test_stream"));
+    }
+
+    #[test]
+    fn test_map_nats_info_error_stream_not_found_is_no_artefact() {
+        use async_nats::jetstream::context::{RequestError, RequestErrorKind};
+        let err_code = async_nats::jetstream::ErrorCode::STREAM_NOT_FOUND.0;
+        let js_err: async_nats::jetstream::Error = serde_json::from_str(&format!(
+            r#"{{"code": 404, "err_code": {err_code}, "description": "stream not found"}}"#
+        ))
+        .unwrap();
+        let err = RequestError::with_source(RequestErrorKind::Other, js_err);
+        let failure = map_nats_info_error("test_stream", &err);
+        assert_eq!(*failure.condition(), FailureCondition::NoArtefactExists);
+    }
+
+    #[test]
+    fn test_map_nats_info_error_timed_out_is_transport_unavailable() {
+        use async_nats::jetstream::context::{RequestError, RequestErrorKind};
+        let err = RequestError::new(RequestErrorKind::TimedOut);
+        let failure = map_nats_info_error("test_stream", &err);
+        assert_eq!(*failure.condition(), FailureCondition::TransportUnavailable);
+        assert!(failure
+            .diagnostic_detail()
+            .message()
+            .contains("test_stream"));
+    }
+
+    #[test]
+    fn test_map_meta_raw_message_error_missing_is_ownership_record_unreadable() {
+        let err = RawMessageError::new(RawMessageErrorKind::NoMessageFound);
+        let failure = map_meta_raw_message_error(42, &err);
+        assert_eq!(
+            *failure.condition(),
+            FailureCondition::OwnershipRecordUnreadable
+        );
+        assert!(failure.diagnostic_detail().message().contains("seq 42"));
+    }
+
+    #[test]
+    fn test_map_meta_raw_message_error_other_is_transport_unavailable() {
+        let err = RawMessageError::new(RawMessageErrorKind::Other);
+        let failure = map_meta_raw_message_error(42, &err);
+        assert_eq!(*failure.condition(), FailureCondition::TransportUnavailable);
+        assert!(failure.diagnostic_detail().message().contains("seq 42"));
+    }
+
+    #[test]
+    fn test_read_meta_records_transport_unavailable_when_server_dropped() {
+        let server = crate::test_support::LiveNatsServer::isolated();
+        let mut adapter =
+            NatsStorageAdapter::new(server.url(), "read_meta_transport_drop").unwrap();
+        adapter.js.set_timeout(Duration::from_millis(200));
+        let claim = OwnershipClaimRecord {
+            epoch: 1,
+            machine_id: [1; 16],
+            boot_id: [2; 16],
+            process_id: 1,
+            process_start_time_ns: 1,
+            claim_time_ns: 1,
+            operator_label: "fixture".into(),
+        };
+        adapter.create_incomplete_meta_only(&claim).unwrap();
+        drop(server);
+        let err = adapter.read_meta_records().unwrap_err();
+        assert_eq!(*err.condition(), FailureCondition::TransportUnavailable);
     }
 }

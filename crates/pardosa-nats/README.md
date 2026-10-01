@@ -53,7 +53,8 @@ When operations fail, typed error conditions indicate specific remedies:
 - `StaleEpoch`: Writer session epoch was superseded by another claimant. Remedy: Relinquish session; renew exclusive lease before retrying.
 - `StoreAlreadyExists`: Attempted exclusive create on an existing stream stem. Remedy: Use strict open instead of create, or specify a distinct artefact stem.
 - `NoArtefactExists`: Artefact streams do not exist in JetStream. Remedy: Verify stream stem name and ensure artefact was initialized via create.
-- `OwnershipRecordUnreadable`: Metadata stream read/write failed or timed out. Remedy: Check NATS cluster connectivity and JetStream health; retry.
+- `OwnershipRecordUnreadable`: Metadata stream records unreadable or corrupt. Remedy: Verify stream integrity and schema descriptor.
+- `TransportUnavailable`: Underlying NATS transport or cluster unavailable or timed out. Remedy: Check NATS connectivity, cluster health, and authentication credentials; retry operation.
 
 ## Cargo Features
 
