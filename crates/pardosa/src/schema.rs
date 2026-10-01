@@ -74,7 +74,7 @@ pub enum DescriptorNode {
         /// Maximum allowed byte length.
         max_bytes: u32,
     },
-    /// 0x0B: Bounded non-empty UTF-8 text (1 <= len <= max_bytes).
+    /// 0x0B: Bounded non-empty UTF-8 text (1 <= len <= `max_bytes`).
     NonEmptyEventString {
         /// Maximum allowed byte length.
         max_bytes: u32,
@@ -170,6 +170,10 @@ impl DescriptorNode {
         self.encoded_len_recursive(0)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "exhaustive calculation across all descriptor node variants"
+    )]
     fn encoded_len_recursive(&self, depth: usize) -> Result<usize, EncodeError> {
         if depth > MAX_RECURSION_DEPTH {
             return Err(EncodeError::DepthExceeded {
@@ -358,19 +362,19 @@ impl DescriptorNode {
                 buf.extend_from_slice(&variants_len.to_le_bytes());
                 for v in variants {
                     if *discriminant_width == 1 {
-                        if v.discriminant > 255 {
+                        let Ok(d8) = u8::try_from(v.discriminant) else {
                             return Err(EncodeError::Custom(
                                 "discriminant exceeds 1-byte width".to_string(),
                             ));
-                        }
-                        buf.push(v.discriminant as u8);
+                        };
+                        buf.push(d8);
                     } else {
-                        if v.discriminant > 65535 {
+                        let Ok(d16) = u16::try_from(v.discriminant) else {
                             return Err(EncodeError::Custom(
                                 "discriminant exceeds 2-byte width".to_string(),
                             ));
-                        }
-                        buf.extend_from_slice(&(v.discriminant as u16).to_le_bytes());
+                        };
+                        buf.extend_from_slice(&d16.to_le_bytes());
                     }
                     let vname_bytes = v.name.as_bytes();
                     let vname_len = u32::try_from(vname_bytes.len())
@@ -397,6 +401,10 @@ impl DescriptorNode {
         Self::decode_recursive(buf, 0)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "exhaustive deserializer across all descriptor node variants"
+    )]
     fn decode_recursive(buf: &[u8], depth: usize) -> Result<(Self, usize), DecodeError> {
         if depth > MAX_DESCRIPTOR_DEPTH {
             return Err(DecodeError::CycleDetected {
@@ -633,11 +641,11 @@ impl DescriptorNode {
                         });
                     }
                     let discriminant = if discriminant_width == 1 {
-                        let d = buf[cursor] as u32;
+                        let d = u32::from(buf[cursor]);
                         cursor += 1;
                         d
                     } else {
-                        let d = u16::from_le_bytes([buf[cursor], buf[cursor + 1]]) as u32;
+                        let d = u32::from(u16::from_le_bytes([buf[cursor], buf[cursor + 1]]));
                         cursor += 2;
                         d
                     };
@@ -908,6 +916,9 @@ impl AdmittedDescriptor {
     }
 
     /// Creates a default valid descriptor for testing.
+    ///
+    /// # Panics
+    /// Panics if the default test descriptor is invalid.
     #[cfg(any(test, feature = "unstable-test-support"))]
     #[must_use]
     pub fn default_for_test() -> Self {
@@ -956,6 +967,10 @@ impl DescriptorNode {
         self.validate_structural_completeness_recursive(0)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "exhaustive structural validation across all descriptor node variants"
+    )]
     fn validate_structural_completeness_recursive(
         &self,
         depth: usize,
@@ -1127,8 +1142,8 @@ impl SchemaIdentity {
     /// Returns hex-encoded representation of the identity digest.
     #[must_use]
     pub fn to_hex(&self) -> String {
-        let mut s = String::with_capacity(64);
         const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+        let mut s = String::with_capacity(64);
         for &b in &self.0 {
             s.push(HEX_CHARS[(b >> 4) as usize] as char);
             s.push(HEX_CHARS[(b & 0x0F) as usize] as char);
@@ -1155,6 +1170,7 @@ pub trait PardosaSchema: Sized {
     fn schema_descriptor() -> DescriptorNode;
 
     /// Derives schema identity.
+    #[must_use]
     fn schema_identity() -> SchemaIdentity {
         let desc = SchemaDescriptor::new(Self::SCHEMA_VERSION, Self::schema_descriptor());
         let admitted = AdmittedDescriptor::try_from_descriptor(desc)
@@ -1287,7 +1303,7 @@ impl PardosaType for i8 {
         DescriptorNode::I8
     }
     fn encode_type(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
-        buf.push(*self as u8);
+        buf.push((*self).cast_unsigned());
         Ok(())
     }
     fn decode_type(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
@@ -1297,7 +1313,7 @@ impl PardosaType for i8 {
                 available: 0,
             });
         }
-        Ok((buf[0] as i8, 1))
+        Ok((buf[0].cast_signed(), 1))
     }
 }
 
@@ -1372,7 +1388,7 @@ impl PardosaType for bool {
         DescriptorNode::Bool
     }
     fn encode_type(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
-        buf.push(if *self { 0x01 } else { 0x00 });
+        buf.push(u8::from(*self));
         Ok(())
     }
     fn decode_type(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
@@ -1459,13 +1475,8 @@ impl<T: PardosaType> PardosaType for Option<T> {
 impl<const MAX: usize> PardosaType for EventString<MAX> {
     const TYPE_DEPTH: usize = 0;
     fn descriptor_node() -> DescriptorNode {
-        assert!(
-            MAX <= u32::MAX as usize,
-            "const MAX exceeds u32::MAX wire limit"
-        );
-        DescriptorNode::EventString {
-            max_bytes: MAX as u32,
-        }
+        let max_bytes = u32::try_from(MAX).expect("const MAX exceeds u32::MAX wire limit");
+        DescriptorNode::EventString { max_bytes }
     }
     fn encode_type(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
         self.encode(buf);
@@ -1479,13 +1490,8 @@ impl<const MAX: usize> PardosaType for EventString<MAX> {
 impl<const MAX: usize> PardosaType for NonEmptyEventString<MAX> {
     const TYPE_DEPTH: usize = 0;
     fn descriptor_node() -> DescriptorNode {
-        assert!(
-            MAX <= u32::MAX as usize,
-            "const MAX exceeds u32::MAX wire limit"
-        );
-        DescriptorNode::NonEmptyEventString {
-            max_bytes: MAX as u32,
-        }
+        let max_bytes = u32::try_from(MAX).expect("const MAX exceeds u32::MAX wire limit");
+        DescriptorNode::NonEmptyEventString { max_bytes }
     }
     fn encode_type(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
         self.encode(buf);
@@ -1499,13 +1505,8 @@ impl<const MAX: usize> PardosaType for NonEmptyEventString<MAX> {
 impl<const MAX: usize> PardosaType for EventBytes<MAX> {
     const TYPE_DEPTH: usize = 0;
     fn descriptor_node() -> DescriptorNode {
-        assert!(
-            MAX <= u32::MAX as usize,
-            "const MAX exceeds u32::MAX wire limit"
-        );
-        DescriptorNode::EventBytes {
-            max_bytes: MAX as u32,
-        }
+        let max_bytes = u32::try_from(MAX).expect("const MAX exceeds u32::MAX wire limit");
+        DescriptorNode::EventBytes { max_bytes }
     }
     fn encode_type(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
         self.encode(buf);
@@ -1519,13 +1520,10 @@ impl<const MAX: usize> PardosaType for EventBytes<MAX> {
 impl<T: PardosaType, const MAX: usize> PardosaType for EventVec<T, MAX> {
     const TYPE_DEPTH: usize = T::TYPE_DEPTH + 1;
     fn descriptor_node() -> DescriptorNode {
-        assert!(
-            MAX <= u32::MAX as usize,
-            "const MAX exceeds u32::MAX wire limit"
-        );
+        let max_items = u32::try_from(MAX).expect("const MAX exceeds u32::MAX wire limit");
         DescriptorNode::EventVec {
             inner: Box::new(T::descriptor_node()),
-            max_items: MAX as u32,
+            max_items,
         }
     }
     fn encode_type(&self, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
@@ -1533,7 +1531,9 @@ impl<T: PardosaType, const MAX: usize> PardosaType for EventVec<T, MAX> {
         if count > MAX {
             return Err(EncodeError::ItemCountExceeded { count, max: MAX });
         }
-        buf.extend_from_slice(&(count as u32).to_le_bytes());
+        let count_u32 =
+            u32::try_from(count).map_err(|_| EncodeError::ItemCountExceeded { count, max: MAX })?;
+        buf.extend_from_slice(&count_u32.to_le_bytes());
         for item in self.as_slice() {
             item.encode_type(buf)?;
         }
@@ -1684,7 +1684,7 @@ mod tests {
     fn test_invalid_discriminant_width() {
         let mut buf = vec![0x10];
         let name_bytes = b"Test";
-        buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&4u32.to_le_bytes());
         buf.extend_from_slice(name_bytes);
         buf.push(3);
         buf.extend_from_slice(&0u32.to_le_bytes());
@@ -1869,7 +1869,7 @@ mod tests {
     #[test]
     fn test_event_vec_decode_allocation_bomb_rejection() {
         let buf = [255, 255, 255, 255];
-        let err = EventVec::<u64, 4294967295>::decode_type(&buf).unwrap_err();
+        let err = EventVec::<u64, 4_294_967_295>::decode_type(&buf).unwrap_err();
         assert!(matches!(
             err,
             DecodeError::TruncatedPayload {
@@ -2161,11 +2161,11 @@ mod tests {
         assert_eq!(expected_len, 66025);
         assert!(expected_len > MAX_DESCRIPTOR_RECORD_BYTES);
 
-        let count_before = THREAD_ENCODE_CALL_COUNT.with(|cell| cell.get());
+        let count_before = THREAD_ENCODE_CALL_COUNT.with(std::cell::Cell::get);
         let err = AdmittedDescriptor::try_from_descriptor(desc).expect_err(
             "aggregate fields exceeding 64 KiB must be rejected with TooLong before allocation",
         );
-        let count_after = THREAD_ENCODE_CALL_COUNT.with(|cell| cell.get());
+        let count_after = THREAD_ENCODE_CALL_COUNT.with(std::cell::Cell::get);
         assert_eq!(
             count_before, count_after,
             "root.encode must not be executed when aggregate descriptor exceeds 64 KiB"
@@ -2184,6 +2184,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "table-driven exhaustive parity check over all descriptor node shapes"
+    )]
     fn test_descriptor_node_encoded_len_parity() {
         let shapes = vec![
             DescriptorNode::U8,

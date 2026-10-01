@@ -271,13 +271,8 @@ impl<S: fmt::Debug, T: fmt::Debug, F> fmt::Debug for MigrationManager<S, T, F> {
             .field("source", &self.source)
             .field("target", &self.target)
             .field("phase", &self.phase)
-            .finish()
+            .finish_non_exhaustive()
     }
-}
-
-#[allow(dead_code)]
-fn identity_transformer(payload: &[u8]) -> Result<Vec<u8>, OperationFailure> {
-    Ok(payload.to_vec())
 }
 
 impl<S: MigrationSource, T: MigrationTarget>
@@ -417,7 +412,7 @@ mod tests {
             rescue_policy: RescuePolicy::Strict,
             rescue_policy_parameters: Vec::new(),
             broken_chain_election: BrokenChainElection::RefuseOnBreak,
-            transformer: identity_transformer,
+            transformer: |p: &[u8]| Ok(p.to_vec()),
             source_generation: 1,
             target_generation: 2,
             phase: MigrationPhase::Initial,
@@ -445,7 +440,7 @@ mod tests {
             rescue_policy: RescuePolicy::Strict,
             rescue_policy_parameters: Vec::new(),
             broken_chain_election: BrokenChainElection::RefuseOnBreak,
-            transformer: identity_transformer,
+            transformer: |p: &[u8]| Ok(p.to_vec()),
             source_generation: 1,
             target_generation: 2,
             phase: MigrationPhase::Initial,

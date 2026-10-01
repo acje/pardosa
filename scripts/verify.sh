@@ -30,7 +30,7 @@ echo "==> Running cargo test..."
 cargo test --workspace --locked
 
 echo "==> Running cargo clippy..."
-cargo clippy --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 
 echo "==> Running cargo fmt check..."
 cargo fmt --all -- --check

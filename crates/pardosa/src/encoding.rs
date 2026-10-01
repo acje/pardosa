@@ -178,7 +178,7 @@ impl DecodeError {
 
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -225,7 +225,7 @@ pub enum EncodeError {
 
 impl fmt::Display for EncodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -263,6 +263,10 @@ impl<const MAX: usize> EventString<MAX> {
     }
 
     /// Encodes this event string into wire format.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "length bounded by MAX <= u32::MAX"
+    )]
     pub fn encode(&self, buf: &mut Vec<u8>) {
         let len = self.0.len() as u32;
         buf.extend_from_slice(&len.to_le_bytes());
@@ -354,6 +358,10 @@ impl<const MAX: usize> NonEmptyEventString<MAX> {
     }
 
     /// Encodes into wire format.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "length bounded by MAX <= u32::MAX"
+    )]
     pub fn encode(&self, buf: &mut Vec<u8>) {
         let len = self.0.len() as u32;
         buf.extend_from_slice(&len.to_le_bytes());
@@ -445,6 +453,10 @@ impl<const MAX: usize> EventBytes<MAX> {
     }
 
     /// Encodes into wire format.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "length bounded by MAX <= u32::MAX"
+    )]
     pub fn encode(&self, buf: &mut Vec<u8>) {
         let len = self.0.len() as u32;
         buf.extend_from_slice(&len.to_le_bytes());
@@ -739,7 +751,7 @@ impl EnvelopeHeader {
     pub fn encode(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.event_id);
         buf.extend_from_slice(&self.fiber_id);
-        buf.push(if self.detached { 0x01 } else { 0x00 });
+        buf.push(u8::from(self.detached));
         buf.extend_from_slice(&self.precursor);
         buf.extend_from_slice(&self.precursor_hash);
     }
@@ -775,16 +787,13 @@ impl<'a> EventEnvelopeRef<'a> {
             buf[header_consumed + 2],
             buf[header_consumed + 3],
         ]) as usize;
-        let total_consumed = match header_consumed
+        let Some(total_consumed) = header_consumed
             .checked_add(4)
             .and_then(|h| h.checked_add(payload_len))
-        {
-            Some(c) => c,
-            None => {
-                return Err(DecodeError::ValueConstraintViolated {
-                    constraint: ValueConstraint::TooLong,
-                });
-            }
+        else {
+            return Err(DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            });
         };
         if buf.len() < total_consumed {
             return Err(DecodeError::TruncatedPayload {
@@ -862,7 +871,7 @@ impl EventEnvelope {
     ///
     /// # Errors
     /// Returns `ValueConstraintViolated(TooLong)` if 85 + payload length exceeds
-    /// u32::MAX or overflows usize. The output is unchanged on validation failure.
+    /// `u32::MAX` or overflows usize. The output is unchanged on validation failure.
     pub fn encode(&self, buf: &mut Vec<u8>) -> Result<(), DecodeError> {
         self.encode_bounded(buf, u32::MAX as usize)
     }
@@ -894,7 +903,7 @@ impl EventEnvelope {
     /// # Errors
     /// Returns [`DecodeError::ValueConstraintViolated`] with [`ValueConstraint::Empty`]
     /// if `event_id` is all zeroes.
-    /// Returns `ValueConstraintViolated(TooLong)` if the complete wire size exceeds u32::MAX.
+    /// Returns `ValueConstraintViolated(TooLong)` if the complete wire size exceeds `u32::MAX`.
     pub fn genesis(
         event_id: [u8; 16],
         fiber_id: [u8; 16],
@@ -924,7 +933,7 @@ impl EventEnvelope {
     /// # Errors
     /// Returns [`DecodeError::ValueConstraintViolated`] with [`ValueConstraint::Empty`]
     /// if `event_id` or `predecessor.header.event_id` is all zeroes.
-    /// Returns `ValueConstraintViolated(TooLong)` if the complete wire size exceeds u32::MAX.
+    /// Returns `ValueConstraintViolated(TooLong)` if the complete wire size exceeds `u32::MAX`.
     pub fn chain(
         predecessor: &EventEnvelope,
         event_id: [u8; 16],
@@ -954,7 +963,7 @@ impl EventEnvelope {
     /// # Errors
     /// Returns [`DecodeError::ValueConstraintViolated`] with [`ValueConstraint::Empty`]
     /// if `event_id` or `predecessor.header.event_id` is all zeroes.
-    /// Returns `ValueConstraintViolated(TooLong)` if the complete wire size exceeds u32::MAX.
+    /// Returns `ValueConstraintViolated(TooLong)` if the complete wire size exceeds `u32::MAX`.
     pub fn chain_detached(
         predecessor: &EventEnvelope,
         event_id: [u8; 16],
@@ -987,7 +996,7 @@ pub fn compute_envelope_commitment(header: &EnvelopeHeader, payload: &[u8]) -> [
     let mut hasher = blake3::Hasher::new();
     hasher.update(&header.event_id);
     hasher.update(&header.fiber_id);
-    hasher.update(&[if header.detached { 0x01 } else { 0x00 }]);
+    hasher.update(&[u8::from(header.detached)]);
     hasher.update(&header.precursor);
     hasher.update(&header.precursor_hash);
     hasher.update(payload);
@@ -1046,13 +1055,10 @@ impl PartitioningRule {
         }
         let tag = buf[0];
         let param_len = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
-        let total_consumed = match 5usize.checked_add(param_len) {
-            Some(t) => t,
-            None => {
-                return Err(DecodeError::ValueConstraintViolated {
-                    constraint: ValueConstraint::TooLong,
-                });
-            }
+        let Some(total_consumed) = 5usize.checked_add(param_len) else {
+            return Err(DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            });
         };
         if buf.len() < total_consumed {
             return Err(DecodeError::TruncatedPayload {
@@ -1321,6 +1327,9 @@ impl OwnershipRecord {
     }
 
     /// Encodes this ownership record into wire format.
+    ///
+    /// # Panics
+    /// Panics if operator label or rescue parameter payload length exceeds `u32::MAX`.
     pub fn encode(&self, buf: &mut Vec<u8>) {
         buf.push(self.wire_tag());
         match self {
@@ -1332,7 +1341,9 @@ impl OwnershipRecord {
                 buf.extend_from_slice(&c.process_start_time_ns.to_le_bytes());
                 buf.extend_from_slice(&c.claim_time_ns.to_le_bytes());
                 let label_bytes = c.operator_label.as_bytes();
-                buf.extend_from_slice(&(label_bytes.len() as u32).to_le_bytes());
+                let label_len = u32::try_from(label_bytes.len())
+                    .expect("operator label length exceeds u32::MAX");
+                buf.extend_from_slice(&label_len.to_le_bytes());
                 buf.extend_from_slice(label_bytes);
             }
             Self::CleanRelease(r) => {
@@ -1361,7 +1372,9 @@ impl OwnershipRecord {
             }
             Self::RescuePolicyChoice(p) => {
                 buf.push(p.policy_tag);
-                buf.extend_from_slice(&(p.parameter_payload.len() as u32).to_le_bytes());
+                let param_len = u32::try_from(p.parameter_payload.len())
+                    .expect("rescue parameter payload length exceeds u32::MAX");
+                buf.extend_from_slice(&param_len.to_le_bytes());
                 buf.extend_from_slice(&p.parameter_payload);
             }
             Self::IdentityStructure(ids) => {
@@ -1385,6 +1398,10 @@ impl OwnershipRecord {
     /// # Errors
     /// Returns `DecodeError::TruncatedPayload` if bytes are truncated.
     /// Returns `DecodeError::UnknownRecordTag` if tag is outside 0x01..=0x09.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "exhaustive deserializer across all ownership record variants"
+    )]
     pub fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
         if buf.is_empty() {
             return Err(DecodeError::TruncatedPayload {
@@ -1419,16 +1436,13 @@ impl OwnershipRecord {
                     buf[57], buf[58], buf[59], buf[60], buf[61], buf[62], buf[63], buf[64],
                 ]);
                 let label_len = u32::from_le_bytes([buf[65], buf[66], buf[67], buf[68]]) as usize;
-                let total_len = match fixed_prefix
+                let Some(total_len) = fixed_prefix
                     .checked_add(4)
                     .and_then(|l| l.checked_add(label_len))
-                {
-                    Some(l) => l,
-                    None => {
-                        return Err(DecodeError::ValueConstraintViolated {
-                            constraint: ValueConstraint::TooLong,
-                        });
-                    }
+                else {
+                    return Err(DecodeError::ValueConstraintViolated {
+                        constraint: ValueConstraint::TooLong,
+                    });
                 };
                 if buf.len() < total_len {
                     return Err(DecodeError::TruncatedPayload {
@@ -1573,13 +1587,10 @@ impl OwnershipRecord {
                 }
                 let policy_tag = buf[1];
                 let param_len = u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]) as usize;
-                let total_len = match 6usize.checked_add(param_len) {
-                    Some(l) => l,
-                    None => {
-                        return Err(DecodeError::ValueConstraintViolated {
-                            constraint: ValueConstraint::TooLong,
-                        });
-                    }
+                let Some(total_len) = 6usize.checked_add(param_len) else {
+                    return Err(DecodeError::ValueConstraintViolated {
+                        constraint: ValueConstraint::TooLong,
+                    });
                 };
                 if buf.len() < total_len {
                     return Err(DecodeError::TruncatedPayload {
@@ -1610,13 +1621,10 @@ impl OwnershipRecord {
                 let dragline_id = u32::from_le_bytes([buf[21], buf[22], buf[23], buf[24]]);
                 let (partitioning_rule, rule_consumed) =
                     PartitioningRule::decode(&buf[prefix_len..])?;
-                let total_len = match prefix_len.checked_add(rule_consumed) {
-                    Some(l) => l,
-                    None => {
-                        return Err(DecodeError::ValueConstraintViolated {
-                            constraint: ValueConstraint::TooLong,
-                        });
-                    }
+                let Some(total_len) = prefix_len.checked_add(rule_consumed) else {
+                    return Err(DecodeError::ValueConstraintViolated {
+                        constraint: ValueConstraint::TooLong,
+                    });
                 };
                 Ok((
                     Self::IdentityStructure(IdentityStructureRecord {
@@ -1760,8 +1768,8 @@ mod tests {
         let err = Timestamp::new(0).unwrap_err();
         assert_eq!(err.error_kind(), "InvalidTimestampSentinel");
 
-        let ts = Timestamp::new(123456789).unwrap();
-        assert_eq!(ts.as_nanos(), 123456789);
+        let ts = Timestamp::new(123_456_789).unwrap();
+        assert_eq!(ts.as_nanos(), 123_456_789);
 
         let mut buf = Vec::new();
         ts.encode(&mut buf);
@@ -1812,7 +1820,7 @@ mod tests {
                 structure_version: 1,
                 dragline_id: 7,
                 partitioning_rule: PartitioningRule::ConsistentHash {
-                    hash_seed: 0xDEADBEEF,
+                    hash_seed: 0xDEAD_BEEF,
                     virtual_node_count: 64,
                 },
             }),

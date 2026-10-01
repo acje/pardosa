@@ -413,13 +413,12 @@ impl<E: StorageEngine> Store<E> {
             }
             WriteLandingVerdict::Undetermined { carried_epoch } => {
                 self.uncertain = true;
-                let diag = self
-                    .engine
-                    .uncertain_diagnostic()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| {
+                let diag = self.engine.uncertain_diagnostic().map_or_else(
+                    || {
                         format!("writer session in uncertain state; reconciliation required: write landing undetermined for carried epoch {carried_epoch} per C5.16")
-                    });
+                    },
+                    ToString::to_string,
+                );
                 self.uncertain_diagnostic = Some(diag);
                 Ok(WriteLandingVerdict::Undetermined { carried_epoch })
             }
@@ -573,7 +572,7 @@ impl<E: StorageEngine> Store<E> {
                     ));
                 }
             }
-            let idx = SessionIndex::build_from_frames(frames.iter().map(|f| f.as_slice()))?;
+            let idx = SessionIndex::build_from_frames(frames.iter().map(Vec::as_slice))?;
             if !for_migration && idx.has_broken_fibers() {
                 self.fiber_index = idx;
                 return Err(OperationFailure::new(
@@ -736,6 +735,9 @@ impl<E: StorageEngine> Store<E> {
     ///
     /// # Errors
     /// Returns [`OperationFailure`] if reading fails, decoding fails, or the reader retained broken state.
+    ///
+    /// # Panics
+    /// Panics if accumulator state is violated during fold iteration.
     pub fn fold_envelopes<B, F>(&mut self, init: B, mut f: F) -> Result<B, OperationFailure>
     where
         F: FnMut(B, EventEnvelopeRef<'_>) -> Result<B, OperationFailure>,

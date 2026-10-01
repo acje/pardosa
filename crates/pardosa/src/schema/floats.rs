@@ -344,7 +344,7 @@ impl PardosaType for EventF32 {
             }
             0x03 => Ok((Self::PosInf, 1)),
             other => Err(DecodeError::UnknownVariantDiscriminant {
-                discriminant: other as u32,
+                discriminant: u32::from(other),
             }),
         }
     }
@@ -498,13 +498,19 @@ impl PardosaType for EventF64 {
             }
             0x03 => Ok((Self::PosInf, 1)),
             other => Err(DecodeError::UnknownVariantDiscriminant {
-                discriminant: other as u32,
+                discriminant: u32::from(other),
             }),
         }
     }
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::float_cmp,
+    clippy::similar_names,
+    clippy::too_many_lines,
+    reason = "floating point tests compare exact values, use similar naming patterns, and test exhaustive contracts"
+)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
@@ -1078,7 +1084,7 @@ mod tests {
             assert_eq!(
                 err,
                 DecodeError::UnknownVariantDiscriminant {
-                    discriminant: bad as u32,
+                    discriminant: u32::from(bad),
                 }
             );
         }
@@ -1290,7 +1296,7 @@ mod tests {
             assert_eq!(
                 err,
                 DecodeError::UnknownVariantDiscriminant {
-                    discriminant: bad as u32,
+                    discriminant: u32::from(bad),
                 }
             );
         }

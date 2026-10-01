@@ -29,7 +29,7 @@ pub(crate) enum FiberSlot {
 /// # Resource Contract
 /// - Boundary: Pure count-based bounding for `SessionIndex` and store sessions per Priority 3.
 /// - Named Budgets: `MAX_ACTIVE_FIBERS = 100_000` and `MAX_EVENTS_PER_FIBER = 100_000`.
-/// - Explicit Application Exclusions: In-memory tip payload allocations, transient bulk history buffers during `read_all_frames`/`build_from_frames`, process stack, allocator heap overhead, and durable payload storage in OS page cache or JetStream streams. Byte-reservation scaffolding is permanently retired.
+/// - Explicit Application Exclusions: In-memory tip payload allocations, transient bulk history buffers during `read_all_frames`/`build_from_frames`, process stack, allocator heap overhead, and durable payload storage in OS page cache or `JetStream` streams. Byte-reservation scaffolding is permanently retired.
 /// - Exhaustion: `ValueConstraint::TooLong` when fiber count or event count exceeds 100,000.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionIndex {
@@ -73,6 +73,10 @@ impl SessionIndex {
     ///
     /// # Errors
     /// Returns [`OperationFailure`] if index capacity limits are exceeded.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "public API signature takes owned String"
+    )]
     pub fn mark_fiber_broken(
         &mut self,
         fiber_id: [u8; 16],
@@ -232,7 +236,7 @@ impl SessionIndex {
     /// Validates an event envelope candidate against session index constraints before write landing.
     ///
     /// # Errors
-    /// Returns [`OperationFailure`] if raw frames exist, event_id is zero, duplicate event_id is seen,
+    /// Returns [`OperationFailure`] if raw frames exist, `event_id` is zero, duplicate `event_id` is seen,
     /// precursor chain or hash is broken, event count limit is reached, or capacity limit is breached.
     pub fn validate_append(&self, envelope: &EventEnvelope) -> Result<(), OperationFailure> {
         if self.has_raw_frames {
@@ -258,7 +262,8 @@ impl SessionIndex {
             ));
         }
 
-        let max_seen_events = MAX_ACTIVE_FIBERS.saturating_mul(MAX_EVENTS_PER_FIBER as usize);
+        let max_seen_events = MAX_ACTIVE_FIBERS
+            .saturating_mul(usize::try_from(MAX_EVENTS_PER_FIBER).unwrap_or(usize::MAX));
         if self.seen_event_ids.len() >= max_seen_events {
             return Err(OperationFailure::new(
                 FailureCondition::ValueConstraintViolated {
@@ -418,7 +423,8 @@ impl SessionIndex {
             *event_count = next_count;
         }
 
-        let max_seen_events = MAX_ACTIVE_FIBERS.saturating_mul(MAX_EVENTS_PER_FIBER as usize);
+        let max_seen_events = MAX_ACTIVE_FIBERS
+            .saturating_mul(usize::try_from(MAX_EVENTS_PER_FIBER).unwrap_or(usize::MAX));
         if !self.seen_event_ids.contains(&event_id) {
             if self.seen_event_ids.len() >= max_seen_events {
                 return Err(OperationFailure::new(
@@ -491,6 +497,11 @@ impl SessionIndex {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "test harnesses generate bounded index sequences with loop counters"
+)]
 mod tests {
     use super::*;
 

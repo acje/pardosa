@@ -148,9 +148,10 @@ impl FiberHandle {
 
             prev_event_id = env.header.event_id;
             prev_commitment = env.commitment();
-            current_state = match env.header.detached {
-                true => FiberState::Detached,
-                false => FiberState::Defined,
+            current_state = if env.header.detached {
+                FiberState::Detached
+            } else {
+                FiberState::Defined
             };
         }
 
@@ -873,6 +874,11 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::similar_names,
+        clippy::too_many_lines,
+        reason = "test verifies boundaries across defined, detached, and purged states"
+    )]
     fn test_fiber_handle_h4_max_count_boundary_and_purged_rules() {
         let fiber_id = [0xa0; 16];
 

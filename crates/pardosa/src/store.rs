@@ -108,7 +108,7 @@ impl fmt::Display for AttemptedTransition {
             Self::Update => write!(f, "update"),
             Self::Detach => write!(f, "detach"),
             Self::Rescue => write!(f, "rescue"),
-            Self::Migrate(policy) => write!(f, "migrate({:?})", policy),
+            Self::Migrate(policy) => write!(f, "migrate({policy:?})"),
         }
     }
 }
@@ -181,38 +181,34 @@ impl FiberState {
     }
 
     pub(crate) fn apply_action(
-        &self,
+        self,
         action: AttemptedTransition,
     ) -> Result<Self, IllegalStateTransition> {
         match (self, &action) {
-            (Self::Undefined, AttemptedTransition::Create) => Ok(Self::Defined),
-            (Self::Defined, AttemptedTransition::Update) => Ok(Self::Defined),
             (Self::Defined, AttemptedTransition::Detach) => Ok(Self::Detached),
-            (Self::Detached, AttemptedTransition::Rescue) => Ok(Self::Defined),
             (Self::Detached, AttemptedTransition::Migrate(FiberMigrationPolicy::Keep)) => {
                 Ok(Self::Detached)
             }
             (Self::Detached, AttemptedTransition::Migrate(FiberMigrationPolicy::LockAndPrune)) => {
                 Ok(Self::Locked)
             }
-            (Self::Detached, AttemptedTransition::Migrate(FiberMigrationPolicy::Purge)) => {
-                Ok(Self::Purged)
-            }
-            (Self::Locked, AttemptedTransition::Rescue) => Ok(Self::Defined),
-            (Self::Locked, AttemptedTransition::Migrate(FiberMigrationPolicy::Purge)) => {
-                Ok(Self::Purged)
-            }
-            (Self::Purged, AttemptedTransition::Create) => Ok(Self::Defined),
+            (
+                Self::Detached | Self::Locked,
+                AttemptedTransition::Migrate(FiberMigrationPolicy::Purge),
+            ) => Ok(Self::Purged),
+            (Self::Undefined | Self::Purged, AttemptedTransition::Create)
+            | (Self::Defined, AttemptedTransition::Update)
+            | (Self::Detached | Self::Locked, AttemptedTransition::Rescue) => Ok(Self::Defined),
             _ => Err(IllegalStateTransition {
-                from: *self,
+                from: self,
                 attempted: action,
             }),
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn can_apply_action(&self, action: &AttemptedTransition) -> bool {
-        self.apply_action(*action).is_ok()
+    pub(crate) fn can_apply_action(self, action: AttemptedTransition) -> bool {
+        self.apply_action(action).is_ok()
     }
 
     /// Rescues a locked fiber with the specified rescue policy per C6.1 and C6.19.
@@ -345,7 +341,7 @@ pub struct ResumeCursor<'brand> {
     _brand: std::marker::PhantomData<fn(&'brand ()) -> &'brand ()>,
 }
 
-impl<'brand> ResumeCursor<'brand> {
+impl ResumeCursor<'_> {
     /// Returns the stream position of the cursor.
     #[must_use]
     pub fn position(&self) -> u64 {
@@ -376,8 +372,8 @@ pub const MAX_STREAM_ITEMS: usize = 65_536;
 /// # Resource Contract
 /// - Boundary: Per-reader session in-memory queued stream.
 /// - Accounting: Formula covers per-reader queued payload capacities plus a nominal 85-byte header charge per envelope. This numerical limit (64 MiB) is an implementation policy constraint (Moltke policy per pardosa-3hek.10 / pardosa-3hek.12), not an architectural limit defined by C5.22.
-/// - Exclusions: Excludes reader-owned Vec/VecDeque container slot allocations and spare capacity, BTreeMap index nodes, current wire frame and transient frame/decode overlap during `with_frames`, caller iterator internals, locators, returned results, standard library allocator/runtime overhead, and concurrent readers.
-/// - Lifetimes: On terminal error or capacity refusal, unread payload allocations are immediately dropped via `stream.clear()` and `retained_bytes` is reset to 0, while VecDeque backing capacity and index nodes remain allocated until the reader session is dropped.
+/// - Exclusions: Excludes reader-owned Vec/VecDeque container slot allocations and spare capacity, `BTreeMap` index nodes, current wire frame and transient frame/decode overlap during `with_frames`, caller iterator internals, locators, returned results, standard library allocator/runtime overhead, and concurrent readers.
+/// - Lifetimes: On terminal error or capacity refusal, unread payload allocations are immediately dropped via `stream.clear()` and `retained_bytes` is reset to 0, while `VecDeque` backing capacity and index nodes remain allocated until the reader session is dropped.
 pub const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -495,8 +491,8 @@ impl ArtefactReader<'_> {
     /// # Resource Contract
     /// - Boundary: Per-reader session in-memory queued stream.
     /// - Accounting: Formula covers per-reader queued payload capacities plus a nominal 85-byte header charge per envelope across all currently queued envelopes.
-    /// - Exclusions: Excludes reader-owned Vec/VecDeque container slot allocations and spare capacity, BTreeMap index nodes, current wire frame and transient frame/decode overlap during `with_frames`, caller iterator internals, locators, returned results, standard library allocator/runtime overhead, and concurrent readers.
-    /// - Lifetimes: On terminal error or capacity refusal, unread payload allocations are immediately dropped via `stream.clear()` and `retained_bytes` is reset to 0, while VecDeque backing capacity and index nodes remain allocated until the reader session is dropped.
+    /// - Exclusions: Excludes reader-owned Vec/VecDeque container slot allocations and spare capacity, `BTreeMap` index nodes, current wire frame and transient frame/decode overlap during `with_frames`, caller iterator internals, locators, returned results, standard library allocator/runtime overhead, and concurrent readers.
+    /// - Lifetimes: On terminal error or capacity refusal, unread payload allocations are immediately dropped via `stream.clear()` and `retained_bytes` is reset to 0, while `VecDeque` backing capacity and index nodes remain allocated until the reader session is dropped.
     ///
     /// If item count exceeds [`MAX_STREAM_ITEMS`] or total retained capacity exceeds [`MAX_STREAM_BYTES`]
     /// (Moltke implementation policy), ingestion stops, unread payload allocations are immediately dropped,
@@ -522,12 +518,9 @@ impl ArtefactReader<'_> {
         for env in iter.by_ref() {
             count = count.saturating_add(1);
             if count <= MAX_STREAM_ITEMS {
-                let env_size = match 85usize.checked_add(env.payload.capacity()) {
-                    Some(s) => s,
-                    None => {
-                        byte_capacity_refused = true;
-                        break;
-                    }
+                let Some(env_size) = 85usize.checked_add(env.payload.capacity()) else {
+                    byte_capacity_refused = true;
+                    break;
                 };
                 match retained_bytes.checked_add(env_size) {
                     Some(new_retained) if new_retained <= MAX_STREAM_BYTES => {
@@ -656,16 +649,13 @@ impl ArtefactReader<'_> {
                     ),
                 ));
             }
-            let env_size = match 85usize.checked_add(env.payload.capacity()) {
-                Some(s) => s,
-                None => {
-                    return Err(OperationFailure::new(
-                        FailureCondition::ValueConstraintViolated {
-                            constraint: crate::encoding::ValueConstraint::TooLong,
-                        },
-                        "frame byte limit exceeded",
-                    ));
-                }
+            let Some(env_size) = 85usize.checked_add(env.payload.capacity()) else {
+                return Err(OperationFailure::new(
+                    FailureCondition::ValueConstraintViolated {
+                        constraint: crate::encoding::ValueConstraint::TooLong,
+                    },
+                    "frame byte limit exceeded",
+                ));
             };
             total_bytes = match total_bytes.checked_add(env_size) {
                 Some(b) if b <= MAX_STREAM_BYTES => b,
@@ -701,8 +691,8 @@ impl<'brand> ArtefactReader<'brand> {
     /// # Resource Contract
     /// - Boundary: Per-reader session in-memory queued stream.
     /// - Accounting: Formula covers per-reader queued payload capacities plus a nominal 85-byte header charge per envelope.
-    /// - Exclusions: Excludes reader-owned Vec/VecDeque container slot allocations and spare capacity, BTreeMap index nodes, current wire frame and transient frame/decode overlap during `with_frames`, caller iterator internals, locators, returned results, standard library allocator/runtime overhead, and concurrent readers.
-    /// - Lifetimes: On terminal error or capacity refusal, unread payload allocations are immediately dropped via `stream.clear()` and `retained_bytes` is reset to 0, while VecDeque backing capacity and index nodes remain allocated until the reader session is dropped.
+    /// - Exclusions: Excludes reader-owned Vec/VecDeque container slot allocations and spare capacity, `BTreeMap` index nodes, current wire frame and transient frame/decode overlap during `with_frames`, caller iterator internals, locators, returned results, standard library allocator/runtime overhead, and concurrent readers.
+    /// - Lifetimes: On terminal error or capacity refusal, unread payload allocations are immediately dropped via `stream.clear()` and `retained_bytes` is reset to 0, while `VecDeque` backing capacity and index nodes remain allocated until the reader session is dropped.
     ///
     /// # Errors
     ///
@@ -713,6 +703,10 @@ impl<'brand> ArtefactReader<'brand> {
     /// - Stream retained byte capacity exceeded [`MAX_STREAM_BYTES`] (Moltke policy) during eager intake,
     /// - Active tracked fibers exceed [`MAX_ACTIVE_FIBERS`] per C6.7, or
     /// - The observed position counter overflows [`u64::MAX`].
+    #[expect(
+        clippy::too_many_lines,
+        reason = "complex state machine for event validation and observation"
+    )]
     pub fn read_event(&self) -> Option<Result<ReaderObservation<'brand>, OperationFailure>> {
         let envelope = {
             let mut state = self.state.borrow_mut();
@@ -784,18 +778,15 @@ impl<'brand> ArtefactReader<'brand> {
                     )));
                 }
             }
-            let obs = match self.observe_genesis(&envelope) {
-                Some(o) => o,
-                None => {
-                    let mut state = self.state.borrow_mut();
-                    state.mark_terminally_failed();
-                    return Some(Err(OperationFailure::new(
-                        FailureCondition::ValueConstraintViolated {
-                            constraint: crate::encoding::ValueConstraint::TooLong,
-                        },
-                        "observed position counter overflow",
-                    )));
-                }
+            let Some(obs) = self.observe_genesis(&envelope) else {
+                let mut state = self.state.borrow_mut();
+                state.mark_terminally_failed();
+                return Some(Err(OperationFailure::new(
+                    FailureCondition::ValueConstraintViolated {
+                        constraint: crate::encoding::ValueConstraint::TooLong,
+                    },
+                    "observed position counter overflow",
+                )));
             };
             Some(Ok(obs))
         } else {
@@ -826,19 +817,16 @@ impl<'brand> ArtefactReader<'brand> {
                         )));
                     }
                     Some(_) => {
-                        let fiber = match state.fibers.get(&envelope.header.fiber_id) {
-                            Some(f) => f,
-                            None => {
-                                drop(state);
-                                let mut state = self.state.borrow_mut();
-                                state.mark_terminally_failed();
-                                return Some(Err(OperationFailure::new(
-                                    FailureCondition::PrecursorChainBroken(Some(
-                                        CausalChainError::PrecursorOutOfRange,
-                                    )),
-                                    "fiber has no observed genesis in this artefact per C6.12",
-                                )));
-                            }
+                        let Some(fiber) = state.fibers.get(&envelope.header.fiber_id) else {
+                            drop(state);
+                            let mut state = self.state.borrow_mut();
+                            state.mark_terminally_failed();
+                            return Some(Err(OperationFailure::new(
+                                FailureCondition::PrecursorChainBroken(Some(
+                                    CausalChainError::PrecursorOutOfRange,
+                                )),
+                                "fiber has no observed genesis in this artefact per C6.12",
+                            )));
                         };
                         if fiber.last_event_id != envelope.header.precursor {
                             drop(state);
@@ -861,18 +849,15 @@ impl<'brand> ArtefactReader<'brand> {
                     }
                 }
             }
-            let obs = match self.observe_event(&envelope) {
-                Some(o) => o,
-                None => {
-                    let mut state = self.state.borrow_mut();
-                    state.mark_terminally_failed();
-                    return Some(Err(OperationFailure::new(
-                        FailureCondition::ValueConstraintViolated {
-                            constraint: crate::encoding::ValueConstraint::TooLong,
-                        },
-                        "observed position counter overflow",
-                    )));
-                }
+            let Some(obs) = self.observe_event(&envelope) else {
+                let mut state = self.state.borrow_mut();
+                state.mark_terminally_failed();
+                return Some(Err(OperationFailure::new(
+                    FailureCondition::ValueConstraintViolated {
+                        constraint: crate::encoding::ValueConstraint::TooLong,
+                    },
+                    "observed position counter overflow",
+                )));
             };
             Some(Ok(obs))
         }
@@ -1388,25 +1373,25 @@ impl OperationFailure {
         &self.diagnostic_detail
     }
 
-    /// Returns true if the failure condition is StoreAlreadyExists.
+    /// Returns true if the failure condition is `StoreAlreadyExists`.
     #[must_use]
     pub fn is_already_exists(&self) -> bool {
         matches!(self.condition, FailureCondition::StoreAlreadyExists)
     }
 
-    /// Returns true if the failure condition is NoArtefactExists.
+    /// Returns true if the failure condition is `NoArtefactExists`.
     #[must_use]
     pub fn is_not_found(&self) -> bool {
         matches!(self.condition, FailureCondition::NoArtefactExists)
     }
 
-    /// Returns true if the failure condition is ConcurrencyConflict.
+    /// Returns true if the failure condition is `ConcurrencyConflict`.
     #[must_use]
     pub fn is_concurrency_conflict(&self) -> bool {
         matches!(self.condition, FailureCondition::ConcurrencyConflict)
     }
 
-    /// Returns true if the failure condition is StaleEpoch.
+    /// Returns true if the failure condition is `StaleEpoch`.
     #[must_use]
     pub fn is_stale_epoch(&self) -> bool {
         matches!(self.condition, FailureCondition::StaleEpoch)
@@ -1916,6 +1901,10 @@ impl CreationPlan {
     ///
     /// # Errors
     /// Returns [`FailureCondition::ConcurrencyConflict`] if the record is already seeded or complete.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "linear type progression protocol advances ownership of state transition token"
+    )]
     pub fn seed_claim(
         progression: CreationProgression,
         claim: OwnershipClaimRecord,
@@ -1940,6 +1929,10 @@ impl CreationPlan {
     /// # Errors
     /// - [`FailureCondition::OwnershipUnestablished`] if the ownership record has no claim.
     /// - [`FailureCondition::StoreAlreadyExists`] if artefact creation was already completed.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "linear type progression protocol advances ownership of state transition token"
+    )]
     pub fn complete_event_data(
         progression: CreationProgression,
     ) -> Result<CreationProgression, OperationFailure> {
@@ -2328,14 +2321,11 @@ pub fn admit_precursor_link<'a>(
         return Ok(());
     }
     let requested_precursor_id = &link.envelope.header.precursor;
-    let predecessor = match resolve_predecessor(requested_precursor_id) {
-        Some(p) => p,
-        None => {
-            return Err(OperationFailure::new(
-                FailureCondition::PrecursorChainBroken(Some(CausalChainError::PrecursorOutOfRange)),
-                "precursor event ID is outside the artefact per C6.12",
-            ));
-        }
+    let Some(predecessor) = resolve_predecessor(requested_precursor_id) else {
+        return Err(OperationFailure::new(
+            FailureCondition::PrecursorChainBroken(Some(CausalChainError::PrecursorOutOfRange)),
+            "precursor event ID is outside the artefact per C6.12",
+        ));
     };
     if predecessor.header.event_id != *requested_precursor_id {
         return Err(OperationFailure::new(
@@ -2361,8 +2351,15 @@ pub fn admit_precursor_link<'a>(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::similar_names,
+    clippy::too_many_lines,
+    reason = "test harnesses generate bounded index sequences, test comprehensive state machines, and compare similar variable names"
+)]
 mod tests {
     use super::*;
+    use std::error::Error;
 
     #[test]
     fn test_fiber_lifecycle_all_10_transitions() {
@@ -2428,11 +2425,11 @@ mod tests {
             for action in &all_actions {
                 match state.apply_action(*action) {
                     Ok(_) => {
-                        assert!(state.can_apply_action(action));
+                        assert!(state.can_apply_action(*action));
                         valid_count += 1;
                     }
                     Err(err) => {
-                        assert!(!state.can_apply_action(action));
+                        assert!(!state.can_apply_action(*action));
                         assert_eq!(err.from, *state);
                         assert_eq!(err.attempted, *action);
                         invalid_count += 1;
@@ -2462,6 +2459,12 @@ mod tests {
 
     #[test]
     fn test_typed_attempted_transition_and_two_member_causal_chain_error() {
+        fn check_causal_chain_2_members(e: CausalChainError) {
+            match e {
+                CausalChainError::PrecursorOutOfRange | CausalChainError::PrecursorWrongFiber => {}
+            }
+        }
+
         let err = FiberState::Undefined.update().unwrap_err();
         assert_eq!(err.from, FiberState::Undefined);
         assert_eq!(err.attempted, AttemptedTransition::Update);
@@ -2478,14 +2481,8 @@ mod tests {
             AttemptedTransition::Migrate(FiberMigrationPolicy::Keep)
         );
 
-        fn check_causal_chain_2_members(e: &CausalChainError) {
-            match e {
-                CausalChainError::PrecursorOutOfRange => {}
-                CausalChainError::PrecursorWrongFiber => {}
-            }
-        }
-        check_causal_chain_2_members(&CausalChainError::PrecursorOutOfRange);
-        check_causal_chain_2_members(&CausalChainError::PrecursorWrongFiber);
+        check_causal_chain_2_members(CausalChainError::PrecursorOutOfRange);
+        check_causal_chain_2_members(CausalChainError::PrecursorWrongFiber);
     }
 
     #[test]
@@ -3306,7 +3303,6 @@ mod tests {
             format!("{failure}"),
             "precursor chain broken: precursor event ID is outside the artefact: test diagnostic"
         );
-        use std::error::Error;
         assert!(failure.source().is_some());
 
         let broken_none = OperationFailure::new(

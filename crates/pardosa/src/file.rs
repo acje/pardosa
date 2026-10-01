@@ -163,16 +163,13 @@ impl ContainerFrame {
             });
         }
         let payload_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-        let total_frame_len = match 4usize
+        let Some(total_frame_len) = 4usize
             .checked_add(payload_len)
             .and_then(|l| l.checked_add(4))
-        {
-            Some(l) => l,
-            None => {
-                return Err(DecodeError::ValueConstraintViolated {
-                    constraint: ValueConstraint::TooLong,
-                });
-            }
+        else {
+            return Err(DecodeError::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            });
         };
         if buf.len() < 4 + payload_len {
             return Err(DecodeError::TruncatedPayload {
@@ -364,7 +361,15 @@ fn read_container_frames(file: &mut File) -> Result<ContainerScan, OperationFail
             "container file too short for header",
         ));
     }
-    let mut buf = Vec::with_capacity(file_len as usize);
+    let Ok(buf_cap) = usize::try_from(file_len) else {
+        return Err(OperationFailure::new(
+            FailureCondition::ValueConstraintViolated {
+                constraint: crate::encoding::ValueConstraint::TooLong,
+            },
+            "container file length exceeds memory address space",
+        ));
+    };
+    let mut buf = Vec::with_capacity(buf_cap);
     (&mut *file)
         .take(file_len)
         .read_to_end(&mut buf)
@@ -681,7 +686,7 @@ pub fn compute_claim_wire_len_bounded(
             "claim wire length overflows usize",
         )
     })?;
-    if total > max_wire_len || total > u32::MAX as usize {
+    if total > max_wire_len {
         return Err(OperationFailure::new(
             FailureCondition::ValueConstraintViolated {
                 constraint: ValueConstraint::TooLong,
@@ -689,7 +694,14 @@ pub fn compute_claim_wire_len_bounded(
             format!("claim wire length {total} exceeds maximum frame limit ({max_wire_len})"),
         ));
     }
-    Ok(total as u32)
+    u32::try_from(total).map_err(|_| {
+        OperationFailure::new(
+            FailureCondition::ValueConstraintViolated {
+                constraint: ValueConstraint::TooLong,
+            },
+            format!("claim wire length {total} exceeds maximum frame limit ({max_wire_len})"),
+        )
+    })
 }
 
 /// Computes the serialized wire length of an ownership claim record from its operator label length.
@@ -823,6 +835,10 @@ impl FileStorageAdapter {
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "atomic creation sequence coordinating meta, event, and lock files"
+    )]
     fn create_with_limit(
         &self,
         initial_claim: &OwnershipClaimRecord,
@@ -1534,6 +1550,10 @@ impl FileStorageAdapter {
 
 /// Pure filesystem storage driver implementing [`StorageEngine`].
 #[derive(Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "simulation and state flags retained for file engine test harnesses"
+)]
 pub struct FileEngine {
     file: Option<File>,
     meta_path: PathBuf,
@@ -1990,6 +2010,9 @@ impl FileWriterSession {
     }
 
     /// Returns the active ownership claim record.
+    ///
+    /// # Panics
+    /// Panics if the writer session has no admitted claim.
     #[must_use]
     pub fn claim(&self) -> &OwnershipClaimRecord {
         self.store
@@ -2032,7 +2055,7 @@ impl FileWriterSession {
         self
     }
 
-    /// Configures whether to simulate a sync_data failure on write.
+    /// Configures whether to simulate a `sync_data` failure on write.
     #[cfg(any(test, feature = "unstable-test-support"))]
     #[must_use]
     pub fn with_simulate_sync_error(mut self, simulate: bool) -> Self {
@@ -2040,7 +2063,7 @@ impl FileWriterSession {
         self
     }
 
-    /// Configures whether to simulate a write_all failure on write.
+    /// Configures whether to simulate a `write_all` failure on write.
     #[cfg(any(test, feature = "unstable-test-support"))]
     #[must_use]
     pub fn with_simulate_write_error(mut self, simulate: bool) -> Self {
