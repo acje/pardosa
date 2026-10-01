@@ -24,13 +24,13 @@ pub(crate) enum FiberSlot {
 
 /// In-memory session index tracking active fibers and event counts.
 ///
-/// Coordinates sequential tip validation, precursor chaining, and active fiber bounds.
+/// Coordinates tip validation, precursor chaining, and active fiber bounds.
 ///
 /// # Resource Contract
-/// - Boundary: Pure count-based bounding for `SessionIndex` and store sessions per Priority 3.
-/// - Named Budgets: `MAX_ACTIVE_FIBERS = 100_000` and `MAX_EVENTS_PER_FIBER = 100_000`.
-/// - Explicit Application Exclusions: In-memory tip payload allocations, transient bulk history buffers during `read_all_frames`/`build_from_frames`, process stack, allocator heap overhead, and durable payload storage in OS page cache or `JetStream` streams. Byte-reservation scaffolding is permanently retired.
-/// - Exhaustion: `ValueConstraint::TooLong` when fiber count or event count exceeds 100,000.
+/// - Boundary: Count-based bounding for `SessionIndex` sessions.
+/// - Budgets: `MAX_ACTIVE_FIBERS = 100_000`, `MAX_EVENTS_PER_FIBER = 100_000`.
+/// - Exclusions: In-memory payloads, transient bulk history buffers, stack, allocator heap overhead, and durable storage (OS page cache / `JetStream`).
+/// - Exhaustion: `ValueConstraint::TooLong` when fiber or event count exceeds 100,000.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionIndex {
     fibers: HashMap<[u8; 16], FiberSlot>,

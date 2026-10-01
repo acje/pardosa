@@ -232,6 +232,12 @@ impl fmt::Display for EncodeError {
 impl std::error::Error for EncodeError {}
 
 /// UTF-8 encoded text bounded by `MAX` bytes.
+///
+/// Private tuple struct construction fails at compile time:
+///
+/// ```compile_fail
+/// let _ = pardosa::encoding::EventString::<64>(String::from("illegal"));
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EventString<const MAX: usize>(String);
 

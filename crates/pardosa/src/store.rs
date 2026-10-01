@@ -370,10 +370,10 @@ pub const MAX_STREAM_ITEMS: usize = 65_536;
 /// Maximum queued stream payload bytes tracked per reader session.
 ///
 /// # Resource Contract
-/// - Boundary: Per-reader session in-memory queued stream.
-/// - Accounting: Formula covers per-reader queued payload capacities plus a nominal 85-byte header charge per envelope. This numerical limit (64 MiB) is an implementation policy constraint (Moltke policy per pardosa-3hek.10 / pardosa-3hek.12), not an architectural limit defined by C5.22.
-/// - Exclusions: Excludes reader-owned Vec/VecDeque container slot allocations and spare capacity, `BTreeMap` index nodes, current wire frame and transient frame/decode overlap during `with_frames`, caller iterator internals, locators, returned results, standard library allocator/runtime overhead, and concurrent readers.
-/// - Lifetimes: On terminal error or capacity refusal, unread payload allocations are immediately dropped via `stream.clear()` and `retained_bytes` is reset to 0, while `VecDeque` backing capacity and index nodes remain allocated until the reader session is dropped.
+/// - Boundary: Per-reader in-memory queued stream (64 MiB policy limit, not C5.22).
+/// - Accounting: Queued payload capacities plus 85-byte header charge per envelope.
+/// - Exclusions: `VecDeque` capacity, index nodes, decode overlap, locators, returned results, caller iterator internals, concurrent readers, allocator overhead.
+/// - Lifetimes: On error or refusal, unread payloads drop via `stream.clear()` and `retained_bytes` resets to 0; container backing capacity and index nodes remain allocated until reader drop.
 pub const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -484,24 +484,17 @@ impl ArtefactReader<'_> {
 
     /// Opens a scoped reader session with an event envelope stream per C5.22.
     ///
-    /// Ingestion is eager: envelopes are drawn from the provided stream during session setup up
-    /// to [`MAX_STREAM_ITEMS`] and [`MAX_STREAM_BYTES`]. The input iterator is dropped before
-    /// invoking `f`.
+    /// Ingestion is eager up to [`MAX_STREAM_ITEMS`] and [`MAX_STREAM_BYTES`].
+    /// The input iterator is dropped before invoking `f`.
     ///
     /// # Resource Contract
-    /// - Boundary: Per-reader session in-memory queued stream.
-    /// - Accounting: Formula covers per-reader queued payload capacities plus a nominal 85-byte header charge per envelope across all currently queued envelopes.
-    /// - Exclusions: Excludes reader-owned Vec/VecDeque container slot allocations and spare capacity, `BTreeMap` index nodes, current wire frame and transient frame/decode overlap during `with_frames`, caller iterator internals, locators, returned results, standard library allocator/runtime overhead, and concurrent readers.
-    /// - Lifetimes: On terminal error or capacity refusal, unread payload allocations are immediately dropped via `stream.clear()` and `retained_bytes` is reset to 0, while `VecDeque` backing capacity and index nodes remain allocated until the reader session is dropped.
+    /// Governed by [`MAX_STREAM_BYTES`] queued capacity bounds and lifetime rules.
     ///
-    /// If item count exceeds [`MAX_STREAM_ITEMS`] or total retained capacity exceeds [`MAX_STREAM_BYTES`]
-    /// (Moltke implementation policy), ingestion stops, unread payload allocations are immediately dropped,
-    /// and the refusal is recorded in reader state; the first call to [`read_event`](Self::read_event)
-    /// will return [`FailureCondition::ValueConstraintViolated`] with [`ValueConstraint::TooLong`]
+    /// Exceeding limits halts ingestion, drops unread payloads, and causes
+    /// [`read_event`](Self::read_event) to return [`FailureCondition::ValueConstraintViolated`]
+    /// with [`ValueConstraint::TooLong`](crate::encoding::ValueConstraint::TooLong)
     /// and enter a terminal failure state.
-    ///
-    /// The rank-2 closure parameter ensures that the lifetime `'brand` is unique
-    /// to this session invocation and cannot be unified with any other session.
+    /// The rank-2 closure parameter ensures `'brand` lifetime uniqueness.
     pub fn with_stream<L, I, F, R>(locator: L, stream: I, f: F) -> R
     where
         L: Into<ArtefactLocator>,
@@ -566,14 +559,12 @@ impl ArtefactReader<'_> {
     /// Decodes each container frame payload into an event envelope.
     ///
     /// # Resource Contract
-    /// Governed by the [`with_stream`](Self::with_stream) queued payload capacity contract.
-    /// Transient decode overlap between the current wire frame payload allocation and the
-    /// newly decoded envelope payload during `with_frames` is excluded from the queued accounting formula.
+    /// Governed by [`with_stream`](Self::with_stream) queued capacity bounds; transient decode
+    /// overlap during `with_frames` is excluded from queued accounting.
     ///
     /// # Errors
-    ///
-    /// Returns [`OperationFailure`] if frame item count exceeds [`MAX_STREAM_ITEMS`],
-    /// byte count exceeds [`MAX_STREAM_BYTES`], or any frame payload fails envelope decoding or CRC validation.
+    /// Returns [`OperationFailure`] if frame item or byte count exceeds limits, or if payload
+    /// decoding or CRC validation fails.
     pub fn with_frames<L, I, F, R>(locator: L, frames: I, f: F) -> Result<R, OperationFailure>
     where
         L: Into<ArtefactLocator>,
@@ -683,26 +674,17 @@ impl<'brand> ArtefactReader<'brand> {
 
     /// Reads and observes the next event envelope from the reader session stream per C5.22.
     ///
-    /// Consumes envelopes from the authorized stream, decrements retained byte capacity accounting
-    /// by 85 bytes header overhead plus `payload.capacity()`, validates genesis or precursor link
-    /// integrity against session fiber state and BLAKE3 commitment history, and mints a
-    /// branded observation.
+    /// Consumes envelopes, decrements retained capacity, validates precursor integrity against
+    /// fiber state and BLAKE3 commitments, and mints a branded observation.
     ///
     /// # Resource Contract
-    /// - Boundary: Per-reader session in-memory queued stream.
-    /// - Accounting: Formula covers per-reader queued payload capacities plus a nominal 85-byte header charge per envelope.
-    /// - Exclusions: Excludes reader-owned Vec/VecDeque container slot allocations and spare capacity, `BTreeMap` index nodes, current wire frame and transient frame/decode overlap during `with_frames`, caller iterator internals, locators, returned results, standard library allocator/runtime overhead, and concurrent readers.
-    /// - Lifetimes: On terminal error or capacity refusal, unread payload allocations are immediately dropped via `stream.clear()` and `retained_bytes` is reset to 0, while `VecDeque` backing capacity and index nodes remain allocated until the reader session is dropped.
+    /// Governed by [`MAX_STREAM_BYTES`] queued capacity bounds and exclusions.
     ///
     /// # Errors
-    ///
-    /// Returns [`OperationFailure`] with [`FailureCondition::PrecursorChainBroken`] if precursor
-    /// link fields, fiber continuity, or commitment hashes are broken or invalid.
-    /// Returns [`OperationFailure`] with [`FailureCondition::ValueConstraintViolated`] if:
-    /// - Stream item count exceeded [`MAX_STREAM_ITEMS`] during eager intake,
-    /// - Stream retained byte capacity exceeded [`MAX_STREAM_BYTES`] (Moltke policy) during eager intake,
-    /// - Active tracked fibers exceed [`MAX_ACTIVE_FIBERS`] per C6.7, or
-    /// - The observed position counter overflows [`u64::MAX`].
+    /// Returns [`OperationFailure`] with:
+    /// - [`FailureCondition::PrecursorChainBroken`] if precursor links, fiber continuity, or hashes are invalid.
+    /// - [`FailureCondition::ValueConstraintViolated`] with [`ValueConstraint::TooLong`](crate::encoding::ValueConstraint::TooLong)
+    ///   (entering terminal failure) if item/byte limits, [`MAX_ACTIVE_FIBERS`], or position counter overflow.
     #[expect(
         clippy::too_many_lines,
         reason = "complex state machine for event validation and observation"
@@ -2292,20 +2274,15 @@ impl<'a> PrecursorLink<'a> {
     }
 }
 
-/// Validates precursor linkage for event admission along a fiber per C5.27, C5.28, C5.40, and C6.12.
+/// Validates precursor linkage along a fiber per C5.27, C5.28, C5.40, and C6.12.
 ///
-/// Verifies requested precursor ID equality on the resolved predecessor, fiber equality,
-/// and commitment digest binding using BLAKE3.
+/// Verifies predecessor ID equality, fiber equality, and BLAKE3 commitment binding.
 ///
 /// # Errors
-///
-/// - [`FailureCondition::PrecursorChainBroken`] with [`CausalChainError::PrecursorWrongFiber`]
-///   if the event or its predecessor belongs to another fiber.
-/// - [`FailureCondition::PrecursorChainBroken`] with [`CausalChainError::PrecursorOutOfRange`]
-///   if the precursor event is not resident in the artefact or if the resolved predecessor ID
-///   does not match the requested precursor ID.
-/// - [`FailureCondition::PrecursorChainBroken`] with `None` if the precursor commitment hash
-///   does not match the predecessor's computed BLAKE3 commitment per C5.40.
+/// Returns [`OperationFailure`] with [`FailureCondition::PrecursorChainBroken`]:
+/// - [`CausalChainError::PrecursorWrongFiber`] if an event belongs to another fiber.
+/// - [`CausalChainError::PrecursorOutOfRange`] if predecessor is absent or ID mismatches.
+/// - `None` if precursor commitment hash mismatches the predecessor's BLAKE3 digest.
 pub fn admit_precursor_link<'a>(
     expected_fiber_id: &[u8; 16],
     link: &PrecursorLink<'a>,
