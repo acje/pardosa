@@ -123,7 +123,7 @@
 
 ## 5. Downstream Verification Commands (`gh-report`)
 
-To independently verify candidate commit `d386fae` against `gh-report` (`868d38b`) without committing sibling path dependencies:
+To independently verify current working tree / commit `878a33b` against downstream `gh-report` (`2ff09cf`) without committing sibling path dependencies:
 
 ```bash
 cd /Users/anders.jensen/code/gh-report
@@ -132,4 +132,4 @@ cargo test -p gh-report \
   --config 'patch."https://github.com/acje/pardosa".pardosa-nats.path="/Users/anders.jensen/code/pardosa/crates/pardosa-nats"'
 ```
 
-All 1,366 unit, integration, and doctests pass cleanly (exit 0). Recorded as candidate execution evidence for `868d38b` on `d386fae`.
+All 1,714 unit, integration, and doctests pass cleanly (exit 0). Recorded as execution evidence for `2ff09cf` on `878a33b`.
