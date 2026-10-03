@@ -65,6 +65,10 @@ is a **second map**, charted once this one closes.
 
 See `AGENTS.md` for how to resume the work.
 
+For the two controlled consumers, see the [identity-resolution roadmap toward
+1.0](docs/plans/identity-resolution-to-1.0.md), including its separately chartered
+open decision map, evaluation gates and future implementation milestones.
+
 ## Lineage
 
 | Stage | Where | What it contributed |
