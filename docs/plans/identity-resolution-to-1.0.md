@@ -27,6 +27,16 @@ observations, not executed conformance evidence.
 
 ## Binding boundaries
 
+Desired outcome: consumer integration/adapter owns domain-key namespaces,
+canonicalization and resolution to generation-local storage identity; core
+storage operates on validated storage identities. This ownership boundary chooses
+neither derivation nor persistent associations, nor a mint-ownership API (future
+ticket 3). Use fully controlled **cherry-pit** and **gh-report** to remove or
+replace core key-policy helpers and update both consumers atomically when required;
+prefer a clean break over unnecessary legacy shims. Final exact API cuts await
+the future decisions and must satisfy the binding specification constraints;
+no implementation is authorized now.
+
 The [canonical specification](../spec/pardosa-1.0.md) remains the commitment.
 C5.20 requires fresh event and fiber identity at each generation boundary;
 C5.22 makes resume cursors generation-local. C6.18 accepts a payload-only
