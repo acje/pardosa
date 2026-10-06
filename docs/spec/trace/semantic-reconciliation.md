@@ -305,9 +305,9 @@ not claimed completed; their existing dispositions and downstream owners survive
 
 This mission edits the specification, supplementary trace notes, this report and
 existing decision navigation in bd. No clause identifier, regime, numeric ruling
-identity or classification input changes. Inner
-verification is `git diff --check`; mid verification is `./scripts/check.sh`;
-boundary status is `git status --short`. The local gate checks spec/trace
+identity or classification input changes. Mid
+verification is `./scripts/check.sh`; boundary
+status is `git status --short`. The local gate checks spec/trace
 consistency, not this report's semantic judgement or implementation readiness.
 Exact exits, preserved navigation preimages and review handoff evidence belong
 to the adoption mission's durable evidence bead. No E2E implementation verify is

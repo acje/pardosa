@@ -65,9 +65,14 @@ is a **second map**, charted once this one closes.
 
 See `AGENTS.md` for how to resume the work.
 
-For the two controlled consumers, see the [identity-resolution roadmap toward
-1.0](docs/plans/identity-resolution-to-1.0.md), including its separately chartered
-open decision map, evaluation gates and future implementation milestones.
+For the two controlled consumers, the identity-resolution roadmap toward 1.0
+lives in Beads, including its open decision map, evaluation gates and future
+implementation milestones. These remain subject to separate authorization.
+
+```sh
+bd -C /Users/anders.jensen/code/pardosa show pardosa-vqbq
+bd -C /Users/anders.jensen/code/pardosa ready --parent pardosa-vqbq -u
+```
 
 ## Lineage
 

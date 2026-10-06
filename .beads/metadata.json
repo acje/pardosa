@@ -3,5 +3,6 @@
   "backend": "dolt",
   "dolt_mode": "embedded",
   "dolt_database": "pardosa",
-  "project_id": "17cfe624-6f67-4e0a-a4aa-7f24481e8e96"
+  "project_id": "17cfe624-6f67-4e0a-a4aa-7f24481e8e96",
+  "last_bd_version": "1.3.1"
 }

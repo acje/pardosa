@@ -6,6 +6,10 @@
 .beads/proxieddb/
 .beads.gate.lock
 
+# Passive local exports (index-only; never committed; local bytes preserved)
+/.beads/interactions.jsonl
+/.beads/issues.jsonl
+
 # Bead-db rollback backups (local artefacts; keep out of git)
 .beads.backup-*
 

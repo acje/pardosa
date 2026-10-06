@@ -369,7 +369,7 @@ remain observations, not normative promotion gates or permission to weaken non-g
 
 ### Checks for this document mission
 
-Run `git diff --check` (inner), `./scripts/check.sh` (mid), and
+Run `./scripts/check.sh` (mid) and
 `git status --short` (boundary). Supplement with link/anchor and exact T1–T20/S1–S10
 row checks, and live map parentage/readiness/dependency inspection. The script is
 this repository's sole local gate and checks **spec/trace consistency, not plan
