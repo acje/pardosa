@@ -20,3 +20,4 @@ Cargo.lock
 
 # macOS
 .DS_Store
+/graphify-out/
