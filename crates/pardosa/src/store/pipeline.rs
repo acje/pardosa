@@ -523,6 +523,9 @@ impl<E: StorageEngine> Store<E> {
 
     /// Reads all raw frame payloads from the container.
     ///
+    /// # Resource Contract
+    /// Materialises the whole container in memory and retains every raw frame as a `Vec<Vec<u8>>`; not a streaming or constant-memory path.
+    ///
     /// # Errors
     /// Returns [`OperationFailure`] if reading fails.
     pub fn read_all_frames(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
@@ -598,6 +601,9 @@ impl<E: StorageEngine> Store<E> {
 
     /// Reads and decodes all event envelopes from the container.
     ///
+    /// # Resource Contract
+    /// Materialises the whole container's raw frames and additionally decodes and retains every event envelope as a `Vec<EventEnvelope>`; frames and envelopes are held together for the call, not a streaming or constant-memory path.
+    ///
     /// # Errors
     /// Returns [`OperationFailure`] if any frame is invalid or history contains broken fibers.
     pub fn read_all_envelopes(&mut self) -> Result<Vec<EventEnvelope>, OperationFailure> {
@@ -605,6 +611,9 @@ impl<E: StorageEngine> Store<E> {
     }
 
     /// Reads all event envelopes for migration, tolerating broken fiber history.
+    ///
+    /// # Resource Contract
+    /// Materialises the whole container's raw frames and the decoded envelope list together, exactly as [`Self::read_all_envelopes`]; only the broken fiber-history tolerance differs. Not a streaming path.
     ///
     /// # Errors
     /// Returns [`OperationFailure`] if reading frames fails.
@@ -614,7 +623,16 @@ impl<E: StorageEngine> Store<E> {
         self.read_all_envelopes_inner(true)
     }
 
-    /// Iterates over all event envelopes sequentially using borrowed views without bulk allocation.
+    /// Iterates over all event envelopes sequentially as borrowed `EventEnvelopeRef` views.
+    ///
+    /// # Resource Contract
+    /// Decodes each frame to a borrowed view without materialising a decoded `Vec<EventEnvelope>`.
+    /// Frame recovery is delegated to the engine's `recover_frames`, so raw-frame retention is
+    /// engine-relative: the file engine loads the whole container, the default `read_chunk`
+    /// reloads `read_all` per chunk, and an engine overriding `read_chunk` reads per chunk.
+    /// No bounded-retention claim is made here. The validation index retains one
+    /// `seen_event_ids` entry per event for the call. Avoids the decoded list only; not a
+    /// streaming or constant-memory path.
     ///
     /// # Errors
     /// Returns [`OperationFailure`] if reading fails, decoding fails, or the reader retained broken state.

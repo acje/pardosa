@@ -2146,6 +2146,9 @@ impl FileReaderSession {
 
     /// Reads all framed payloads from the .pgno container file, validating CRC32C on each frame.
     ///
+    /// # Resource Contract
+    /// Materialises the whole container in memory and retains every raw frame as a `Vec<Vec<u8>>`; not a streaming or constant-memory path.
+    ///
     /// # Errors
     /// Returns [`OperationFailure`] if reading fails or frame checksum fails.
     pub fn read_all_frames(&mut self) -> Result<Vec<Vec<u8>>, OperationFailure> {
@@ -2153,6 +2156,9 @@ impl FileReaderSession {
     }
 
     /// Reads and decodes all event envelopes from the container.
+    ///
+    /// # Resource Contract
+    /// Materialises the whole container's raw frames and additionally decodes and retains every event envelope as a `Vec<EventEnvelope>`; frames and envelopes are held together for the call, not a streaming or constant-memory path.
     ///
     /// # Errors
     /// Returns [`OperationFailure`] if any frame is invalid or history contains broken fibers.
@@ -2162,6 +2168,9 @@ impl FileReaderSession {
 
     /// Reads all event envelopes for migration, tolerating broken fiber history.
     ///
+    /// # Resource Contract
+    /// Materialises the whole container's raw frames and the decoded envelope list together, exactly as [`FileReaderSession::read_all_envelopes`]; only the broken fiber-history tolerance differs. Not a streaming path.
+    ///
     /// # Errors
     /// Returns [`OperationFailure`] if reading frames fails or frame decoding fails.
     pub fn read_all_envelopes_for_migration(
@@ -2170,7 +2179,13 @@ impl FileReaderSession {
         self.store.read_all_envelopes_for_migration()
     }
 
-    /// Iterates over all event envelopes sequentially using borrowed views without bulk allocation.
+    /// Iterates over all event envelopes sequentially as borrowed `EventEnvelopeRef` views.
+    ///
+    /// # Resource Contract
+    /// Decodes each frame to a borrowed view without materialising a decoded `Vec<EventEnvelope>`.
+    /// The file engine still loads every raw frame of the whole container into memory to visit them,
+    /// and the internal validation index retains one `seen_event_ids` entry per event for the call.
+    /// Avoids the decoded list only; not a streaming or constant-memory path.
     ///
     /// # Errors
     /// Returns [`OperationFailure`] if reading fails, decoding fails, or the reader retained broken state.

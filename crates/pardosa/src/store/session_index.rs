@@ -29,8 +29,9 @@ pub(crate) enum FiberSlot {
 /// # Resource Contract
 /// - Boundary: Count-based bounding for `SessionIndex` sessions.
 /// - Budgets: `MAX_ACTIVE_FIBERS = 100_000`, `MAX_EVENTS_PER_FIBER = 100_000`.
+/// - Retention: `seen_event_ids` is a `HashSet<[u8; 16]>` retained for the whole session and never pruned; its aggregate bound is `MAX_ACTIVE_FIBERS * MAX_EVENTS_PER_FIBER = 10^10` ids, a theoretical ceiling rather than a practical memory bound.
 /// - Exclusions: In-memory payloads, transient bulk history buffers, stack, allocator heap overhead, and durable storage (OS page cache / `JetStream`).
-/// - Exhaustion: `ValueConstraint::TooLong` when fiber or event count exceeds 100,000.
+/// - Exhaustion: `ValueConstraint::TooLong` when fiber or event count exceeds 100,000, or when `seen_event_ids` reaches its aggregate bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionIndex {
     fibers: HashMap<[u8; 16], FiberSlot>,
@@ -481,6 +482,13 @@ impl SessionIndex {
     }
 
     /// Rebuilds a session index from an ordered sequence of raw container frames.
+    ///
+    /// # Resource Contract
+    /// Builds an in-memory index; the input frames are borrowed and their raw bytes are not copied.
+    /// Retention: `seen_event_ids` gains one insert-only entry per event id, and each active fiber
+    /// retains its most recent decoded `EventEnvelope` as a tip with an `event_count`; broken fibers
+    /// retain a count and a reason string. Exhaustion: `ValueConstraint::TooLong` when
+    /// `MAX_ACTIVE_FIBERS`, `MAX_EVENTS_PER_FIBER`, or the `seen_event_ids` aggregate bound is reached.
     ///
     /// # Errors
     /// Returns [`OperationFailure`] if frame is shorter than 85 bytes, frame decode fails,
