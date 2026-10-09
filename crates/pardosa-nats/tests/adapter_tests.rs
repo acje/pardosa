@@ -663,7 +663,6 @@ fn test_nats_interleaved_open_coherent_snapshot() {
     };
 
     let handle_b = {
-        let barrier = barrier;
         let adapter = adapter_clone;
         let env_b = env_b.clone();
         thread::spawn(move || {
