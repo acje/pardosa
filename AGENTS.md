@@ -74,10 +74,12 @@ must define and satisfy explicit resource bounds:
 
 ### Verification Cadences (Three-Tier Cadence)
 Verification is strictly tier-scoped. A claim is backed by the tier whose scope
-matches the claim: sub-missions are backed by MID; epics and releases are backed
-by BOUNDARY.
+matches the claim: sub-missions are backed by MID; repository stable candidates
+are backed by BOUNDARY. Canonical approval of a verified result repeats only per
+repository stable candidate; targeted falsifiers remain allowed against any
+candidate.
 
-- **INNER** (every hopper TDD increment and per-review-round re-verification;
+- **INNER** (every hopper TDD increment and targeted-reviewer falsifiers;
   changed crate ONLY; exit-code criterion: test + clippy exit 0):
   ```sh
   CARGO_TERM_PROGRESS_WHEN=never cargo test -p pardosa --locked --message-format=short
@@ -97,7 +99,7 @@ by BOUNDARY.
   Compute reverse dependents via `cargo metadata --format-version 1 --no-deps`.
   `--workspace` is forbidden at this tier; verify stays scoped to affected crates.
 
-- **BOUNDARY** (once per epic before epic done-claim; full workspace; exit 0 across all):
+- **BOUNDARY** (once per repository stable candidate; full workspace; exit 0 across all):
   ```sh
   cargo build --workspace --all-features --locked
   timeout 900 cargo test --workspace --all-features --locked --no-fail-fast
@@ -122,7 +124,7 @@ comment-free --check-doc-budget --doc-advisory-words 80 --doc-max-words 120 --ma
 
 Requires comment-free 0.2.0 at the canonical revision below:
 ```sh
-cargo +1.98.0 install --git https://github.com/acje/comment-free --rev e45de7ef3b0fcd9a1ec299b9026b14fb5b0cf534 --locked comment-free
+cargo +1.98.0 install --git https://github.com/acje/comment-free --rev b4666626bbeee4e74ca41fd6ff1048b2f167dd27 --locked comment-free
 ```
 
 The read-only native gate recursively scans Rust sources under `.` with the

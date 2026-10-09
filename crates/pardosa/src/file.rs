@@ -3265,11 +3265,11 @@ mod tests {
         let frames = reader
             .read_all_frames()
             .expect("read frames on meta only succeeds");
-        assert!(frames.is_empty());
+        assert!(frames.is_empty(), "unexpected frames");
         let envelopes = reader
             .read_all_envelopes()
             .expect("read envelopes on meta only succeeds");
-        assert!(envelopes.is_empty());
+        assert!(envelopes.is_empty(), "unexpected envelopes");
         let claim_opt: Option<&OwnershipClaimRecord> = reader.claim();
         assert_eq!(claim_opt.map(|c| c.epoch), Some(1));
     }

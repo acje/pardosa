@@ -506,10 +506,9 @@ impl PardosaType for EventF64 {
 
 #[cfg(test)]
 #[expect(
-    clippy::float_cmp,
     clippy::similar_names,
     clippy::too_many_lines,
-    reason = "floating point tests compare exact values, use similar naming patterns, and test exhaustive contracts"
+    reason = "floating point tests use similar naming patterns and test exhaustive contracts"
 )]
 mod tests {
     use super::*;
