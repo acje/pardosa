@@ -124,7 +124,7 @@ comment-free --check-doc-budget --doc-advisory-words 80 --doc-max-words 120 --ma
 
 Requires comment-free 0.2.0 at the canonical revision below:
 ```sh
-cargo +1.98.0 install --git https://github.com/acje/comment-free --rev b4666626bbeee4e74ca41fd6ff1048b2f167dd27 --locked comment-free
+cargo +1.99.0 install --git https://github.com/acje/comment-free --rev b4666626bbeee4e74ca41fd6ff1048b2f167dd27 --locked comment-free
 ```
 
 The read-only native gate recursively scans Rust sources under `.` with the

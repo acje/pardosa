@@ -137,7 +137,7 @@ if "hashFiles('tools/.nats-server-version')" not in key:
 # an alternate toolchain, a branch, a missing flag, a suffix) is refused,
 # never parsed as an acceptable install.
 canonical_argv = shlex.split(
-    "cargo +1.98.0 install --git https://github.com/acje/comment-free --rev "
+    "cargo +1.99.0 install --git https://github.com/acje/comment-free --rev "
     + cf_rev
     + " --locked comment-free",
     comments=True,
