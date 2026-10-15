@@ -628,23 +628,305 @@ async fn read_range_async(
     Ok(frames)
 }
 
+/// Validated locator that deterministically derives NATS stream names and subjects from a token hierarchy.
+///
+/// Tokens are non-empty NATS-safe labels (ASCII alphanumeric, `_`, `-`) joined into a dot-separated
+/// `subject_prefix` and a dash-separated `stream_stem`. Derived names: `meta_stream_name` /
+/// `data_stream_name` = `{stream_stem}_meta` / `{stream_stem}_data`; `meta_subject` /
+/// `data_subject` = `{subject_prefix}.meta` / `{subject_prefix}.data`.
+///
+/// # Errors
+/// [`NatsLocator::new`], [`NatsLocator::from_stem`], and [`NatsLocator::child`] reject empty
+/// hierarchies and empty or non-NATS-safe tokens with
+/// [`FailureCondition::ValueConstraintViolated`]; the joined `stream_stem` is bounded to 128
+/// bytes so the derived stream names remain within JetStream limits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NatsLocator {
+    tokens: Vec<String>,
+    stream_stem: String,
+    subject_prefix: String,
+    meta_stream_name: String,
+    data_stream_name: String,
+    meta_subject: String,
+    data_subject: String,
+}
+
+impl NatsLocator {
+    /// Creates a locator from an ordered token hierarchy.
+    ///
+    /// # Errors
+    /// Returns [`FailureCondition::ValueConstraintViolated`] when the hierarchy is empty, a
+    /// token is empty or contains a byte outside the NATS-safe set, or the joined stem exceeds
+    /// 128 bytes.
+    pub fn new<I, S>(tokens: I) -> Result<Self, OperationFailure>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut collected: Vec<String> = Vec::new();
+        for token in tokens {
+            collected.push(token.as_ref().to_string());
+        }
+        Self::from_tokens(collected)
+    }
+
+    /// Creates a single-token locator from a plain stem.
+    ///
+    /// # Errors
+    /// Returns [`FailureCondition::ValueConstraintViolated`] when the stem is empty or not
+    /// NATS-safe, or exceeds 128 bytes.
+    pub fn from_stem(stem: impl AsRef<str>) -> Result<Self, OperationFailure> {
+        Self::new(std::iter::once(stem))
+    }
+
+    /// Appends one validated token to the hierarchy.
+    ///
+    /// # Errors
+    /// Returns [`FailureCondition::ValueConstraintViolated`] when the token is empty or not
+    /// NATS-safe, or the joined stem would exceed 128 bytes.
+    pub fn child(&self, token: impl AsRef<str>) -> Result<Self, OperationFailure> {
+        let mut tokens = self.tokens.clone();
+        tokens.push(token.as_ref().to_string());
+        Self::from_tokens(tokens)
+    }
+
+    /// Returns the ordered token hierarchy.
+    #[must_use]
+    pub fn tokens(&self) -> &[String] {
+        &self.tokens
+    }
+
+    /// Returns the dash-joined stream stem.
+    #[must_use]
+    pub fn stream_stem(&self) -> &str {
+        &self.stream_stem
+    }
+
+    /// Returns the dot-joined hierarchical subject prefix.
+    #[must_use]
+    pub fn subject_prefix(&self) -> &str {
+        &self.subject_prefix
+    }
+
+    /// Returns the ownership record stream name (`{stream_stem}_meta`).
+    #[must_use]
+    pub fn meta_stream_name(&self) -> &str {
+        &self.meta_stream_name
+    }
+
+    /// Returns the event data stream name (`{stream_stem}_data`).
+    #[must_use]
+    pub fn data_stream_name(&self) -> &str {
+        &self.data_stream_name
+    }
+
+    /// Returns the canonical ownership record subject (`{subject_prefix}.meta`).
+    #[must_use]
+    pub fn meta_subject(&self) -> &str {
+        &self.meta_subject
+    }
+
+    /// Returns the canonical event data subject (`{subject_prefix}.data`).
+    #[must_use]
+    pub fn data_subject(&self) -> &str {
+        &self.data_subject
+    }
+
+    /// Returns the legacy underscore ownership record subject (`{stream_stem}_meta`).
+    #[must_use]
+    pub fn legacy_meta_subject(&self) -> String {
+        format!("{}_meta", self.stream_stem)
+    }
+
+    /// Returns the legacy underscore event data subject (`{stream_stem}_data`).
+    #[must_use]
+    pub fn legacy_data_subject(&self) -> String {
+        format!("{}_data", self.stream_stem)
+    }
+
+    fn from_tokens(tokens: Vec<String>) -> Result<Self, OperationFailure> {
+        if tokens.is_empty() {
+            return Err(OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::Empty,
+                },
+                "NatsLocator requires a non-empty token hierarchy",
+            ));
+        }
+        for token in &tokens {
+            Self::verify_token(token)?;
+        }
+        let subject_prefix = tokens.join(".");
+        let stream_stem = tokens.join("-");
+        if stream_stem.len() > 128 {
+            return Err(OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::TooLong,
+                },
+                "NatsLocator stream stem exceeds the 128-byte bound",
+            ));
+        }
+        Ok(Self {
+            meta_stream_name: format!("{stream_stem}_meta"),
+            data_stream_name: format!("{stream_stem}_data"),
+            meta_subject: format!("{subject_prefix}.meta"),
+            data_subject: format!("{subject_prefix}.data"),
+            tokens,
+            stream_stem,
+            subject_prefix,
+        })
+    }
+
+    fn verify_token(token: &str) -> Result<(), OperationFailure> {
+        if token.is_empty() {
+            return Err(OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::Empty,
+                },
+                "NatsLocator token must not be empty",
+            ));
+        }
+        if !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
+            return Err(OperationFailure::new(
+                FailureCondition::ValueConstraintViolated {
+                    constraint: ValueConstraint::InvalidChar,
+                },
+                "NatsLocator token must contain only ASCII alphanumeric, '_', or '-' bytes",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Builds a single-token locator for a stem that cannot validate as a NATS-safe token.
+    ///
+    /// The stem is sanitized byte-by-byte and bounded so the derived locator is always
+    /// constructible; legacy callers keep the pre-existing flat subject derivation on their
+    /// adapter. Empty sanitized stems fall back to `"_"` and oversized stems are truncated to
+    /// 128 ASCII bytes, keeping the joined stream stem within `from_tokens` bounds.
+    fn from_synthetic_stem(stem: &str) -> Self {
+        let sanitized = stem
+            .bytes()
+            .map(|byte| {
+                if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-' {
+                    byte as char
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
+        let sanitized = if sanitized.is_empty() {
+            "_".to_string()
+        } else {
+            sanitized
+        };
+        let sanitized = sanitized
+            .bytes()
+            .take(128)
+            .map(char::from)
+            .collect::<String>();
+        Self::from_tokens(vec![sanitized])
+            .expect("sanitized synthetic stem token is always NATS-safe")
+    }
+}
+
+/// Resolved JetStream subjects for the adapter's active streams, settled during reopen inspection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ResolvedSubjects {
+    meta_subject: Option<String>,
+    data_subject: Option<String>,
+}
+
+/// Tags which stream family a subject inspection failure concerns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubjectKind {
+    Meta,
+    Data,
+}
+
+/// Reads the configured subjects of an existing broker stream and accepts the canonical or the
+/// legacy underscore form, returning the subject the stream actually binds.
+///
+/// # Errors
+/// Returns [`FailureCondition::OwnershipRecordUnreadable`] for the meta stream and
+/// [`FailureCondition::PrecursorChainBroken(None)`] for the data stream when the stream binds
+/// any other subject set.
+async fn inspect_stream_subject(
+    js: &async_nats::jetstream::Context,
+    stream_name: &str,
+    canonical: &str,
+    legacy: &str,
+    kind: SubjectKind,
+) -> Result<String, OperationFailure> {
+    let mut stream = js
+        .get_stream(stream_name)
+        .await
+        .map_err(|err| map_nats_stream_open_error(stream_name, &err))?;
+    let subjects = stream
+        .info()
+        .await
+        .map_err(|err| map_nats_info_error(stream_name, &err))?
+        .config
+        .subjects
+        .clone();
+    if subjects == [canonical.to_string()] {
+        Ok(canonical.to_string())
+    } else if subjects == [legacy.to_string()] {
+        Ok(legacy.to_string())
+    } else {
+        let condition = match kind {
+            SubjectKind::Meta => FailureCondition::OwnershipRecordUnreadable,
+            SubjectKind::Data => FailureCondition::PrecursorChainBroken(None),
+        };
+        Err(OperationFailure::new(
+            condition,
+            format!(
+                "stream {stream_name} binds unexpected subjects {subjects:?}; expected {canonical} or {legacy}"
+            ),
+        ))
+    }
+}
+
 /// JetStream storage adapter managing container artefacts in NATS JetStream per C5.10, C5.11, and C10.3.
 ///
 /// # Deployment Constraint
 /// Deployments must ensure a single-writer topology per stream stem (`{stem}_data` and
 /// `{stem}_meta`). When authority divergence occurs (OCC collision or epoch supersession), the
 /// active session is marked uncertain and refuses subsequent writes per H2.
-#[derive(Clone)]
 pub struct NatsStorageAdapter {
     url: String,
     stem: String,
+    locator: NatsLocator,
     meta_stream_name: String,
     data_stream_name: String,
     meta_subject: String,
     data_subject: String,
+    custom_subjects_for_test: bool,
+    resolved_subjects: std::sync::Mutex<ResolvedSubjects>,
     client: async_nats::Client,
     js: async_nats::jetstream::Context,
     runtime: Arc<tokio::runtime::Runtime>,
+}
+
+impl Clone for NatsStorageAdapter {
+    fn clone(&self) -> Self {
+        Self {
+            url: self.url.clone(),
+            stem: self.stem.clone(),
+            locator: self.locator.clone(),
+            meta_stream_name: self.meta_stream_name.clone(),
+            data_stream_name: self.data_stream_name.clone(),
+            meta_subject: self.meta_subject.clone(),
+            data_subject: self.data_subject.clone(),
+            custom_subjects_for_test: self.custom_subjects_for_test,
+            resolved_subjects: std::sync::Mutex::new(ResolvedSubjects::default()),
+            client: self.client.clone(),
+            js: self.js.clone(),
+            runtime: Arc::clone(&self.runtime),
+        }
+    }
 }
 
 impl fmt::Debug for NatsStorageAdapter {
@@ -652,10 +934,20 @@ impl fmt::Debug for NatsStorageAdapter {
         f.debug_struct("NatsStorageAdapter")
             .field("url", &self.url)
             .field("stem", &self.stem)
+            .field("locator", &self.locator)
             .field("meta_stream_name", &self.meta_stream_name)
             .field("data_stream_name", &self.data_stream_name)
             .field("meta_subject", &self.meta_subject)
             .field("data_subject", &self.data_subject)
+            .field("custom_subjects_for_test", &self.custom_subjects_for_test)
+            .field(
+                "resolved_subjects",
+                &self
+                    .resolved_subjects
+                    .lock()
+                    .map(|guard| guard.clone())
+                    .unwrap_or_else(|err| err.into_inner().clone()),
+            )
             .finish()
     }
 }
@@ -691,6 +983,40 @@ impl NatsStorageAdapter {
         Ok(Self::from_client_internal(url_str, client, stem_str, rt))
     }
 
+    /// Creates a new NATS storage adapter by connecting to a NATS server URL with a validated locator.
+    ///
+    /// # Errors
+    /// Returns [`OperationFailure`] with [`FailureCondition::OwnershipRecordUnreadable`] if connection fails.
+    pub fn new_with_locator(
+        url: impl Into<String>,
+        locator: NatsLocator,
+    ) -> Result<Self, OperationFailure> {
+        let url_str = url.into();
+        let rt = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| {
+                    OperationFailure::new(
+                        FailureCondition::OwnershipRecordUnreadable,
+                        format!("failed to initialize runtime: {err}"),
+                    )
+                })?,
+        );
+        let u_clone = url_str.clone();
+        let client = rt
+            .block_on(async move { async_nats::connect(&u_clone).await })
+            .map_err(|err| {
+                OperationFailure::new(
+                    FailureCondition::OwnershipRecordUnreadable,
+                    format!("failed to connect to NATS at {url_str}: {err}"),
+                )
+            })?;
+        Ok(Self::from_client_internal_with_locator(
+            url_str, client, locator, rt,
+        ))
+    }
+
     /// Creates a new NATS storage adapter from an existing connected client.
     #[must_use]
     pub fn from_client(client: async_nats::Client, stem: impl Into<String>) -> Self {
@@ -713,16 +1039,99 @@ impl NatsStorageAdapter {
         Self::from_client_internal("nats://connected".to_string(), client, stem.into(), runtime)
     }
 
+    /// Creates a new NATS storage adapter from an existing connected client with a validated locator.
+    #[must_use]
+    pub fn from_client_with_locator(client: async_nats::Client, locator: NatsLocator) -> Self {
+        let rt = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to create runtime for NATS adapter"),
+        );
+        Self::from_client_internal_with_locator("nats://connected".to_string(), client, locator, rt)
+    }
+
+    /// Creates a new NATS storage adapter from an existing connected client and locator with a provided runtime.
+    #[must_use]
+    pub fn from_client_with_locator_and_runtime(
+        client: async_nats::Client,
+        locator: NatsLocator,
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> Self {
+        Self::from_client_internal_with_locator(
+            "nats://connected".to_string(),
+            client,
+            locator,
+            runtime,
+        )
+    }
+
     fn from_client_internal(
         url: String,
         client: async_nats::Client,
         stem: String,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Self {
+        let (locator, meta_subject, data_subject) = Self::subjects_for_stem(&stem);
+        Self::into_instance(
+            url,
+            client,
+            stem,
+            locator,
+            meta_subject,
+            data_subject,
+            runtime,
+        )
+    }
+
+    fn from_client_internal_with_locator(
+        url: String,
+        client: async_nats::Client,
+        locator: NatsLocator,
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> Self {
+        let stem = locator.stream_stem().to_string();
+        let meta_subject = locator.meta_subject().to_string();
+        let data_subject = locator.data_subject().to_string();
+        Self::into_instance(
+            url,
+            client,
+            stem,
+            locator,
+            meta_subject,
+            data_subject,
+            runtime,
+        )
+    }
+
+    /// Derives the active subjects for a caller-supplied stem, adopting hierarchical subjects
+    /// when the stem is a NATS-safe token and falling back to legacy flat subjects otherwise.
+    fn subjects_for_stem(stem: &str) -> (NatsLocator, String, String) {
+        match NatsLocator::from_stem(stem) {
+            Ok(locator) => (
+                locator.clone(),
+                locator.meta_subject().to_string(),
+                locator.data_subject().to_string(),
+            ),
+            Err(_) => (
+                NatsLocator::from_synthetic_stem(stem),
+                format!("{stem}_meta"),
+                format!("{stem}_data"),
+            ),
+        }
+    }
+
+    fn into_instance(
+        url: String,
+        client: async_nats::Client,
+        stem: String,
+        locator: NatsLocator,
+        meta_subject: String,
+        data_subject: String,
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> Self {
         let meta_stream_name = format!("{stem}_meta");
         let data_stream_name = format!("{stem}_data");
-        let meta_subject = format!("{stem}_meta");
-        let data_subject = format!("{stem}_data");
         let js = {
             let _guard = runtime.enter();
             async_nats::jetstream::new(client.clone())
@@ -730,14 +1139,105 @@ impl NatsStorageAdapter {
         Self {
             url,
             stem,
+            locator,
             meta_stream_name,
             data_stream_name,
             meta_subject,
             data_subject,
+            custom_subjects_for_test: false,
+            resolved_subjects: std::sync::Mutex::new(ResolvedSubjects::default()),
             client,
             js,
             runtime,
         }
+    }
+
+    /// Returns the validated locator backing this adapter's naming.
+    #[must_use]
+    pub fn locator(&self) -> &NatsLocator {
+        &self.locator
+    }
+
+    /// Resolves the active subjects of the existing broker streams, accepting the canonical or the
+    /// legacy underscore form, without mutating the adapter.
+    ///
+    /// # Errors
+    /// Returns [`FailureCondition::OwnershipRecordUnreadable`] or
+    /// [`FailureCondition::PrecursorChainBroken(None)`] when a stream binds unexpected subjects.
+    fn resolve_open_subjects(
+        &self,
+        presence: ArtefactPresence,
+    ) -> Result<ResolvedSubjects, OperationFailure> {
+        if self.custom_subjects_for_test {
+            return Ok(ResolvedSubjects {
+                meta_subject: Some(self.meta_subject.clone()),
+                data_subject: Some(self.data_subject.clone()),
+            });
+        }
+        let js = self.js.clone();
+        let meta_name = self.meta_stream_name.clone();
+        let data_name = self.data_stream_name.clone();
+        let meta_canon = self.meta_subject.clone();
+        let data_canon = self.data_subject.clone();
+        let meta_legacy = format!("{}_meta", self.stem);
+        let data_legacy = format!("{}_data", self.stem);
+        let handle = self.runtime.handle().clone();
+        run_future(&handle, async move {
+            let mut meta_subject = None;
+            let mut data_subject = None;
+            match presence {
+                ArtefactPresence::OwnershipRecordOnly | ArtefactPresence::Both => {
+                    meta_subject = Some(
+                        inspect_stream_subject(
+                            &js,
+                            &meta_name,
+                            &meta_canon,
+                            &meta_legacy,
+                            SubjectKind::Meta,
+                        )
+                        .await?,
+                    );
+                }
+                ArtefactPresence::None | ArtefactPresence::EventDataOnly => {}
+            }
+            match presence {
+                ArtefactPresence::Both | ArtefactPresence::EventDataOnly => {
+                    data_subject = Some(
+                        inspect_stream_subject(
+                            &js,
+                            &data_name,
+                            &data_canon,
+                            &data_legacy,
+                            SubjectKind::Data,
+                        )
+                        .await?,
+                    );
+                }
+                ArtefactPresence::None | ArtefactPresence::OwnershipRecordOnly => {}
+            }
+            Ok(ResolvedSubjects {
+                meta_subject,
+                data_subject,
+            })
+        })
+    }
+
+    fn cache_resolved_subjects(&self, resolved: ResolvedSubjects) {
+        let mut guard = self
+            .resolved_subjects
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        *guard = resolved;
+    }
+
+    fn resolved_meta_subject(&self) -> String {
+        let resolved = self
+            .resolved_subjects
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .meta_subject
+            .clone();
+        resolved.unwrap_or_else(|| self.meta_subject.clone())
     }
 
     #[cfg(feature = "unstable-test-support")]
@@ -750,6 +1250,7 @@ impl NatsStorageAdapter {
     ) -> Self {
         self.meta_subject = meta_subject.into();
         self.data_subject = data_subject.into();
+        self.custom_subjects_for_test = true;
         self
     }
 
@@ -1405,12 +1906,18 @@ impl NatsStorageAdapter {
             }
         }
 
+        let resolved = self.resolve_open_subjects(presence)?;
+        self.cache_resolved_subjects(resolved.clone());
+        let resolved_meta_subject = resolved
+            .meta_subject
+            .unwrap_or_else(|| self.meta_subject.clone());
+
         let js = self.js.clone();
         let client = self.client.clone();
         let stem = self.stem.clone();
         let meta_name = self.meta_stream_name.clone();
         let data_name = self.data_stream_name.clone();
-        let meta_subject = self.meta_subject.clone();
+        let meta_subject = resolved_meta_subject;
         let data_subject = self.data_subject.clone();
         let claim_clone = claim.clone();
         let handle = self.runtime.handle().clone();
@@ -1583,6 +2090,15 @@ impl NatsStorageAdapter {
             ArtefactPresence::Both => {}
         }
 
+        let resolved = self.resolve_open_subjects(ArtefactPresence::Both)?;
+        self.cache_resolved_subjects(resolved.clone());
+        let resolved_meta_subject = resolved
+            .meta_subject
+            .unwrap_or_else(|| self.meta_subject.clone());
+        let resolved_data_subject = resolved
+            .data_subject
+            .unwrap_or_else(|| self.data_subject.clone());
+
         let js_meta = self.js.clone();
         let meta_name = self.meta_stream_name.clone();
         let meta = run_future(&handle, async move {
@@ -1676,8 +2192,8 @@ impl NatsStorageAdapter {
             stem: self.stem.clone(),
             meta_stream_name: self.meta_stream_name.clone(),
             data_stream_name: self.data_stream_name.clone(),
-            meta_subject: self.meta_subject.clone(),
-            data_subject: self.data_subject.clone(),
+            meta_subject: resolved_meta_subject,
+            data_subject: resolved_data_subject,
             carried_epoch,
             claim: Some(claim),
             meta_records: meta,
@@ -1719,6 +2235,15 @@ impl NatsStorageAdapter {
 
         let admission = admit_open(presence, meta_records.latest_claim.clone(), false)?;
 
+        let resolved = self.resolve_open_subjects(presence)?;
+        self.cache_resolved_subjects(resolved.clone());
+        let resolved_meta_subject = resolved
+            .meta_subject
+            .unwrap_or_else(|| self.meta_subject.clone());
+        let resolved_data_subject = resolved
+            .data_subject
+            .unwrap_or_else(|| self.data_subject.clone());
+
         let engine = NatsEngine {
             client: self.client.clone(),
             js: self.js.clone(),
@@ -1726,8 +2251,8 @@ impl NatsStorageAdapter {
             stem: self.stem.clone(),
             meta_stream_name: self.meta_stream_name.clone(),
             data_stream_name: self.data_stream_name.clone(),
-            meta_subject: self.meta_subject.clone(),
-            data_subject: self.data_subject.clone(),
+            meta_subject: resolved_meta_subject,
+            data_subject: resolved_data_subject,
             carried_epoch: meta_records.latest_claim.as_ref().map_or(0, |c| c.epoch),
             claim: meta_records.latest_claim.clone(),
             meta_records,
@@ -1767,7 +2292,7 @@ impl NatsStorageAdapter {
         record: &OwnershipRecord,
     ) -> Result<(), OperationFailure> {
         let js = self.js.clone();
-        let meta_subject = self.meta_subject.clone();
+        let meta_subject = self.resolved_meta_subject();
         let meta_name = self.meta_stream_name.clone();
         let record_clone = record.clone();
         let handle = self.runtime.handle().clone();
@@ -2642,6 +3167,18 @@ mod tests {
     };
     use async_nats::jetstream::stream::{RawMessageError, RawMessageErrorKind};
     use pardosa::store::FailureCondition;
+
+    #[test]
+    fn synthetic_stem_empty_and_oversized_never_panic() {
+        let empty = NatsLocator::from_synthetic_stem("");
+        assert_eq!(empty.tokens(), vec!["_"]);
+        assert_eq!(empty.stream_stem(), "_");
+
+        let oversized = NatsLocator::from_synthetic_stem(&"x".repeat(300));
+        assert_eq!(oversized.tokens().len(), 1);
+        assert_eq!(oversized.tokens()[0].len(), 128);
+        assert!(oversized.stream_stem().len() <= 128);
+    }
 
     fn guard_meta_tail(case: &str) {
         let server = crate::test_support::LiveNatsServer::isolated();

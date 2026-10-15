@@ -3,7 +3,7 @@
 
 use pardosa::prelude::*;
 use pardosa_nats::test_support::LiveNatsServer;
-use pardosa_nats::NatsStorageAdapter;
+use pardosa_nats::{NatsLocator, NatsStorageAdapter};
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -2469,13 +2469,17 @@ fn test_nats_read_meta_records_missing_seq1_fails_closed() {
 }
 
 #[test]
-fn test_nats_default_subjects_underscore_routing() {
+fn test_nats_default_subjects_dotted_routing() {
     let server = LiveNatsServer::acquire();
-    let stem = unique_stem("underscore_routing");
+    let stem = unique_stem("dotted_routing");
     let adapter = NatsStorageAdapter::new(server.url(), &stem).expect("connect adapter");
 
-    assert_eq!(adapter.meta_subject(), format!("{stem}_meta"));
-    assert_eq!(adapter.data_subject(), format!("{stem}_data"));
+    let locator = NatsLocator::from_stem(&stem).expect("stem is a valid locator token");
+    assert_eq!(adapter.locator(), &locator);
+    assert_eq!(adapter.meta_subject(), format!("{stem}.meta"));
+    assert_eq!(adapter.data_subject(), format!("{stem}.data"));
+    assert_eq!(adapter.meta_stream_name(), format!("{stem}_meta"));
+    assert_eq!(adapter.data_stream_name(), format!("{stem}_data"));
 }
 
 #[test]
@@ -2707,13 +2711,20 @@ fn test_nats_existing_stream_legacy_underscore_routing_reopen_and_append_continu
     let stem_a = unique_stem("legacy_reopen_a");
     let stem_b = unique_stem("legacy_reopen_b");
 
-    let adapter_a = NatsStorageAdapter::new(server.url(), &stem_a).expect("connect a");
+    let adapter_a = NatsStorageAdapter::new(server.url(), &stem_a)
+        .expect("connect a")
+        .with_subjects_for_test(format!("{stem_a}_meta"), format!("{stem_a}_data"));
     let adapter_b = NatsStorageAdapter::new(server.url(), &stem_b).expect("connect b");
 
     assert_eq!(adapter_a.meta_subject(), format!("{stem_a}_meta"));
     assert_eq!(adapter_a.data_subject(), format!("{stem_a}_data"));
-    assert_eq!(adapter_b.meta_subject(), format!("{stem_b}_meta"));
-    assert_eq!(adapter_b.data_subject(), format!("{stem_b}_data"));
+    assert_eq!(adapter_b.meta_subject(), format!("{stem_b}.meta"));
+    assert_eq!(adapter_b.data_subject(), format!("{stem_b}.data"));
+
+    let adapter_a_reopen =
+        NatsStorageAdapter::new(server.url(), &stem_a).expect("reopen adapter a");
+    assert_eq!(adapter_a_reopen.meta_subject(), format!("{stem_a}.meta"));
+    assert_eq!(adapter_a_reopen.data_subject(), format!("{stem_a}.data"));
 
     let claim = sample_claim(1);
 
@@ -2776,7 +2787,7 @@ fn test_nats_existing_stream_legacy_underscore_routing_reopen_and_append_continu
     }
     drop(writer_a);
 
-    let mut writer_a = adapter_a.open_write(1).expect("reopen writer a");
+    let mut writer_a = adapter_a_reopen.open_write(1).expect("reopen writer a");
     for (fiber_id, event_id, payload) in &events_m {
         writer_a
             .append_to_fiber(*fiber_id, *event_id, payload.clone())
@@ -2799,7 +2810,7 @@ fn test_nats_existing_stream_legacy_underscore_routing_reopen_and_append_continu
     }
     drop(writer_b);
 
-    let final_writer_a = adapter_a.open_write(1).expect("final open write a");
+    let final_writer_a = adapter_a_reopen.open_write(1).expect("final open write a");
     let final_writer_b = adapter_b.open_write(1).expect("final open write b");
 
     assert_eq!(
@@ -2839,7 +2850,7 @@ fn test_nats_existing_stream_legacy_underscore_routing_reopen_and_append_continu
     drop(final_writer_a);
     drop(final_writer_b);
 
-    let mut final_reader_a = adapter_a.open_read().expect("final open read a");
+    let mut final_reader_a = adapter_a_reopen.open_read().expect("final open read a");
     let mut final_reader_b = adapter_b.open_read().expect("final open read b");
     let envs_a = final_reader_a.read_all_envelopes().expect("read all a");
     let envs_b = final_reader_b.read_all_envelopes().expect("read all b");
@@ -2887,4 +2898,222 @@ fn test_nats_adapter_create_oversized_claim_rejected_without_creating_streams() 
         ArtefactPresence::None,
         "no streams must be created on JetStream broker"
     );
+}
+
+#[test]
+fn test_nats_locator_validation_and_derivation() {
+    let err = NatsLocator::new(Vec::<String>::new()).expect_err("empty hierarchy must be rejected");
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::ValueConstraintViolated {
+            constraint: ValueConstraint::Empty,
+        }
+    );
+
+    let err = NatsLocator::from_stem("").expect_err("empty token must be rejected");
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::ValueConstraintViolated {
+            constraint: ValueConstraint::Empty,
+        }
+    );
+
+    let err =
+        NatsLocator::from_stem("gh-report/team").expect_err("non NATS-safe token must be rejected");
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::ValueConstraintViolated {
+            constraint: ValueConstraint::InvalidChar,
+        }
+    );
+
+    let err = NatsLocator::from_stem("x".repeat(200)).expect_err("oversized stem must be rejected");
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::ValueConstraintViolated {
+            constraint: ValueConstraint::TooLong,
+        }
+    );
+
+    let locator = NatsLocator::new(["gh-report", "org_4d617474696c73796e6574", "v25"])
+        .expect("valid hierarchy accepted");
+    assert_eq!(locator.tokens().len(), 3);
+    assert_eq!(
+        locator.stream_stem(),
+        "gh-report-org_4d617474696c73796e6574-v25"
+    );
+    assert_eq!(
+        locator.subject_prefix(),
+        "gh-report.org_4d617474696c73796e6574.v25"
+    );
+    assert_eq!(
+        locator.meta_stream_name(),
+        "gh-report-org_4d617474696c73796e6574-v25_meta"
+    );
+    assert_eq!(
+        locator.data_stream_name(),
+        "gh-report-org_4d617474696c73796e6574-v25_data"
+    );
+    assert_eq!(
+        locator.meta_subject(),
+        "gh-report.org_4d617474696c73796e6574.v25.meta"
+    );
+    assert_eq!(
+        locator.data_subject(),
+        "gh-report.org_4d617474696c73796e6574.v25.data"
+    );
+    assert_eq!(
+        locator.legacy_meta_subject(),
+        "gh-report-org_4d617474696c73796e6574-v25_meta"
+    );
+    assert_eq!(
+        locator.legacy_data_subject(),
+        "gh-report-org_4d617474696c73796e6574-v25_data"
+    );
+
+    let child = locator.child("org").expect("child org accepted");
+    assert_eq!(
+        child.meta_subject(),
+        "gh-report.org_4d617474696c73796e6574.v25.org.meta"
+    );
+    let grandchild = child.child("team").expect("child team accepted");
+    assert_eq!(
+        grandchild.data_subject(),
+        "gh-report.org_4d617474696c73796e6574.v25.org.team.data"
+    );
+
+    let parent = NatsLocator::from_stem("gh-report").expect("single token accepted");
+    assert_eq!(parent.meta_subject(), "gh-report.meta");
+    assert_eq!(parent.meta_stream_name(), "gh-report_meta");
+}
+
+#[test]
+fn test_nats_reopen_rejects_meta_stream_with_unexpected_subjects() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("reopen_meta_mismatch");
+    let rogue = NatsStorageAdapter::new(server.url(), &stem)
+        .expect("connect rogue")
+        .with_subjects_for_test(format!("{stem}_rogue_meta"), format!("{stem}_rogue_data"));
+    let claim = sample_claim(1);
+    let writer = rogue
+        .create(&claim, &sample_descriptor())
+        .expect("create streams bound to unexpected meta subjects");
+    drop(writer);
+
+    let reopened = NatsStorageAdapter::new(server.url(), &stem).expect("connect reopened");
+    let err = reopened
+        .open_write(1)
+        .expect_err("reopen must reject unexpected meta subjects");
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::OwnershipRecordUnreadable
+    );
+    let err = reopened
+        .open_read()
+        .expect_err("open_read must also reject unexpected meta subjects");
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::OwnershipRecordUnreadable
+    );
+
+    rogue.delete_streams().expect("cleanup");
+}
+
+#[test]
+fn test_nats_reopen_rejects_data_stream_with_unexpected_subjects() {
+    let server = LiveNatsServer::acquire();
+    let stem = unique_stem("reopen_data_mismatch");
+    let rogue = NatsStorageAdapter::new(server.url(), &stem)
+        .expect("connect rogue")
+        .with_subjects_for_test(format!("{stem}.meta"), format!("{stem}_rogue_data"));
+    let claim = sample_claim(1);
+    let writer = rogue
+        .create(&claim, &sample_descriptor())
+        .expect("create streams with canonical meta but unexpected data subject");
+    drop(writer);
+
+    let reopened = NatsStorageAdapter::new(server.url(), &stem).expect("connect reopened");
+    let err = reopened
+        .open_write(1)
+        .expect_err("reopen must reject unexpected data subjects");
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::PrecursorChainBroken(None)
+    );
+
+    rogue.delete_streams().expect("cleanup");
+}
+
+#[test]
+fn test_nats_locator_hierarchical_subjects_pass_acl_while_flat_are_denied() {
+    let server = LiveNatsServer::isolated_with_config(
+        "jetstream { store_dir: \"{store_dir}\" }\n\
+         authorization {\n\
+         \x20 users = [\n\
+         \x20 \x20 { user: \"app\", password: \"pw\", permissions: {\n\
+         \x20 \x20 \x20 publish: [\"gh-report.>\", \"$JS.API.>\"]\n\
+         \x20 \x20 \x20 subscribe: [\">\"]\n\
+         \x20 \x20 } }\n\
+         \x20 ]\n\
+         }\n",
+    );
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let client_flat = rt
+        .block_on(
+            async_nats::ConnectOptions::with_user_and_password("app".into(), "pw".into())
+                .connect(server.url()),
+        )
+        .expect("connect flat client");
+    let client_dotted = rt
+        .block_on(
+            async_nats::ConnectOptions::with_user_and_password("app".into(), "pw".into())
+                .connect(server.url()),
+        )
+        .expect("connect dotted client");
+
+    let locator =
+        NatsLocator::new(["gh-report", "org_4d617474696c73796e6574", "v25"]).expect("locator");
+    let full_locator = locator
+        .child("org")
+        .expect("child org accepted")
+        .child("team")
+        .expect("child team accepted");
+    assert!(full_locator
+        .data_subject()
+        .starts_with("gh-report.org_4d617474696c73796e6574.v25."));
+    let stem = locator.stream_stem();
+    let flat_meta = format!("{stem}_meta");
+    let flat_data = format!("{stem}_data");
+
+    let adapter_flat = NatsStorageAdapter::from_client_with_locator(client_flat, locator.clone())
+        .with_subjects_for_test(flat_meta, flat_data);
+    let claim = sample_claim(1);
+    let err = adapter_flat
+        .create(&claim, &sample_descriptor())
+        .expect_err("flat underscore subjects must be denied by ACL");
+    assert_eq!(
+        *err.condition(),
+        FailureCondition::OwnershipRecordUnreadable
+    );
+    adapter_flat.delete_streams().expect("cleanup flat partial");
+
+    let adapter = NatsStorageAdapter::from_client_with_locator(client_dotted, locator.clone());
+    assert_eq!(
+        adapter.meta_subject(),
+        "gh-report.org_4d617474696c73796e6574.v25.meta"
+    );
+    assert_eq!(
+        adapter.data_subject(),
+        "gh-report.org_4d617474696c73796e6574.v25.data"
+    );
+    let mut writer = adapter
+        .create(&claim, &sample_descriptor())
+        .expect("hierarchical subjects allowed");
+    let env = EventEnvelope::genesis([1; 16], [2; 16], b"frame").unwrap();
+    writer
+        .append_envelope_verdict(&env)
+        .expect("append allowed");
+    drop(writer);
+
+    adapter.delete_streams().expect("cleanup");
 }
